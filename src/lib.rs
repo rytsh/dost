@@ -1,11 +1,13 @@
 pub mod app;
 pub mod cli;
 pub mod dog;
+pub mod look;
 pub mod mcp;
 pub mod notify;
 pub mod panel;
 pub mod render;
 pub mod settings;
 pub mod sound;
+pub mod toy;
 pub mod update;
 pub mod watch;

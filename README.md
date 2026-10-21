@@ -81,12 +81,12 @@ Then ask things like *"tell me when localhost:3000 is up"*, *"bark when the buil
 
 | Tool | What the dog does |
 | --- | --- |
-| `notify` | Barks and shows a bubble. Optional `url` (opened on click), `copy` (put on the clipboard), `source` (who sent it). |
+| `notify` | Barks and shows a bubble. Optional `url` (opened on click), `copy` (put on the clipboard), `source` (who sent it), `mood` (`good`: the dog is happy, `bad`: it is sad and howls; guessed from the words when left out). |
 | `ask` · `dismiss` | Shows a question with up to 4 answer buttons and waits for your click; the agent gets the answer. `dismiss` withdraws it. |
 | `progress` | A progress bar for a long task, updated in place; the dog is happy when it finishes, barks if it fails. |
 | `remind` | Barks later: after some minutes or at a local time. |
 | `add_watch` | Checks something every few seconds and barks when it changes: a `url`, a `port`, a `file` (or text in it), a process (`pid`), a GitHub Actions run (`github`: `owner/repo` or a run URL; set `GITHUB_TOKEN` for private repos), or a shell `command`. |
-| `react` | Happy, bark, sleep, wake or zoomies. |
+| `react` | Happy, sad, bark, fetch (throws the bone), sleep, wake or zoomies. |
 | `copy` | Puts text on the clipboard and says so. |
 | `status` · `history` | What the dog is doing, how long you have been idle, and what you may have missed. |
 | `check_now` · `list_watches` · `remove_watch` | Manage watches and reminders. |
@@ -97,6 +97,31 @@ does not bark and only shows questions, progress and sticky messages; the rest g
 
 > [!WARNING]
 > Watches can run shell commands on your computer. Only connect clients you trust.
+
+## Make it yours
+
+Settings → **Look**:
+
+- **Name**: click it and type. The name shows in the panel and is told to AI assistants over MCP,
+  so you can say *"tell Karabaş when the build is done"*. The dog's birthday is the day you first
+  started it; on that day it wears a party hat.
+- **Fur** and **collar** colours, and what it **wears**: a bandana, a beanie or sunglasses.
+- **Holiday outfits**: a witch hat (and a pumpkin instead of the bone) 24–31 October, a Santa hat
+  20 December – 1 January.
+- **Bubble**: Classic, Dark, Sky or Mint. Each `source` gets a colour of its own; pick one with
+  `"source_colors": { "ci": "#2f6fc4" }` in `settings.json`.
+
+**Fetch**: a bone lies next to the dog. Drag it and fling it; the dog runs after it and brings it
+back (just picking it up and letting go moves it without a game). Now and then the dog plays with
+it by itself. **Bone** in the panel (or `dost react fetch`) throws it for you; turn it off with
+*Bone to play with* (settings → Walk).
+
+**Moods**: good news (tests passed, done) makes the dog happy, failures make it sad. With *Happy,
+sad and asking voices* on (settings → Sound) it also sounds different: a double yip, a little howl,
+a short "wuf?" for questions.
+
+**Your own bark**: list 16-bit PCM WAV files in `settings.json`; one is picked at random each time:
+`"bark_files": ["~/sounds/woof1.wav", "~/sounds/woof2.wav"]`.
 
 ## Settings
 

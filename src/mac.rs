@@ -13,7 +13,7 @@ use std::ptr::NonNull;
 use block2::RcBlock;
 use muda::{ContextMenu, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use objc2::rc::Retained;
-use objc2::{AnyThread, MainThreadMarker, MainThreadOnly};
+use objc2::{AnyThread, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSBitmapFormat,
     NSBitmapImageRep, NSCellImagePosition, NSColor, NSEvent, NSEventMask, NSEventType, NSImage,
@@ -30,7 +30,6 @@ use dost::app::{self, Core, EDGE, Platform};
 use dost::dog::Bounds;
 use dost::panel::{self, Panel};
 use dost::render::{Renderer, Scale};
-use dost::sound::{BARK_WAV, scaled_wav};
 
 const FRAME: f64 = 1.0 / 60.0;
 const DRAG_THRESHOLD: f64 = 4.0;
@@ -78,8 +77,20 @@ struct Shell {
     hotkeys: crate::hotkeys::Hotkeys,
     /// While hidden: the bubble on its own under the menu bar icon.
     alone: AloneBubble,
+    /// The bone's window.
+    toy: ToyWindow,
     sound: Option<Retained<NSSound>>,
     quit: bool,
+}
+
+/// A small window for the toy, so it can fly anywhere above the Dock.
+struct ToyWindow {
+    window: Retained<NSWindow>,
+    view: Retained<NSImageView>,
+    pixmap: Pixmap,
+    shown: bool,
+    /// Cursor offset from the toy's bottom-centre while dragging (physical).
+    drag: Option<(f32, f32)>,
 }
 
 /// A bubble window without the dog, hanging under the menu bar icon.
@@ -149,6 +160,16 @@ pub fn run() {
                 shown: false,
                 pressed: false,
                 pos: (0.0, 0.0, 1.0),
+            }
+        },
+        toy: {
+            let (window, view) = make_window(mtm, false);
+            ToyWindow {
+                window,
+                view,
+                pixmap: Pixmap::new(1, 1).unwrap(),
+                shown: false,
+                drag: None,
             }
         },
         sound: None,
@@ -247,14 +268,30 @@ fn build_menu() -> (Menu, MenuItems) {
 /// A borderless, transparent, shadowless window with an image view filling it.
 fn make_window(mtm: MainThreadMarker, panel: bool) -> (Retained<NSWindow>, Retained<NSImageView>) {
     let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(10.0, 10.0));
-    let window = unsafe {
-        NSWindow::initWithContentRect_styleMask_backing_defer(
-            NSWindow::alloc(mtm),
-            frame,
-            NSWindowStyleMask::Borderless,
-            NSBackingStoreType::Buffered,
-            false,
-        )
+    let style = NSWindowStyleMask::Borderless;
+    let backing = NSBackingStoreType::Buffered;
+    let window: Retained<NSWindow> = if panel {
+        // The panel takes the keyboard (the name field); borderless windows do not by default.
+        let w: Retained<KeyWindow> = unsafe {
+            msg_send![
+                KeyWindow::alloc(mtm),
+                initWithContentRect: frame,
+                styleMask: style,
+                backing: backing,
+                defer: false
+            ]
+        };
+        w.into_super()
+    } else {
+        unsafe {
+            NSWindow::initWithContentRect_styleMask_backing_defer(
+                NSWindow::alloc(mtm),
+                frame,
+                style,
+                backing,
+                false,
+            )
+        }
     };
     unsafe { window.setReleasedWhenClosed(false) };
     window.setOpaque(false);
@@ -273,6 +310,21 @@ fn make_window(mtm: MainThreadMarker, panel: bool) -> (Retained<NSWindow>, Retai
     window.setContentView(Some(&view));
     (window, view)
 }
+
+define_class!(
+    // SAFETY: NSWindow has no subclassing requirements; KeyWindow has no Drop.
+    #[unsafe(super(NSWindow))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "DostKeyWindow"]
+    struct KeyWindow;
+
+    impl KeyWindow {
+        #[unsafe(method(canBecomeKeyWindow))]
+        fn can_become_key(&self) -> bool {
+            true
+        }
+    }
+);
 
 /// Converts a pixmap (premultiplied RGBA) to an `NSImage` of `points` size.
 fn to_image(pm: &Pixmap, points: NSSize) -> Option<Retained<NSImage>> {
@@ -474,10 +526,7 @@ fn mouse_px(mtm: MainThreadMarker) -> (f64, f64) {
 }
 
 impl Platform for Shell {
-    fn play_bark(&mut self, volume: u8) {
-        let Some(wav) = scaled_wav(BARK_WAV, volume) else {
-            return;
-        };
+    fn play_wav(&mut self, wav: Vec<u8>) {
         let data = NSData::with_bytes(&wav);
         if let Some(old) = self.sound.take() {
             old.stop();
@@ -604,12 +653,14 @@ impl App {
             self.on_menu(ev.id.as_ref());
         }
         self.drag_update();
+        self.toy_drag_update();
         let bounds = self.bounds();
         self.core.tick(&mut self.shell, &bounds);
         self.keys();
         if self.core.on_screen() {
             self.paint();
         }
+        self.paint_toy();
         self.paint_alone();
         if self.core.panel_dirty {
             self.core.panel_dirty = false;
@@ -772,7 +823,7 @@ impl App {
 
     fn toggle_panel(&mut self, anchor: Option<(f64, f64)>) {
         if self.shell.panel.is_open() {
-            self.shell.panel.close();
+            self.close_panel();
             return;
         }
         let at = anchor.unwrap_or_else(|| mouse_px(self.shell.mtm));
@@ -786,6 +837,16 @@ impl App {
     }
 
     fn paint_panel(&mut self) {
+        // The caret blinks while the name is edited.
+        if self
+            .shell
+            .panel
+            .panel
+            .as_ref()
+            .is_some_and(Panel::is_editing)
+        {
+            self.shell.panel.redraw = true;
+        }
         if !self.shell.panel.is_open() || !self.shell.panel.redraw {
             return;
         }
@@ -794,11 +855,105 @@ impl App {
         self.shell.panel.paint(&mut self.core.renderer, &view);
     }
 
+    /// A key for the panel's name field.
+    fn panel_key(&mut self, key: panel::Key) {
+        let view = self.core.panel_view(&self.shell);
+        let Some(p) = self.shell.panel.panel.as_mut() else {
+            return;
+        };
+        let (redraw, action) = p.key(key, &view);
+        self.shell.panel.redraw |= redraw;
+        if let Some(a) = action {
+            self.on_action(a);
+        }
+    }
+
+    /// Closes the panel; a name being edited is saved.
+    fn close_panel(&mut self) {
+        let view = self.core.panel_view(&self.shell);
+        let action = self
+            .shell
+            .panel
+            .panel
+            .as_mut()
+            .and_then(|p| p.finish_editing(&view));
+        self.shell.panel.close();
+        if let Some(a) = action {
+            self.on_action(a);
+        }
+    }
+
+    /// The toy's window: shown while the toy lies, flies or is dragged (not in the mouth).
+    fn paint_toy(&mut self) {
+        let mtm = self.shell.mtm;
+        let show = self.core.toy_shown();
+        let t = &mut self.shell.toy;
+        if !show {
+            if t.shown {
+                t.shown = false;
+                t.window.orderOut(None);
+            }
+            return;
+        }
+        let Some(item) = self.core.renderer.outfit().toy else {
+            return;
+        };
+        let (_, full) = screen_at(mtm, self.core.toy.x as f64, self.core.toy.y as f64 - 10.0);
+        let px = self.core.scale(full.scale as f32).px;
+        let size = self.core.renderer.toy_size(item, px);
+        if t.pixmap.width() != size {
+            t.pixmap = Pixmap::new(size, size).unwrap();
+        }
+        self.core
+            .renderer
+            .draw_toy(&mut t.pixmap, item, self.core.toy.quarter(), px);
+        let x = (self.core.toy.x as f64 - size as f64 / 2.0).round();
+        let y = (self.core.toy.y as f64 - size as f64).round();
+        let points = NSSize::new(size as f64 / full.scale, size as f64 / full.scale);
+        if let Some(image) = to_image(&t.pixmap, points) {
+            t.view.setImage(Some(&image));
+        }
+        place(mtm, &t.window, x, y, size as f64, size as f64, full.scale);
+        if !t.shown {
+            t.shown = true;
+            t.window.orderFrontRegardless();
+        }
+    }
+
+    /// While dragging the toy, follow the mouse; on release, throw it.
+    fn toy_drag_update(&mut self) {
+        let Some((dx, dy)) = self.shell.toy.drag else {
+            return;
+        };
+        let (mx, my) = mouse_px(self.shell.mtm);
+        self.core.toy.drag_to(mx as f32 - dx, my as f32 - dy);
+        if NSEvent::pressedMouseButtons() & 1 == 0 {
+            self.shell.toy.drag = None;
+            let scale = self.bounds().scale;
+            self.core.toy.release(scale);
+        }
+    }
+
     /// Mouse events on our windows, from the local event monitor. Returns true if consumed.
     fn on_mouse(&mut self, kind: NSEventType, window: Option<&NSWindow>, scroll: f64) -> bool {
         let mtm = self.shell.mtm;
         let (mx, my) = mouse_px(mtm);
         let on_dog = window.is_some_and(|w| std::ptr::eq(w, &*self.shell.window));
+        let on_toy = self.shell.toy.shown
+            && window.is_some_and(|w| std::ptr::eq(w, &*self.shell.toy.window));
+        if on_toy {
+            if kind == NSEventType::LeftMouseDown {
+                self.shell.toy.drag =
+                    Some((mx as f32 - self.core.toy.x, my as f32 - self.core.toy.y));
+                self.core.grab_toy();
+            }
+            return matches!(
+                kind,
+                NSEventType::LeftMouseDown
+                    | NSEventType::LeftMouseUp
+                    | NSEventType::LeftMouseDragged
+            );
+        }
         let on_alone = self.shell.alone.shown
             && window.is_some_and(|w| std::ptr::eq(w, &*self.shell.alone.window));
         if on_alone {
@@ -871,6 +1026,18 @@ impl App {
                         .as_mut()
                         .and_then(|p| p.pointer_up(px, py, &view));
                     self.shell.panel.redraw = true;
+                    // Editing the name: the panel takes the keyboard.
+                    if self
+                        .shell
+                        .panel
+                        .panel
+                        .as_ref()
+                        .is_some_and(Panel::is_editing)
+                        && let Some(w) = self.shell.panel.window.as_ref()
+                    {
+                        NSApplication::sharedApplication(mtm).activate();
+                        w.makeKeyAndOrderFront(None);
+                    }
                     if let Some(a) = action {
                         self.on_action(a);
                     }
@@ -969,12 +1136,33 @@ fn install_mouse_monitor() {
         let ev = unsafe { event.as_ref() };
         let mtm = MainThreadMarker::new().unwrap();
         let kind = ev.r#type();
-        if kind == NSEventType::KeyDown && ev.keyCode() == 53 {
-            // Esc closes the panel.
-            with_app(|a| a.shell.panel.close());
-            return event.as_ptr();
-        }
         let window = ev.window(mtm);
+        if kind == NSEventType::KeyDown {
+            // The name field takes the keys while it is edited; Esc otherwise closes the panel.
+            let code = ev.keyCode();
+            let text = ev.characters().map(|s| s.to_string()).unwrap_or_default();
+            let handled = with_app(|a| {
+                if !a.shell.panel.panel.as_ref().is_some_and(Panel::is_editing) {
+                    if code == 53 {
+                        a.close_panel();
+                    }
+                    return false;
+                }
+                let key = match code {
+                    53 => panel::Key::Escape,
+                    36 | 76 => panel::Key::Enter,
+                    51 => panel::Key::Backspace,
+                    _ => panel::Key::Text(text),
+                };
+                a.panel_key(key);
+                true
+            });
+            return if handled == Some(true) {
+                std::ptr::null_mut()
+            } else {
+                event.as_ptr()
+            };
+        }
         if kind == NSEventType::RightMouseDown {
             let on_status = with_app(|a| {
                 let status = a.shell.status.button(mtm).and_then(|b| b.window());
@@ -1008,7 +1196,7 @@ fn install_mouse_monitor() {
 
     // Clicking anywhere else closes the panel, like a menu.
     let outside = RcBlock::new(|_event: NonNull<NSEvent>| {
-        with_app(|a| a.shell.panel.close());
+        with_app(App::close_panel);
     });
     let monitor = NSEvent::addGlobalMonitorForEventsMatchingMask_handler(
         NSEventMask::LeftMouseDown | NSEventMask::RightMouseDown,

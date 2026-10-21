@@ -54,6 +54,7 @@ preview:
 # art/px/* (Sprite Forge pixel finish) -> assets/dog.png
 atlas:
 	~/tools/agent-sprite-forge/.venv/bin/python art/pack_atlas.py
+	~/tools/agent-sprite-forge/.venv/bin/python art/pack_items.py
 
 # examples/icon.rs -> packaging/macos/AppIcon.icns and packaging/windows/dost.ico.
 ICON_TMP := target/icons

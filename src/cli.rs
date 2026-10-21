@@ -12,6 +12,7 @@ Dost: the desktop dog. Without arguments it starts the dog.
 
 Usage:
   dost notify <title> [message] [--sticky] [--url URL] [--copy TEXT] [--source NAME]
+                      [--mood good|bad|neutral]
   dost ask <question> [--choices Yes,No] [--title T] [--timeout SECS]
                       Prints the answer; exit code 1 if nobody answered.
   dost done [title]   Bark with the last command's result: run it as `cmd; dost done`
@@ -19,7 +20,7 @@ Usage:
   dost run <command...>
                       Runs the command, then barks with how it went and how long it took.
   dost remind <minutes|HH:MM> <message>
-  dost react <happy|bark|sleep|wake|zoomies>
+  dost react <happy|sad|bark|fetch|sleep|wake|zoomies>
   dost status
   dost hook claude    Claude Code hook (reads the event on stdin); see `dost hook --help`.
   dost hook codex     Codex notify / hook (event as the last argument or on stdin).
@@ -227,7 +228,7 @@ fn cmd_notify(o: &mut Opts) -> Result<(), String> {
         "source": o.source("Terminal"),
         "sticky": o.has("sticky"),
     });
-    for k in ["url", "copy"] {
+    for k in ["url", "copy", "mood"] {
         if let Some(v) = o.flag(k) {
             a[k] = json!(v);
         }
@@ -280,15 +281,14 @@ fn cmd_done(o: &mut Opts) -> Result<(), String> {
     } else {
         o.pos.join(" ")
     };
-    let (title, message) = match status {
-        Some(0) | None => (format!("{what} finished"), String::new()),
-        Some(c) => (format!("{what} failed"), format!("Exit code {c}.")),
+    let (title, message, mood) = match status {
+        Some(0) => (format!("{what} finished"), String::new(), "good"),
+        None => (format!("{what} finished"), String::new(), "neutral"),
+        Some(c) => (format!("{what} failed"), format!("Exit code {c}."), "bad"),
     };
-    let a = json!({ "title": title, "message": message, "source": o.source("Terminal") });
+    let a =
+        json!({ "title": title, "message": message, "mood": mood, "source": o.source("Terminal") });
     call(&o.url(), "notify", a, SHORT)?;
-    if status == Some(0) {
-        let _ = call(&o.url(), "react", json!({ "reaction": "happy" }), SHORT);
-    }
     Ok(())
 }
 
@@ -322,11 +322,10 @@ fn cmd_run(o: &mut Opts) -> Result<(), String> {
             format!("{line}\n{code} after {took}."),
         )
     };
-    let a = json!({ "title": title, "message": msg, "source": o.source("Terminal") });
+    let mood = if status.success() { "good" } else { "bad" };
+    let a = json!({ "title": title, "message": msg, "mood": mood, "source": o.source("Terminal") });
     if let Err(e) = call(&o.url(), "notify", a, SHORT) {
         eprintln!("dost: {e}");
-    } else if status.success() {
-        let _ = call(&o.url(), "react", json!({ "reaction": "happy" }), SHORT);
     }
     // Pass the command's exit code on, so `dost run make && deploy` still works.
     if status.success() {
@@ -466,6 +465,7 @@ fn hook(url: &str, source: &str, ev: &Value) -> Result<Option<String>, String> {
             let a = json!({
                 "title": in_project(&title),
                 "message": short(s("message")),
+                "mood": "neutral",
                 "source": source,
             });
             call(url, "notify", a, SHORT).map(|_| None)
@@ -486,6 +486,7 @@ fn hook(url: &str, source: &str, ev: &Value) -> Result<Option<String>, String> {
             let a = json!({
                 "title": in_project("Your turn"),
                 "message": short(last),
+                "mood": "neutral",
                 "source": source,
             });
             call(url, "notify", a, SHORT)?;

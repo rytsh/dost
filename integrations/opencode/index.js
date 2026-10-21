@@ -309,8 +309,7 @@ export default {
           if (task?.shown) {
             await call("progress", { id: progressID(data.sessionID), title, message, state: "done" })
           } else {
-            await notify(title, message)
-            await call("react", { reaction: "happy" })
+            await notify(title, message, { mood: "good" })
           }
           return
         }
@@ -323,7 +322,7 @@ export default {
           if (task?.shown) {
             await call("progress", { id: progressID(data.sessionID), title, message, state: "failed" })
           } else {
-            await notify(title, message)
+            await notify(title, message, { mood: "bad" })
           }
           return
         }

@@ -1,0 +1,10 @@
+Create ONE wide image, aspect 2:1: a sprite sheet of 8 separate game ITEM icons (props, no character) in 2 rows x 4 columns, read left to right, top row first. These are accessories for the puppy in the FIRST attached image; match its style exactly: premium 16-bit pixel art (SNES era), crisp visible chunky pixels, limited palette, strong dark outline, 3-tone cel shading, no smooth gradients, no blur. Every item is seen in SIDE VIEW, as worn by a small dog facing RIGHT, and sized for that puppy's head (each item about as wide as the puppy's head, never larger).
+0: a chunky cartoon dog BONE (white-cream, two round knobs on each end), lying horizontally.
+1: a cosy knitted winter BEANIE hat, red and white stripes with a white pompom on top, side view, opening at the bottom.
+2: a cone-shaped birthday PARTY HAT, bright blue with yellow dots, a small fluffy tuft on the tip, side view, tilted slightly to the right.
+3: a pointy purple-black WITCH HAT with a wide brim and an orange band, side view, the tip bent slightly backward (to the LEFT).
+4: a red SANTA HAT with a white fur trim at the bottom and a white pompom, the floppy tip hanging down to the LEFT (backward), side view.
+5: a red BANDANA neckerchief with small white dots, folded into a triangle, as worn around a dog's neck seen from the side: a horizontal knotted band at the top with the triangle point hanging DOWN, the triangle point toward the RIGHT (front).
+6: cool black SUNGLASSES seen from the side (three-quarter): one dark rounded lens with a white shine streak and a thin black arm going back to the LEFT.
+7: a small orange PUMPKIN treat bucket with a carved happy face and a black handle.
+Each item alone in the middle of its cell, inside the central 70 percent with a generous empty margin, nothing touching or crossing a cell edge, no gutters, no separators, no grid lines. Do NOT draw the puppy. Background: solid flat pure magenta #FF00FF everywhere outside the items, no shadow, no ground, no glow. No text, no letters, no numbers, no labels.

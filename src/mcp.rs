@@ -11,7 +11,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tiny_http::{Header, Method, Response, Server};
 
-use crate::notify::{Notification, Notifier, Progress, ProgressState, Reaction};
+use crate::notify::{Mood, Notification, Notifier, Progress, ProgressState, Reaction};
 use crate::watch::{Check, DEFAULT_INTERVAL, MIN_INTERVAL, NewWatch, Watches};
 
 const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -20,10 +20,12 @@ const MAX_BODY: u64 = 1 << 20;
 const ASK_TIMEOUT: u64 = 300;
 const ASK_TIMEOUT_MAX: u64 = 1800;
 
-/// The dog's current state, shared with the MCP server.
+/// The dog's state, shared with the MCP server.
 #[derive(Clone, Debug, Default)]
 pub struct DogStatus {
     pub activity: String,
+    /// How long it has been with the user ("2 years").
+    pub age: String,
     pub visible: bool,
     pub showing: Option<String>,
     pub queued: usize,
@@ -54,6 +56,8 @@ pub struct Mcp {
     notifier: Notifier,
     watches: Arc<Watches>,
     status: Arc<Mutex<DogStatus>>,
+    /// The dog's name (settings), used in the tool descriptions.
+    name: Mutex<String>,
 }
 
 /// A running server; stops and releases the port when dropped.
@@ -90,7 +94,22 @@ impl Mcp {
             notifier,
             watches,
             status,
+            name: Mutex::new(crate::settings::DEFAULT_NAME.into()),
         }
+    }
+
+    /// The dog's name changed (settings).
+    pub fn set_name(&self, name: &str) {
+        if let Ok(mut n) = self.name.lock() {
+            *n = name.to_string();
+        }
+    }
+
+    fn name(&self) -> String {
+        self.name
+            .lock()
+            .map(|n| n.clone())
+            .unwrap_or_else(|_| crate::settings::DEFAULT_NAME.into())
     }
 
     fn handle(&self, mut req: tiny_http::Request) {
@@ -153,7 +172,7 @@ impl Mcp {
         let result = match method {
             "initialize" => Ok(self.initialize(&params)),
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({ "tools": tools() })),
+            "tools/list" => Ok(json!({ "tools": tools(&self.name()) })),
             "tools/call" => self.call_tool(&params),
             "resources/list" => Ok(json!({ "resources": [] })),
             "prompts/list" => Ok(json!({ "prompts": [] })),
@@ -174,17 +193,20 @@ impl Mcp {
             .iter()
             .find(|v| **v == asked)
             .unwrap_or(&PROTOCOL_VERSIONS[0]);
+        let name = self.name();
+        let dog = dog_label(&name);
         json!({
             "protocolVersion": version,
             "capabilities": { "tools": {} },
-            "serverInfo": { "name": "dost", "title": "Dost (desktop dog)", "version": env!("CARGO_PKG_VERSION") },
-            "instructions": "A dog on the user's screen. Use `notify` to tell the user something, \
+            "serverInfo": { "name": "dost", "title": format!("{dog} (Dost desktop dog)"), "version": env!("CARGO_PKG_VERSION") },
+            "instructions": format!("{dog}: a dog on the user's screen. Use `notify` to tell the user something, \
                 `ask` to ask a question with answer buttons and wait for the click, and `progress` \
                 to show a long task's progress bar. Use `add_watch` / `remind` to get the user \
                 notified later (a site comes up, a port opens, a file appears, a process ends, at a time). \
                 Always notify when something needs the user, even if they seem active: they often \
                 listen for the bark and look later. Pass `source` with your name so the user can \
-                tell agents apart.",
+                tell agents apart. When the user talks about {name} (\"tell {name}\", \"ask {name}\", \
+                \"{name}, remind me...\"), they mean these tools."),
         })
     }
 
@@ -222,7 +244,9 @@ impl Mcp {
         if title.is_empty() && message.is_empty() {
             return Err("`title` or `message` is required".into());
         }
-        let mut n = Notification::new(title, message).source(str_arg(a, "source"));
+        let mut n = Notification::new(title, message)
+            .source(str_arg(a, "source"))
+            .mood(parse_mood(a)?);
         if a.get("sticky").and_then(Value::as_bool).unwrap_or(false) {
             n = n.sticky();
         } else if let Some(s) = a.get("timeout_secs").and_then(Value::as_u64) {
@@ -339,6 +363,11 @@ impl Mcp {
         let mut n = Notification::new(title, message)
             .source(str_arg(a, "source"))
             .sticky();
+        n.mood = match state {
+            ProgressState::Running => Mood::Neutral,
+            ProgressState::Done => Mood::Good,
+            ProgressState::Failed => Mood::Bad,
+        };
         n.progress = Some(Progress {
             id: id.clone(),
             value,
@@ -366,7 +395,7 @@ impl Mcp {
         if !self.notifier.react(r) {
             return Err("the dog is not running".into());
         }
-        Ok(format!("The dog reacts: {name}."))
+        Ok(format!("{} reacts: {name}.", self.name()))
     }
 
     fn tool_copy(&self, a: &Value) -> Result<String, String> {
@@ -488,6 +517,8 @@ impl Mcp {
     fn tool_status(&self) -> String {
         let s = self.status.lock().unwrap().clone();
         let v = json!({
+            "name": self.name(),
+            "age": s.age,
             "activity": s.activity,
             "visible": s.visible,
             "showing": s.showing,
@@ -640,7 +671,8 @@ fn parse_github(s: &str, a: &Value) -> Result<Check, String> {
     })
 }
 
-fn tools() -> Value {
+fn tools(name: &str) -> Value {
+    let dog = dog_label(name);
     let source = json!({ "type": "string", "description": "Who is sending this (your name, e.g. \"OpenCode\", \"CI\"); shown above the title." });
     let check_props = json!({
         "url": { "type": "string", "description": "HTTP(S) check: sends a GET request to this URL. Met on 2xx (or `status`)." },
@@ -674,14 +706,15 @@ fn tools() -> Value {
     json!([
         {
             "name": "notify",
-            "title": "Notify via the dog",
-            "description": "The dog on the user's screen barks and shows the message in a speech bubble. Use it when a long task finishes or when you need the user's attention. Always send it when something needs the user, even if they seem active: they listen for the bark.",
+            "title": format!("Notify via {name}"),
+            "description": format!("{dog}, the dog on the user's screen, barks and shows the message in a speech bubble. Use it when a long task finishes or when you need the user's attention. Always send it when something needs the user, even if they seem active: they listen for the bark. The dog looks happy for good news and sad for failures (see `mood`)."),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "title": { "type": "string", "description": "Short title." },
                     "message": { "type": "string", "description": "Message (a few sentences)." },
                     "source": source,
+                    "mood": { "type": "string", "enum": Mood::NAMES, "description": "good (it worked: the dog is happy), bad (it failed: the dog is sad and howls) or neutral. Default: guessed from the words (failed, error, passed, done...)." },
                     "url": { "type": "string", "description": "http(s) link opened when the user clicks the bubble (a PR, a failed job, a preview)." },
                     "copy": { "type": "string", "description": "Text put on the user's clipboard when the bubble appears (a command to run, a token, a path)." },
                     "sticky": { "type": "boolean", "description": "Keep it until the user clicks it." },
@@ -692,7 +725,7 @@ fn tools() -> Value {
         {
             "name": "ask",
             "title": "Ask the user",
-            "description": "Shows a question in the dog's bubble with answer buttons, barks, and WAITS until the user clicks one; returns the chosen answer. Use it for quick decisions (yes/no, pick one of a few) so the user does not have to switch to the terminal. Returns an error if nobody answers in time.",
+            "description": format!("Shows a question in {dog}'s bubble with answer buttons, barks, and WAITS until the user clicks one; returns the chosen answer. Use it for quick decisions (yes/no, pick one of a few) so the user does not have to switch to the terminal. Returns an error if nobody answers in time."),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -719,7 +752,7 @@ fn tools() -> Value {
         {
             "name": "progress",
             "title": "Show progress",
-            "description": "Shows or updates a progress bar in the dog's bubble for a long task (build, tests, migration). Call with the same `id` to update; finish with state done (the dog is happy) or failed (the dog barks). Only the first call barks.",
+            "description": format!("Shows or updates a progress bar in {dog}'s bubble for a long task (build, tests, migration). Call with the same `id` to update; finish with state done (the dog is happy) or failed (the dog is sad). Only the first call barks."),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -736,8 +769,8 @@ fn tools() -> Value {
         },
         {
             "name": "react",
-            "title": "Make the dog react",
-            "description": "The dog does something without a bubble: happy (celebrate a success), bark, zoomies (runs around, for big wins), sleep or wake. Only put the dog to sleep if the user asks: while asleep it does not bark and only questions, progress and sticky messages are shown.",
+            "title": format!("Make {name} react"),
+            "description": format!("{dog} does something without a bubble: happy (celebrate a success), sad (something went wrong), bark, zoomies (runs around, for big wins), fetch (the user throws the bone and the dog brings it back: a little break), sleep or wake. Only put the dog to sleep if the user asks: while asleep it does not bark and only questions, progress and sticky messages are shown."),
             "inputSchema": {
                 "type": "object",
                 "properties": { "reaction": { "type": "string", "enum": Reaction::NAMES } },
@@ -762,7 +795,7 @@ fn tools() -> Value {
         {
             "name": "remind",
             "title": "Set a reminder",
-            "description": "The dog barks with a message later: after some minutes, or at a local time (today, or tomorrow if it has passed). Reminders survive restarts; list and remove them with list_watches / remove_watch.",
+            "description": format!("{dog} barks with a message later: after some minutes, or at a local time (today, or tomorrow if it has passed). Reminders survive restarts; list and remove them with list_watches / remove_watch."),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -779,7 +812,7 @@ fn tools() -> Value {
         {
             "name": "add_watch",
             "title": "Add a status watch",
-            "description": "The dog checks a condition at regular intervals; when it is met, the dog barks and notifies the user. Exactly one of url, port, file, pid or command. Examples: 'when the site is up' (url), 'when the dev server listens' (port), 'when the build output appears' (file), 'when an ERROR shows up in the log' (file + contains), 'when this process finishes' (pid + negate), 'when the site goes down' (url + negate). Watches persist across dog restarts.",
+            "description": format!("{dog} checks a condition at regular intervals; when it is met, the dog barks and notifies the user. Exactly one of url, port, file, pid or command. Examples: 'when the site is up' (url), 'when the dev server listens' (port), 'when the build output appears' (file), 'when an ERROR shows up in the log' (file + contains), 'when this process finishes' (pid + negate), 'when the site goes down' (url + negate). Watches persist across dog restarts."),
             "inputSchema": { "type": "object", "properties": watch_props }
         },
         {
@@ -804,8 +837,8 @@ fn tools() -> Value {
         },
         {
             "name": "status",
-            "title": "Dog status",
-            "description": "Returns what the dog is doing, the notification on screen, queued notifications, watches, whether it is quiet (Quiet on, quiet hours, a full-screen app, or the dog put to sleep: no barking, only questions/progress/sticky shown), and how long the user has been idle (no mouse/keyboard).",
+            "title": format!("{name}'s status"),
+            "description": format!("Returns the dog's name ({name}) and age, what it is doing, the notification on screen, queued notifications, watches, whether it is quiet (Quiet on, quiet hours, a full-screen app, or the dog put to sleep: no barking, only questions/progress/sticky shown), and how long the user has been idle (no mouse/keyboard)."),
             "inputSchema": { "type": "object", "properties": {} },
             "annotations": { "readOnlyHint": true }
         },
@@ -817,6 +850,25 @@ fn tools() -> Value {
             "annotations": { "readOnlyHint": true }
         }
     ])
+}
+
+/// "Karabaş (the user's dog)" or "Dost" when it has no name of its own.
+fn dog_label(name: &str) -> String {
+    if name == crate::settings::DEFAULT_NAME {
+        name.to_string()
+    } else {
+        format!("{name} (the user's dog)")
+    }
+}
+
+/// `mood`: `None` when not given (guessed from the text).
+fn parse_mood(a: &Value) -> Result<Option<Mood>, String> {
+    match str_arg(a, "mood") {
+        None => Ok(None),
+        Some(m) => Mood::parse(&m)
+            .map(Some)
+            .ok_or_else(|| format!("unknown mood `{m}`; use one of {}", Mood::NAMES.join(", "))),
+    }
 }
 
 fn str_arg(a: &Value, key: &str) -> Option<String> {
@@ -1164,6 +1216,45 @@ mod tests {
             false
         );
         assert!(m.watches.list().is_empty());
+    }
+
+    #[test]
+    fn name_mood_and_new_reactions() {
+        let (m, rx) = mcp();
+        let list = |m: &Mcp| {
+            m.dispatch(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }))
+                .unwrap()["result"]["tools"]
+                .to_string()
+        };
+        assert!(!list(&m).contains("the user's dog"), "no name yet");
+        m.set_name("Karabaş");
+        let tools = list(&m);
+        assert!(tools.contains("Notify via Karabaş"), "{tools}");
+        assert!(tools.contains("Karabaş (the user's dog)"));
+        let r = call(&m, "status", json!({}));
+        let v: Value = serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(v["name"], "Karabaş");
+
+        call(&m, "notify", json!({ "title": "Deploy", "mood": "bad" }));
+        assert_eq!(note(&rx).mood, Mood::Bad);
+        call(&m, "notify", json!({ "title": "Tests passed" }));
+        assert_eq!(note(&rx).mood, Mood::Good, "guessed");
+        assert_eq!(
+            call(&m, "notify", json!({ "title": "x", "mood": "meh" }))["isError"],
+            true
+        );
+        call(&m, "progress", json!({ "id": "b", "state": "failed" }));
+        assert_eq!(note(&rx).mood, Mood::Bad);
+        for (name, r) in [("sad", Reaction::Sad), ("fetch", Reaction::Fetch)] {
+            let out = call(&m, "react", json!({ "reaction": name }));
+            assert!(
+                out["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("Karabaş")
+            );
+            assert!(matches!(rx.try_recv().unwrap(), notify::Event::React(x) if x == r));
+        }
     }
 
     #[test]

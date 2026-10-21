@@ -6,6 +6,8 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+use crate::look::{Collar, Fur, Theme, Wear};
+
 /// Dog size, percent. The sprite is 128 px tall; on screen it is rounded to a whole multiple so
 /// pixels stay crisp and even (100 = 1:1).
 pub const SIZES: [(u32, &str); 3] = [(100, "1×"), (200, "2×"), (300, "3×")];
@@ -78,6 +80,26 @@ pub struct Settings {
     pub hidden: bool,
     /// Put to sleep (Sleep): kept across restarts.
     pub asleep: bool,
+    /// The dog's name: shown in bubbles and the panel, and told to agents over MCP.
+    pub name: String,
+    /// The day the dog was adopted ("YYYY-MM-DD", set on first start): its birthday.
+    pub birthday: String,
+    pub fur: Fur,
+    pub collar: Collar,
+    pub wear: Wear,
+    /// Holiday outfits on their days (birthday, Halloween, Christmas).
+    pub seasonal: bool,
+    pub theme: Theme,
+    /// Bubble colour per source, lowercase name -> "#rrggbb"; others get a colour of their own.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub source_colors: std::collections::BTreeMap<String, String>,
+    /// Bark sounds: 16-bit PCM WAV files, one picked at random; empty = the built-in bark.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub bark_files: Vec<String>,
+    /// A different sound for good news, failures and questions.
+    pub event_sounds: bool,
+    /// The bone lies next to the dog (to throw, and now and then it plays with it).
+    pub toy: bool,
 }
 
 impl Default for Settings {
@@ -103,9 +125,24 @@ impl Default for Settings {
             auto_update: true,
             hidden: false,
             asleep: false,
+            name: DEFAULT_NAME.into(),
+            birthday: String::new(),
+            fur: Fur::Golden,
+            collar: Collar::Red,
+            wear: Wear::None,
+            seasonal: true,
+            theme: Theme::Classic,
+            source_colors: Default::default(),
+            bark_files: Vec::new(),
+            event_sounds: true,
+            toy: true,
         }
     }
 }
+
+pub const DEFAULT_NAME: &str = "Dost";
+/// Longest name, in characters.
+pub const NAME_MAX: usize = 20;
 
 impl Settings {
     /// Fixes invalid values (for hand-edited files).
@@ -132,7 +169,24 @@ impl Settings {
             self.quiet_from = d.quiet_from;
             self.quiet_to = d.quiet_to;
         }
+        self.name = clean_name(&self.name);
+        if !self.birthday.is_empty() && crate::look::parse_date(&self.birthday).is_none() {
+            self.birthday.clear();
+        }
         self
+    }
+
+    /// The birthday as a date (`None` until the first start sets it).
+    pub fn birthday(&self) -> Option<chrono::NaiveDate> {
+        crate::look::parse_date(&self.birthday)
+    }
+
+    /// `source_colors` parsed; bad entries are left out.
+    pub fn source_colors(&self) -> Vec<(String, tiny_skia::ColorU8)> {
+        self.source_colors
+            .iter()
+            .filter_map(|(k, v)| Some((k.trim().to_lowercase(), crate::look::parse_hex(v)?)))
+            .collect()
     }
 
     /// Whether do-not-disturb is on at `minute` (minutes since local midnight).
@@ -213,6 +267,18 @@ fn mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
+/// One line, no control characters, at most [`NAME_MAX`] characters; empty -> the default.
+pub fn clean_name(s: &str) -> String {
+    let n: String = s
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(NAME_MAX)
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if n.is_empty() { DEFAULT_NAME.into() } else { n }
+}
+
 /// "HH:MM" -> minutes since midnight.
 pub fn parse_hhmm(s: &str) -> Option<u32> {
     let (h, m) = s.trim().split_once(':')?;
@@ -288,6 +354,29 @@ mod tests {
             ..Settings::default()
         };
         assert_eq!(bad.sanitized().quiet_from, "22:00");
+    }
+
+    #[test]
+    fn identity_and_look() {
+        let s: Settings = serde_json::from_str(
+            r##"{ "name": "  Karabaş\n ", "fur": "black", "collar": "blue", "wear": "glasses",
+                 "birthday": "2026-02-30", "source_colors": { "CI": "#ff0000", "x": "nope" } }"##,
+        )
+        .unwrap();
+        let s = s.sanitized();
+        assert_eq!(s.name, "Karabaş");
+        assert_eq!(
+            (s.fur, s.collar, s.wear),
+            (Fur::Black, Collar::Blue, Wear::Glasses)
+        );
+        assert_eq!(s.birthday, "", "not a real date");
+        assert_eq!(s.source_colors().len(), 1);
+        assert_eq!(s.source_colors()[0].0, "ci");
+        assert_eq!(clean_name(""), DEFAULT_NAME);
+        assert_eq!(clean_name(&"x".repeat(50)).chars().count(), NAME_MAX);
+        // Defaults are not written out for the empty maps and lists.
+        let json = serde_json::to_string(&Settings::default()).unwrap();
+        assert!(!json.contains("bark_files") && !json.contains("source_colors"));
     }
 
     #[test]

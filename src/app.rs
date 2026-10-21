@@ -8,14 +8,19 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::dog::{Anim, Bounds, Dog};
+use crate::look::{self, Outfit};
 use crate::mcp::{self, DogStatus, HISTORY_LEN, HistoryEntry, Mcp};
-use crate::notify::{self, Event, Notification, Notifier, ProgressState, Reaction};
+use crate::notify::{self, Event, Mood, Notification, Notifier, ProgressState, Reaction};
 use crate::panel::{self, Action};
 use crate::render::{Bubble, Hits, Renderer, Scale};
 use crate::settings::{self, Settings, Store};
+use crate::sound::{Sounds, Voice};
+use crate::toy::{self, Toy};
 use crate::update;
 use crate::watch::{self, Watches};
 
+/// On average, the dog plays with the bone by itself once in this many seconds.
+const SELF_PLAY_EVERY: f32 = 900.0;
 /// A finished or failed progress bubble stays this long.
 const PROGRESS_END: Duration = Duration::from_secs(6);
 /// While other notifications wait, a running progress bubble yields after this long.
@@ -31,7 +36,8 @@ const CLICK_GUARD: Duration = Duration::from_millis(400);
 
 /// What a platform shell provides to the shared core.
 pub trait Platform {
-    fn play_bark(&mut self, volume: u8);
+    /// Plays a 16-bit PCM WAV (already scaled to the volume); a new one stops the last.
+    fn play_wav(&mut self, wav: Vec<u8>);
     fn copy_text(&mut self, text: &str) -> bool;
     fn autostart_enabled(&self) -> bool;
     fn set_autostart(&mut self, on: bool) -> Result<(), String>;
@@ -137,6 +143,13 @@ pub struct Core {
     while_locked: Vec<(String, String)>,
     last_fullscreen_check: Instant,
     last_history_save: Instant,
+    /// Barks and event voices, rebuilt when the sound files change.
+    sounds: Sounds,
+    sound_files: Vec<String>,
+    /// The toy, while the dog is on screen.
+    pub toy: Toy,
+    /// The day the outfit was last chosen (holidays change at midnight).
+    look_day: Option<chrono::NaiveDate>,
 }
 
 impl Core {
@@ -144,7 +157,13 @@ impl Core {
     /// `x`, `ground`: where the dog starts (physical pixels).
     pub fn new(renderer: Renderer, x: f32, ground: f32) -> Self {
         let mut store = Store::new(settings::config_dir().map(|d| d.join("settings.json")));
-        let settings = store.load();
+        let mut settings = store.load();
+        let first_start = settings.birthday.is_empty();
+        if first_start {
+            // The day it was adopted is its birthday.
+            settings.birthday = look::today().format("%Y-%m-%d").to_string();
+            store.save(&settings);
+        }
         update::cleanup();
         let mut core = Self::build(renderer, x, ground, store, watch::default_path());
         core.load_history(settings::config_dir().map(|d| d.join("history.json")));
@@ -152,13 +171,27 @@ impl Core {
         core.apply_settings(settings, false);
         // Hidden or asleep from last time: no hello bark.
         let quiet_start = !core.visible || core.dog.is_put_to_sleep();
+        let name = core.settings.name.clone();
         let hello = match &core.mcp_error {
             None if quiet_start => None,
             None => Some(
-                Notification::new(
-                    "Woof!",
-                    "Hi, I'm Dost. Drag me around, or click my tray icon for settings.",
-                )
+                match look::Season::on(look::today(), core.settings.birthday()) {
+                    Some(look::Season::Birthday) => Notification::new(
+                        "Woof! It's my birthday!",
+                        format!("{name} is {} today. Thanks for having me.", core.age_text()),
+                    )
+                    .mood(Some(Mood::Good)),
+                    _ if first_start => Notification::new(
+                        "Woof!",
+                        format!(
+                            "Hi, I'm {name}. Drag me around, throw my bone, or click my tray icon to give me a name."
+                        ),
+                    ),
+                    _ => Notification::new(
+                        "Woof!",
+                        format!("{name} is here. Drag me around, or click my tray icon for settings."),
+                    ),
+                }
                 .timeout(Duration::from_secs(6)),
             ),
             Some(e) => Some(Notification::new("MCP server could not start", e.clone()).sticky()),
@@ -167,6 +200,11 @@ impl Core {
             core.notifier.send(hello);
         }
         core
+    }
+
+    /// "2 years" / "1 year" / "3 days" since the birthday.
+    pub fn age_text(&self) -> String {
+        age_text(self.settings.birthday(), look::today())
     }
 
     fn build(
@@ -220,6 +258,10 @@ impl Core {
             while_locked: Vec::new(),
             last_fullscreen_check: Instant::now(),
             last_history_save: Instant::now(),
+            sounds: Sounds::default(),
+            sound_files: Vec::new(),
+            toy: Toy::new(x + 90.0, ground),
+            look_day: None,
         }
     }
 
@@ -364,8 +406,13 @@ impl Core {
         self.restart_if_asked(p);
         self.publish_status(p);
         self.dog.update(dt, bounds);
+        self.play(bounds, dt);
         if self.dog.take_left() {
             self.panel_dirty = true;
+        }
+        if self.look_day != Some(look::today()) {
+            // Midnight: a holiday may start or end.
+            self.apply_look();
         }
         let on = self.on_screen();
         if on != self.was_on_screen {
@@ -399,6 +446,135 @@ impl Core {
     /// Waits for the dog to finish walking off before showing a detached bubble.
     fn ready_for_next(&self) -> bool {
         self.visible || self.dog.is_away()
+    }
+
+    /// The toy and fetch: moves the toy, sends the dog after it when it lands, and hands it
+    /// over between the toy and the dog's mouth.
+    fn play(&mut self, b: &Bounds, dt: f32) {
+        if !self.settings.toy {
+            // Put away: the game ends, the toy goes with it.
+            if self.dog.is_fetching() {
+                self.dog.stop_fetch();
+                let _ = self.dog.take_dropped();
+            }
+            let _ = self.dog.take_picked();
+            if self.toy.state == toy::State::Carried {
+                self.toy.put_down(self.dog.mouth_x(), b.ground);
+            }
+            return;
+        }
+        let edges = self.toy_edges(b);
+        self.toy.update(dt, b, edges);
+        if self.dog.take_picked() {
+            self.toy.carry();
+        }
+        if let Some(x) = self.dog.take_dropped() {
+            let y = if self.dog.is_held() {
+                self.dog.y - 60.0 * b.scale
+            } else {
+                b.ground
+            };
+            self.toy.put_down(x.clamp(edges.0, edges.1), y);
+        }
+        if self.toy.take_landed() && self.toy_shown() {
+            self.dog.fetch(self.toy.x, b);
+        } else if self.settings.wander
+            && self.shown.is_none()
+            && self.toy.state == toy::State::Resting
+            && self.toy_shown()
+            && !self.dog.is_performing()
+            && !self.dog.is_held()
+            && !self.dog.is_sleeping()
+            && fastrand::f32() < dt / SELF_PLAY_EVERY
+        {
+            // Now and then it goes and plays with the bone by itself.
+            self.dog.fetch(self.toy.x, b);
+        }
+        // The game ended some other way while the toy was in the mouth.
+        if self.toy.state == toy::State::Carried && !self.dog.is_carrying() {
+            let x = self.dog.mouth_x().clamp(edges.0, edges.1);
+            self.toy.put_down(x, b.ground);
+        }
+    }
+
+    /// Where the toy may go: the walkable area plus a little.
+    fn toy_edges(&self, b: &Bounds) -> (f32, f32) {
+        let m = (EDGE - 20.0) * b.scale;
+        (b.left - m, b.right + m)
+    }
+
+    /// The toy is drawn: the dog is out, and the toy is not in its mouth.
+    pub fn toy_shown(&self) -> bool {
+        self.settings.toy && self.visible && !self.dog.is_away() && self.toy.is_shown()
+    }
+
+    /// The toy is grabbed with the mouse; the dog stops chasing it.
+    pub fn grab_toy(&mut self) {
+        self.dog.stop_fetch();
+        self.toy.grab();
+    }
+
+    /// Throws the toy from the dog's mouth (or where it lies) in a random arc.
+    fn throw_toy(&mut self, b: &Bounds) {
+        if !self.settings.toy || !self.visible || self.dog.is_away() || self.dog.is_put_to_sleep() {
+            return;
+        }
+        self.dog.stop_fetch();
+        let mid = (b.left + b.right) / 2.0;
+        let dir = if self.dog.x < mid { 1.0 } else { -1.0 };
+        let r = fastrand::f32();
+        let (sx, sy) = (self.dog.x, b.ground - 70.0 * b.scale);
+        self.toy.put_down(sx, sy);
+        self.toy.throw(
+            dir * (500.0 + 700.0 * r) * b.scale,
+            -(700.0 + 300.0 * r) * b.scale,
+        );
+    }
+
+    /// Plays a voice at the set volume.
+    fn voice(&mut self, p: &mut dyn Platform, v: Voice) {
+        if let Some(wav) = self
+            .sounds
+            .wav(v, self.settings.volume, self.settings.event_sounds)
+        {
+            p.play_wav(wav);
+        }
+    }
+
+    /// The voice for a notification.
+    fn voice_of(n: &Notification) -> Voice {
+        if n.is_question() {
+            return Voice::Ask;
+        }
+        match n.mood {
+            Mood::Good => Voice::Happy,
+            Mood::Bad => Voice::Sad,
+            Mood::Neutral => Voice::Bark,
+        }
+    }
+
+    /// The dog reacts to a notification it shows: barks, or is happy or sad.
+    fn react_to(&mut self, n: &Notification) {
+        match n.mood {
+            _ if n.is_question() => self.dog.notify(),
+            Mood::Good => self.dog.pet(),
+            Mood::Bad => self.dog.sad(),
+            Mood::Neutral => self.dog.notify(),
+        }
+    }
+
+    /// Recolours the dog and dresses it for the day.
+    fn apply_look(&mut self) {
+        let today = look::today();
+        self.look_day = Some(today);
+        let s = &self.settings;
+        let season = s
+            .seasonal
+            .then(|| look::Season::on(today, s.birthday()))
+            .flatten();
+        let outfit = Outfit::new(s.wear, season);
+        self.renderer
+            .set_look(s.fur, s.collar, outfit, s.theme, s.source_colors());
     }
 
     /// Hide: the dog walks off to the right. Show: it walks back in.
@@ -450,7 +626,7 @@ impl Core {
                     s.deadline = Some(Instant::now() + PROGRESS_END);
                     match s.note.progress.as_ref().map(|p| p.state) {
                         Some(ProgressState::Done) => self.dog.pet(),
-                        _ => self.dog.notify(),
+                        _ => self.dog.sad(),
                     }
                 }
                 self.update_history(id, |h| {
@@ -553,7 +729,7 @@ impl Core {
             if !self.visible && !note.is_important() {
                 if !note.announced {
                     if self.settings.sound && !quiet {
-                        p.play_bark(self.settings.volume);
+                        self.voice(p, Self::voice_of(&note));
                     }
                     if let Some(text) = &note.copy {
                         p.copy_text(text);
@@ -565,10 +741,10 @@ impl Core {
             }
             if !note.announced {
                 if !seen {
-                    self.dog.notify();
+                    self.react_to(&note);
                 }
                 if self.settings.sound && !quiet && !seen {
-                    p.play_bark(self.settings.volume);
+                    self.voice(p, Self::voice_of(&note));
                 }
                 if let Some(text) = &note.copy {
                     p.copy_text(text);
@@ -598,12 +774,14 @@ impl Core {
             Reaction::Bark => {
                 self.dog.notify();
                 if self.settings.sound && !self.hushed() {
-                    p.play_bark(self.settings.volume);
+                    self.voice(p, Voice::Bark);
                 }
             }
             Reaction::Sleep => self.dog.sleep(),
             Reaction::Wake => self.dog.wake_up(),
             Reaction::Zoomies => self.dog.zoomies(bounds),
+            Reaction::Sad => self.dog.sad(),
+            Reaction::Fetch => self.throw_toy(bounds),
         }
         self.panel_dirty = true;
     }
@@ -698,7 +876,7 @@ impl Core {
         } else {
             self.dog.pet();
             if self.settings.sound && self.settings.sound_on_pet {
-                p.play_bark(self.settings.volume);
+                self.voice(p, Voice::Bark);
             }
         }
     }
@@ -1069,14 +1247,27 @@ impl Core {
         if save {
             self.store.save(&s);
         }
+        if s.bark_files != self.sound_files {
+            self.sounds = Sounds::new(&s.bark_files);
+            self.sound_files = s.bark_files.clone();
+            let bad = Sounds::bad_files(&s.bark_files);
+            if !bad.is_empty() {
+                self.push(Notification::new(
+                    "Could not use a bark sound",
+                    format!("{} (needs a 16-bit PCM WAV file).", bad.join(", ")),
+                ));
+            }
+        }
+        self.mcp.set_name(&s.name);
         self.settings = s;
+        self.apply_look();
         self.panel_dirty = true;
     }
 
     pub fn on_action(&mut self, p: &mut dyn Platform, action: Action) {
         match action {
             Action::Settings(s) => {
-                self.apply_settings(s, true);
+                self.apply_settings(*s, true);
                 if let Some(e) = self.mcp_error.clone() {
                     self.push(Notification::new("MCP server could not start", e).sticky());
                 }
@@ -1090,7 +1281,7 @@ impl Core {
                     let s = self.settings.clone();
                     self.apply_settings(s, true);
                     if self.settings.sound {
-                        p.play_bark(self.settings.volume);
+                        self.voice(p, Voice::Bark);
                     }
                 }
             }
@@ -1098,6 +1289,17 @@ impl Core {
                 "Test",
                 "This is a test notification. Click the bubble to close it.",
             )),
+            Action::Fetch => {
+                // The bone was put away: the button brings it back.
+                if !self.settings.toy {
+                    let s = Settings {
+                        toy: true,
+                        ..self.settings.clone()
+                    };
+                    self.apply_settings(s, true);
+                }
+                self.reactions.push(Reaction::Fetch);
+            }
             Action::ToggleSleep => self.dog.toggle_sleep(),
             Action::ToggleVisible => {
                 self.toggle_visible = true;
@@ -1152,7 +1354,7 @@ impl Core {
     pub fn toggle_mute(&mut self, p: &mut dyn Platform) {
         let mut s = self.settings.clone();
         s.sound = !s.sound;
-        self.on_action(p, Action::Settings(s));
+        self.on_action(p, Action::Settings(Box::new(s)));
     }
 
     pub fn mcp_url(&self) -> String {
@@ -1162,6 +1364,8 @@ impl Core {
     pub fn panel_view(&self, p: &dyn Platform) -> panel::View {
         panel::View {
             settings: self.settings.clone(),
+            age: self.age_text(),
+            outfit: self.renderer.outfit(),
             sleeping: self.dog.is_sleeping(),
             visible: self.visible,
             autostart: p.autostart_enabled(),
@@ -1210,6 +1414,7 @@ impl Core {
         let activity = match self.dog.frame().anim {
             _ if self.dog.is_put_to_sleep() => "sleeping",
             _ if self.dog.is_away() => "away (hidden)",
+            _ if self.dog.is_fetching() => "playing fetch",
             Anim::Idle => "standing",
             Anim::Walk if self.dog.is_performing() => "doing zoomies",
             Anim::Walk => "walking",
@@ -1218,11 +1423,13 @@ impl Core {
             Anim::Happy => "happy",
             Anim::Sleep => "sleeping",
             Anim::Held => "being carried",
+            Anim::Sad => "sad",
         };
         let idle = p.idle_secs();
         let quiet = self.hushed();
         if let Ok(mut s) = self.status.lock() {
             s.activity = activity.into();
+            s.age = self.age_text();
             s.visible = self.visible;
             s.showing = self
                 .shown
@@ -1256,6 +1463,26 @@ fn local_minute() -> u32 {
     use chrono::Timelike;
     let t = chrono::Local::now();
     t.hour() * 60 + t.minute()
+}
+
+/// How long since `birthday`, in words: "2 years", "1 year", "5 months", "3 days".
+pub fn age_text(birthday: Option<chrono::NaiveDate>, today: chrono::NaiveDate) -> String {
+    use chrono::Datelike;
+    let Some(b) = birthday.filter(|b| *b <= today) else {
+        return "new here".into();
+    };
+    let mut months = (today.year() - b.year()) * 12 + today.month() as i32 - b.month() as i32;
+    if today.day() < b.day() {
+        months -= 1;
+    }
+    let plural = |n: i64, w: &str| format!("{n} {w}{}", if n == 1 { "" } else { "s" });
+    if months >= 12 {
+        plural((months / 12) as i64, "year")
+    } else if months >= 1 {
+        plural(months as i64, "month")
+    } else {
+        plural((today - b).num_days(), "day")
+    }
 }
 
 /// Where the dog stands: the base line (taskbar top / Dock top, or the screen's bottom edge)
@@ -1298,7 +1525,7 @@ mod tests {
     }
 
     impl Platform for Fake {
-        fn play_bark(&mut self, _: u8) {
+        fn play_wav(&mut self, _: Vec<u8>) {
             self.barks += 1;
         }
         fn copy_text(&mut self, text: &str) -> bool {
@@ -1938,6 +2165,100 @@ mod tests {
         assert!(c.dog.is_sleeping(), "an important bubble does not wake it");
         assert_eq!(history(&c)[0], ("FYI".into(), "skipped (asleep)".into()));
         assert!(c.status.lock().unwrap().quiet);
+    }
+
+    #[test]
+    fn failures_make_the_dog_sad() {
+        let (mut c, mut p) = (core(), Fake::default());
+        c.notifier
+            .send(Notification::new("Build failed", "3 errors").mood(None));
+        step(&mut c, &mut p);
+        assert_eq!(c.dog.frame().anim, Anim::Sad);
+        assert_eq!(p.barks, 1);
+        c.shown = None;
+        c.notifier
+            .send(Notification::new("Tests passed", "").mood(None));
+        step(&mut c, &mut p);
+        assert_eq!(c.dog.frame().anim, Anim::Happy);
+    }
+
+    #[test]
+    fn bone_is_fetched() {
+        let (mut c, mut p) = (core(), Fake::default());
+        c.on_action(&mut p, Action::Fetch);
+        run(&mut c, &mut p, 3.0, |c| c.dog.is_fetching());
+        assert!(c.dog.is_fetching(), "the dog runs after it");
+        let home = c.dog.x;
+        run(&mut c, &mut p, 30.0, |c| c.toy.state == toy::State::Carried);
+        assert_eq!(c.toy.state, toy::State::Carried);
+        assert!(!c.toy_shown(), "in the mouth, drawn with the dog");
+        run(&mut c, &mut p, 30.0, |c| !c.dog.is_fetching());
+        assert_eq!(c.dog.x, home, "brought back");
+        run(&mut c, &mut p, 3.0, |c| c.toy.state == toy::State::Resting);
+        assert!(c.toy_shown());
+        assert!(
+            (c.toy.x - c.dog.mouth_x()).abs() < 1.0,
+            "put down at the mouth"
+        );
+    }
+
+    #[test]
+    fn bone_can_be_put_away_and_dropping_is_not_a_throw() {
+        let (mut c, mut p) = (core(), Fake::default());
+        run(&mut c, &mut p, 1.0, |_| false);
+        // Picked up and let go in place: the dog does not run after it.
+        c.grab_toy();
+        let (x, y) = (c.toy.x, c.toy.y - 50.0);
+        c.toy.drag_to(x, y);
+        c.toy.release(B.scale);
+        run(&mut c, &mut p, 3.0, |_| false);
+        assert!(!c.dog.is_fetching());
+        // Put away: not drawn, and fetch does nothing.
+        let s = Settings {
+            toy: false,
+            ..c.settings.clone()
+        };
+        c.on_action(&mut p, Action::Settings(Box::new(s)));
+        assert!(!c.toy_shown());
+        c.reactions.push(Reaction::Fetch);
+        run(&mut c, &mut p, 3.0, |_| false);
+        assert!(!c.dog.is_fetching());
+        // The Bone button brings it back and throws it.
+        c.on_action(&mut p, Action::Fetch);
+        assert!(c.settings.toy);
+        run(&mut c, &mut p, 3.0, |c| c.dog.is_fetching());
+        assert!(c.dog.is_fetching());
+    }
+
+    #[test]
+    fn name_and_look_reach_mcp_and_renderer() {
+        let (mut c, mut p) = (core(), Fake::default());
+        let s = Settings {
+            name: "Karabaş".into(),
+            wear: look::Wear::Bandana,
+            ..c.settings.clone()
+        };
+        c.on_action(&mut p, Action::Settings(Box::new(s)));
+        let r = c
+            .mcp
+            .dispatch(serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }))
+            .unwrap();
+        let text = r["result"]["instructions"].as_str().unwrap();
+        assert!(text.starts_with("Karabaş (the user's dog)"), "{text}");
+        assert_eq!(c.renderer.outfit().neck, Some(look::Item::Bandana));
+        assert_eq!(c.panel_view(&p).settings.name, "Karabaş");
+    }
+
+    #[test]
+    fn ages() {
+        let d = |s| look::parse_date(s).unwrap();
+        assert_eq!(age_text(Some(d("2024-10-21")), d("2026-10-21")), "2 years");
+        assert_eq!(
+            age_text(Some(d("2025-10-22")), d("2026-10-21")),
+            "11 months"
+        );
+        assert_eq!(age_text(Some(d("2026-10-20")), d("2026-10-21")), "1 day");
+        assert_eq!(age_text(None, d("2026-10-21")), "new here");
     }
 
     #[test]

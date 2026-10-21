@@ -18,10 +18,11 @@ pub enum Anim {
     Happy,
     Sleep,
     Held,
+    Sad,
 }
 
 impl Anim {
-    pub const ALL: [Anim; 7] = [
+    pub const ALL: [Anim; 8] = [
         Anim::Idle,
         Anim::Walk,
         Anim::Sit,
@@ -29,10 +30,16 @@ impl Anim {
         Anim::Happy,
         Anim::Sleep,
         Anim::Held,
+        Anim::Sad,
     ];
 
     pub fn row(self) -> u32 {
         self as u32
+    }
+
+    /// Index of the frame's cell, counting every frame of the rows above (atlas order).
+    pub fn cell(self, frame: usize) -> usize {
+        FRAMES[..self as usize].iter().sum::<usize>() + frame
     }
 
     /// Duration of each frame (seconds). `Walk` advances by distance travelled, not by time.
@@ -45,6 +52,7 @@ impl Anim {
             Anim::Happy => &[0.14, 0.11, 0.13, 0.14],
             Anim::Sleep => &[0.8, 0.7, 0.8, 0.7],
             Anim::Held => &[0.28, 0.2, 0.28, 0.2],
+            Anim::Sad => &[1.2, 0.9, 1.1, 0.2],
         }
     }
 
@@ -78,6 +86,8 @@ pub struct DogFrame {
     /// 1 = facing right, -1 = facing left.
     pub facing: f32,
     pub time: f32,
+    /// The toy is in its mouth.
+    pub carry: bool,
 }
 
 impl DogFrame {
@@ -87,6 +97,7 @@ impl DogFrame {
             frame,
             facing: 1.0,
             time: 0.0,
+            carry: false,
         }
     }
 }
@@ -116,7 +127,26 @@ enum Activity {
     Happy,
     Held,
     Falling,
+    Sad,
 }
+
+/// Playing fetch: running to the toy, then bringing it back.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Fetch {
+    None,
+    /// Running to `target` (where the mouth meets the toy); then back to `home`.
+    Chasing {
+        target: f32,
+        home: f32,
+    },
+    /// Carrying the toy back to `home`.
+    Returning {
+        home: f32,
+    },
+}
+
+/// How far in front of the feet point the mouth is (sprite pixels).
+pub const MOUTH: f32 = 44.0;
 
 /// Walking off screen (Hide) and back in (Show), past the right edge.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -163,6 +193,15 @@ pub struct Dog {
     away: bool,
     /// Set when a walk off screen finishes; read once by [`Dog::take_left`].
     just_left: bool,
+    fetch: Fetch,
+    /// Physical pixels per sprite pixel at the last update.
+    scale_hint: f32,
+    /// The toy is in the mouth.
+    carrying: bool,
+    /// Picked the toy up; read once by [`Dog::take_picked`].
+    picked: bool,
+    /// Put the toy down at this x; read once by [`Dog::take_dropped`].
+    dropped: Option<f32>,
     rng: fastrand::Rng,
 }
 
@@ -186,11 +225,17 @@ impl Dog {
             visit: Visit::None,
             away: false,
             just_left: false,
+            fetch: Fetch::None,
+            scale_hint: 1.0,
+            carrying: false,
+            picked: false,
+            dropped: None,
             rng: fastrand::Rng::new(),
         }
     }
 
     pub fn update(&mut self, dt: f32, b: &Bounds) {
+        self.scale_hint = b.scale;
         if self.away {
             return;
         }
@@ -212,7 +257,11 @@ impl Dog {
             Activity::Walk { origin, target } => {
                 let boost = if self.zoomies > 0 {
                     3.5
-                } else if matches!(self.visit, Visit::Entering { .. } | Visit::Leaving { .. }) {
+                } else if let Fetch::Chasing { .. } = self.fetch {
+                    3.0
+                } else if matches!(self.visit, Visit::Entering { .. } | Visit::Leaving { .. })
+                    || self.fetch != Fetch::None
+                {
                     1.8
                 } else {
                     1.0
@@ -232,6 +281,9 @@ impl Dog {
                             return;
                         }
                         _ => {}
+                    }
+                    if self.fetch_arrived(b) {
+                        return;
                     }
                     self.next(b);
                 }
@@ -293,6 +345,7 @@ impl Dog {
             return;
         }
         self.zoomies = 0;
+        self.drop_toy();
         let target = (b.right + OFFSTAGE * b.scale).round();
         self.visit = Visit::Leaving { target };
         if !matches!(self.activity, Activity::Held | Activity::Falling) {
@@ -331,6 +384,7 @@ impl Dog {
             Activity::Alert => Anim::Bark,
             Activity::Happy => Anim::Happy,
             Activity::Held | Activity::Falling => Anim::Held,
+            Activity::Sad => Anim::Sad,
         };
         let frame = match self.activity {
             Activity::Walk { .. } => self.steps() % anim.frames(),
@@ -342,13 +396,108 @@ impl Dog {
             frame,
             facing: self.facing,
             time: self.time,
+            carry: self.carrying,
+        }
+    }
+
+    /// Something failed: the dog sits and looks sad for a while.
+    pub fn sad(&mut self) {
+        if self.is_busy() || self.forced_sleep || self.is_performing() {
+            return;
+        }
+        self.set(Activity::Sad, 4.5);
+    }
+
+    /// The toy landed at `x` (physical): the dog runs to it, picks it up and brings it back
+    /// to where it stood. Does nothing while held, asleep or hidden.
+    pub fn fetch(&mut self, x: f32, b: &Bounds) -> bool {
+        if self.is_busy() || self.forced_sleep || self.zoomies > 0 {
+            return false;
+        }
+        let home = match self.fetch {
+            Fetch::Chasing { home, .. } | Fetch::Returning { home } => home,
+            Fetch::None => self.x.clamp(b.left, b.right).round(),
+        };
+        // Stop where the mouth is over the toy, on whichever side the dog comes from.
+        let dir = if x >= self.x { 1.0 } else { -1.0 };
+        let target = (x - dir * MOUTH * b.scale).round();
+        self.carrying = false;
+        self.fetch = Fetch::Chasing { target, home };
+        if (target - self.x).abs() < WALK_STRIDE * b.scale {
+            self.facing = dir;
+            self.fetch_arrived(b);
+        } else {
+            let origin = self.x.round();
+            self.set(Activity::Walk { origin, target }, 0.0);
+        }
+        true
+    }
+
+    /// Playing fetch (running to the toy or bringing it back).
+    pub fn is_fetching(&self) -> bool {
+        self.fetch != Fetch::None
+    }
+
+    /// Stops playing (the toy was grabbed, or the dog was picked up).
+    pub fn stop_fetch(&mut self) -> Option<f32> {
+        self.fetch = Fetch::None;
+        std::mem::take(&mut self.carrying).then(|| self.mouth_x())
+    }
+
+    /// The toy's x while carried: in front of the mouth (physical).
+    pub fn mouth_x(&self) -> f32 {
+        self.x + self.facing * MOUTH * self.scale_hint
+    }
+
+    pub fn is_carrying(&self) -> bool {
+        self.carrying
+    }
+
+    /// True once after the toy was picked up.
+    pub fn take_picked(&mut self) -> bool {
+        std::mem::take(&mut self.picked)
+    }
+
+    /// Once, after the toy was put down: where (physical x).
+    pub fn take_dropped(&mut self) -> Option<f32> {
+        self.dropped.take()
+    }
+
+    /// A walk ended: the next step of fetch, if playing. Returns true if it took over.
+    fn fetch_arrived(&mut self, b: &Bounds) -> bool {
+        match self.fetch {
+            Fetch::None => false,
+            Fetch::Chasing { home, .. } => {
+                self.carrying = true;
+                self.picked = true;
+                self.fetch = Fetch::Returning { home };
+                let origin = self.x.round();
+                if (home - origin).abs() < WALK_STRIDE * b.scale {
+                    return self.fetch_arrived(b);
+                }
+                self.set(
+                    Activity::Walk {
+                        origin,
+                        target: home,
+                    },
+                    0.0,
+                );
+                true
+            }
+            Fetch::Returning { .. } => {
+                self.fetch = Fetch::None;
+                self.carrying = false;
+                self.dropped = Some(self.mouth_x());
+                self.set(Activity::Happy, 1.6);
+                true
+            }
         }
     }
 
     /// A new notification arrived: sit up and bark. Sleeping (put to sleep) it only lifts its
-    /// head; it stays asleep.
+    /// head; it stays asleep. Fetching, it keeps playing.
     pub fn notify(&mut self) {
-        if self.is_busy() || self.forced_sleep {
+        if self.is_busy() || self.forced_sleep || self.fetch != Fetch::None {
             return;
         }
         self.set(Activity::Alert, 2.4);
@@ -383,7 +532,7 @@ impl Dog {
 
     /// The dog was clicked.
     pub fn pet(&mut self) {
-        if self.is_busy() {
+        if self.is_busy() || self.fetch != Fetch::None {
             return;
         }
         self.forced_sleep = false;
@@ -392,7 +541,15 @@ impl Dog {
 
     pub fn grab(&mut self) {
         self.zoomies = 0;
+        self.drop_toy();
         self.set(Activity::Held, 0.0);
+    }
+
+    /// Stops fetch; a carried toy falls where the mouth is.
+    fn drop_toy(&mut self) {
+        if let Some(x) = self.stop_fetch() {
+            self.dropped = Some(x);
+        }
     }
 
     pub fn drag_to(&mut self, x: f32, y: f32) {
@@ -434,6 +591,7 @@ impl Dog {
     /// the dog falls asleep when it comes back.
     pub fn sleep(&mut self) {
         self.forced_sleep = true;
+        self.drop_toy();
         if !self.is_busy() {
             self.set(Activity::Sleep, f32::INFINITY);
         }
@@ -454,10 +612,12 @@ impl Dog {
             || self.away
     }
 
-    /// True while the dog does something it was asked to (zoomies, walking in or out), so a
-    /// notification or a held bubble does not cut it short.
+    /// True while the dog does something it was asked to (zoomies, walking in or out,
+    /// fetching), so a notification or a held bubble does not cut it short.
     pub fn is_performing(&self) -> bool {
-        self.zoomies > 0 || matches!(self.visit, Visit::Entering { .. } | Visit::Leaving { .. })
+        self.zoomies > 0
+            || matches!(self.visit, Visit::Entering { .. } | Visit::Leaving { .. })
+            || self.fetch != Fetch::None
     }
 
     fn steps(&self) -> usize {
@@ -496,6 +656,17 @@ impl Dog {
         if let Visit::Entering { .. } = self.visit {
             // Dropped while walking in: it is on screen now, close enough.
             self.visit = Visit::None;
+        }
+        if let Fetch::Returning { home } = self.fetch {
+            // Dropped while bringing the toy back: carry on.
+            let origin = self.x.round();
+            return self.set(
+                Activity::Walk {
+                    origin,
+                    target: home,
+                },
+                0.0,
+            );
         }
         if self.forced_sleep {
             return self.set(Activity::Sleep, f32::INFINITY);
@@ -738,5 +909,70 @@ mod tests {
         assert_eq!(Anim::Idle.frame_at(0.0), 0);
         assert_eq!(Anim::Idle.frame_at(0.95), 1);
         assert_eq!(Anim::Idle.frame_at(1.65 + 0.1), 0);
+    }
+
+    fn run_until(dog: &mut Dog, secs: f32, done: impl Fn(&Dog) -> bool) {
+        for _ in 0..(secs * 60.0) as usize {
+            dog.update(1.0 / 60.0, &B);
+            if done(dog) {
+                return;
+            }
+        }
+    }
+
+    #[test]
+    fn fetches_the_toy_and_brings_it_back() {
+        let mut dog = Dog::new(500.0, B.ground);
+        dog.update(1.0 / 60.0, &B);
+        assert!(dog.fetch(1400.0, &B));
+        assert!(dog.is_performing());
+        assert_eq!(dog.facing, 1.0);
+        // A notification does not interrupt the game.
+        dog.notify();
+        assert_eq!(dog.frame().anim, Anim::Walk);
+        run_until(&mut dog, 20.0, |d| d.is_carrying());
+        assert!(dog.take_picked());
+        // Picked up where the mouth met the toy, then turned for home.
+        assert_eq!(dog.facing, -1.0);
+        assert!(
+            (dog.x + MOUTH * B.scale - 1400.0).abs() <= WALK_STRIDE * B.scale + 1.0,
+            "{}",
+            dog.x
+        );
+        assert!(dog.frame().carry);
+        run_until(&mut dog, 20.0, |d| !d.is_fetching());
+        assert_eq!(dog.x, 500.0, "back home");
+        assert!(!dog.is_carrying());
+        let at = dog.take_dropped().expect("puts it down");
+        assert!((at - dog.mouth_x()).abs() < 1.0);
+        assert_eq!(dog.frame().anim, Anim::Happy);
+    }
+
+    #[test]
+    fn fetch_to_the_left_and_dropping_the_dog() {
+        let mut dog = Dog::new(1000.0, B.ground);
+        dog.update(1.0 / 60.0, &B);
+        dog.fetch(300.0, &B);
+        assert_eq!(dog.facing, -1.0);
+        run_until(&mut dog, 20.0, |d| d.is_carrying());
+        // Picked up while carrying: the toy falls, the game ends.
+        dog.grab();
+        assert!(!dog.is_fetching() && !dog.is_carrying());
+        assert!(dog.take_dropped().is_some());
+        // Asleep: no fetch.
+        dog.release();
+        run_until(&mut dog, 3.0, |_| false);
+        dog.sleep();
+        assert!(!dog.fetch(900.0, &B));
+    }
+
+    #[test]
+    fn sad_for_a_while() {
+        let mut dog = Dog::new(500.0, B.ground);
+        dog.sad();
+        assert_eq!(dog.frame().anim, Anim::Sad);
+        run_until(&mut dog, 10.0, |d| d.frame().anim != Anim::Sad);
+        assert_ne!(dog.frame().anim, Anim::Sad);
+        assert_eq!(Anim::Sad.cell(0), 32);
     }
 }

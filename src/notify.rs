@@ -58,6 +58,55 @@ pub struct Notification {
     pub key: Option<String>,
     /// Snoozed ("Later"): waits until then before it is shown again.
     pub not_before: Option<Instant>,
+    /// Good or bad news: how the dog reacts (and sounds).
+    pub mood: Mood,
+}
+
+/// How a notification feels to the dog.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mood {
+    #[default]
+    Neutral,
+    /// Something finished well: the dog is happy.
+    Good,
+    /// Something failed: the dog is sad.
+    Bad,
+}
+
+impl Mood {
+    pub const NAMES: [&str; 3] = ["neutral", "good", "bad"];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "neutral" => Mood::Neutral,
+            "good" | "success" => Mood::Good,
+            "bad" | "failure" | "error" => Mood::Bad,
+            _ => return None,
+        })
+    }
+
+    /// A guess from the words: "Build failed", "Tests passed", ...
+    pub fn guess(title: &str, body: &str) -> Self {
+        let t = format!("{title} {body}").to_lowercase();
+        let has = |words: &[&str]| {
+            words.iter().any(|w| {
+                t.split(|c: char| !c.is_alphanumeric())
+                    .any(|token| token.starts_with(w))
+            })
+        };
+        if has(&[
+            "fail", "error", "crash", "broke", "denied", "rejected", "panic",
+        ]) {
+            Mood::Bad
+        } else if has(&[
+            "pass", "success", "succeed", "done", "finish", "complete", "merged", "deployed",
+            "ready",
+        ]) {
+            Mood::Good
+        } else {
+            Mood::Neutral
+        }
+    }
 }
 
 impl Notification {
@@ -77,7 +126,14 @@ impl Notification {
             announced: false,
             key: None,
             not_before: None,
+            mood: Mood::Neutral,
         }
+    }
+
+    /// Sets the mood, or guesses it from the text when `None`.
+    pub fn mood(mut self, m: Option<Mood>) -> Self {
+        self.mood = m.unwrap_or_else(|| Mood::guess(&self.title, &self.body));
+        self
     }
 
     pub fn sticky(mut self) -> Self {
@@ -142,10 +198,13 @@ pub enum Reaction {
     Sleep,
     Wake,
     Zoomies,
+    Sad,
+    /// Throws the toy for the dog to fetch.
+    Fetch,
 }
 
 impl Reaction {
-    pub const NAMES: [&str; 5] = ["happy", "bark", "sleep", "wake", "zoomies"];
+    pub const NAMES: [&str; 7] = ["happy", "bark", "sleep", "wake", "zoomies", "sad", "fetch"];
 
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
@@ -154,6 +213,8 @@ impl Reaction {
             "sleep" => Reaction::Sleep,
             "wake" => Reaction::Wake,
             "zoomies" => Reaction::Zoomies,
+            "sad" => Reaction::Sad,
+            "fetch" => Reaction::Fetch,
             _ => return None,
         })
     }
@@ -197,4 +258,22 @@ impl Notifier {
 pub fn channel() -> (Notifier, Receiver<Event>) {
     let (tx, rx) = mpsc::channel();
     (Notifier(tx), rx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mood_from_words() {
+        assert_eq!(Mood::guess("Build failed", ""), Mood::Bad);
+        assert_eq!(Mood::guess("CI", "3 errors"), Mood::Bad);
+        assert_eq!(Mood::guess("Tests passed", ""), Mood::Good);
+        assert_eq!(Mood::guess("Done", "cargo build"), Mood::Good);
+        assert_eq!(Mood::guess("New mail", "from Ayşe"), Mood::Neutral);
+        // Whole words only: "redone" is not "done", "terror" is not "error".
+        assert_eq!(Mood::guess("redone", "terror"), Mood::Neutral);
+        let n = Notification::new("Deploy", "ok").mood(Some(Mood::Bad));
+        assert_eq!(n.mood, Mood::Bad);
+    }
 }

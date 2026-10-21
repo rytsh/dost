@@ -58,6 +58,19 @@ struct Shell {
     hotkeys: crate::hotkeys::Hotkeys,
     /// While hidden: the bubble on its own above the tray icon.
     alone: AloneBubble,
+    /// The bone's window.
+    toy: ToyWindow,
+}
+
+/// A small layered window for the toy, so it can fly anywhere along the taskbar.
+struct ToyWindow {
+    hwnd: HWND,
+    pixmap: Pixmap,
+    dib: Dib,
+    pos: POINT,
+    shown: bool,
+    /// Cursor offset from the toy's bottom-centre while dragging.
+    drag: Option<(f32, f32)>,
 }
 
 /// A bubble window without the dog, above the tray icon.
@@ -126,6 +139,14 @@ pub fn run() {
             shown: false,
             anchor: None,
         },
+        toy: ToyWindow {
+            hwnd: unsafe { create_window() },
+            pixmap: Pixmap::new(1, 1).unwrap(),
+            dib: Dib::default(),
+            pos: POINT { x: 0, y: 0 },
+            shown: false,
+            drag: None,
+        },
     };
     // Hidden last time: stays hidden.
     let shown = core.on_screen();
@@ -167,8 +188,8 @@ fn build_menu() -> (Menu, MenuItems) {
 }
 
 impl Platform for Shell {
-    fn play_bark(&mut self, volume: u8) {
-        sound::play(volume);
+    fn play_wav(&mut self, wav: Vec<u8>) {
+        sound::play(wav);
     }
 
     fn copy_text(&mut self, text: &str) -> bool {
@@ -319,6 +340,7 @@ impl App {
         if self.core.on_screen() {
             self.paint();
         }
+        self.paint_toy();
         self.paint_alone();
         if self.core.panel_dirty {
             self.core.panel_dirty = false;
@@ -337,16 +359,18 @@ impl App {
         if now - self.shell.last_topmost > Duration::from_secs(2) {
             // Clicking the taskbar raises it above us; put the dog back on top.
             self.shell.last_topmost = now;
-            unsafe {
-                SetWindowPos(
-                    self.shell.hwnd,
-                    HWND_TOPMOST,
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                );
+            for hwnd in [self.shell.hwnd, self.shell.toy.hwnd] {
+                unsafe {
+                    SetWindowPos(
+                        hwnd,
+                        HWND_TOPMOST,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
             }
         }
     }
@@ -404,6 +428,77 @@ impl App {
             .renderer
             .draw(&mut sh.pixmap, anchor, &frame, bubble.as_ref(), scale);
         unsafe { sh.dib.present(sh.hwnd, &sh.pixmap, sh.win_pos) };
+    }
+
+    /// The toy's window: shown while the toy lies, flies or is dragged (not in the mouth).
+    fn paint_toy(&mut self) {
+        let show = self.core.toy_shown();
+        let t = &mut self.shell.toy;
+        if !show {
+            if t.shown {
+                t.shown = false;
+                unsafe { ShowWindow(t.hwnd, SW_HIDE) };
+            }
+            return;
+        }
+        let Some(item) = self.core.renderer.outfit().toy else {
+            return;
+        };
+        let pt = POINT {
+            x: self.core.toy.x as i32,
+            y: self.core.toy.y as i32 - 10,
+        };
+        let px = self.core.scale(monitor_scale(pt)).px;
+        let size = self.core.renderer.toy_size(item, px);
+        if t.pixmap.width() != size {
+            t.pixmap = Pixmap::new(size, size).unwrap();
+        }
+        self.core
+            .renderer
+            .draw_toy(&mut t.pixmap, item, self.core.toy.quarter(), px);
+        t.pos = POINT {
+            x: (self.core.toy.x - size as f32 / 2.0).round() as i32,
+            y: (self.core.toy.y - size as f32).round() as i32,
+        };
+        unsafe {
+            t.dib.present(t.hwnd, &t.pixmap, t.pos);
+            if !t.shown {
+                t.shown = true;
+                ShowWindow(t.hwnd, SW_SHOWNOACTIVATE);
+                SetWindowPos(
+                    t.hwnd,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        }
+    }
+
+    fn toy_down(&mut self) {
+        let p = cursor_pos();
+        let t = &mut self.shell.toy;
+        t.drag = Some((p.x as f32 - self.core.toy.x, p.y as f32 - self.core.toy.y));
+        self.core.grab_toy();
+        unsafe { SetCapture(t.hwnd) };
+    }
+
+    fn toy_move(&mut self) {
+        if let Some((dx, dy)) = self.shell.toy.drag {
+            let p = cursor_pos();
+            self.core.toy.drag_to(p.x as f32 - dx, p.y as f32 - dy);
+        }
+    }
+
+    fn toy_up(&mut self) {
+        if self.shell.toy.drag.take().is_some() {
+            unsafe { ReleaseCapture() };
+            let scale = self.bounds().scale;
+            self.core.toy.release(scale);
+        }
     }
 
     /// While hidden: shows the current bubble on its own just above the tray icon.
@@ -510,7 +605,7 @@ impl App {
     /// Opens the panel next to `anchor` (the tray icon), or near the cursor; closes it if open.
     fn toggle_panel(&mut self, anchor: Option<POINT>) {
         if self.shell.panel.is_open() {
-            self.shell.panel.close();
+            self.close_panel();
             return;
         }
         let missed = self.core.missed;
@@ -524,12 +619,50 @@ impl App {
     }
 
     fn paint_panel(&mut self) {
+        // The caret blinks while the name is edited.
+        if self
+            .shell
+            .panel
+            .panel
+            .as_ref()
+            .is_some_and(Panel::is_editing)
+        {
+            self.shell.panel.redraw = true;
+        }
         if !self.shell.panel.is_open() || !self.shell.panel.redraw {
             return;
         }
         self.shell.panel.redraw = false;
         let view = self.core.panel_view(&self.shell);
         self.shell.panel.paint(&mut self.core.renderer, &view);
+    }
+
+    /// A key for the panel's name field.
+    fn panel_key(&mut self, key: panel::Key) {
+        let view = self.core.panel_view(&self.shell);
+        let Some(p) = self.shell.panel.panel.as_mut() else {
+            return;
+        };
+        let (redraw, action) = p.key(key, &view);
+        self.shell.panel.redraw |= redraw;
+        if let Some(a) = action {
+            self.on_action(a);
+        }
+    }
+
+    /// Closes the panel; a name being edited is saved.
+    fn close_panel(&mut self) {
+        let view = self.core.panel_view(&self.shell);
+        let action = self
+            .shell
+            .panel
+            .panel
+            .as_mut()
+            .and_then(|p| p.finish_editing(&view));
+        self.shell.panel.close();
+        if let Some(a) = action {
+            self.on_action(a);
+        }
     }
 
     fn mouse_down(&mut self, client: POINT) {
@@ -599,16 +732,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if with_app(|a| a.shell.alone.hwnd == hwnd) == Some(true) {
                 return 0;
             }
+            if with_app(|a| a.shell.toy.hwnd == hwnd) == Some(true) {
+                with_app(App::toy_down);
+                return 0;
+            }
             with_app(|a| a.mouse_down(client()));
             0
         }
         WM_MOUSEMOVE => {
-            with_app(App::mouse_move);
+            with_app(|a| {
+                a.toy_move();
+                a.mouse_move();
+            });
             0
         }
         WM_LBUTTONUP => {
             if with_app(|a| a.shell.alone.hwnd == hwnd) == Some(true) {
                 with_app(|a| a.alone_click(client()));
+                return 0;
+            }
+            if with_app(|a| a.shell.toy.hwnd == hwnd) == Some(true) {
+                with_app(App::toy_up);
                 return 0;
             }
             with_app(|a| a.mouse_up(client()));
@@ -619,6 +763,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if a.shell.drag.take().is_some_and(|d| d.moved) {
                     a.core.dog.release();
                 }
+                a.toy_up();
             });
             0
         }
@@ -939,13 +1084,7 @@ mod sound {
     /// the last played sound is kept here (a new call stops the previous one).
     static PLAYING: Mutex<Option<Vec<u8>>> = Mutex::new(None);
 
-    pub fn play(volume: u8) {
-        if volume == 0 {
-            return;
-        }
-        let Some(wav) = dost::sound::scaled_wav(dost::sound::BARK_WAV, volume) else {
-            return;
-        };
+    pub fn play(wav: Vec<u8>) {
         let Ok(mut slot) = PLAYING.lock() else { return };
         unsafe {
             // Stop the old one first, then swap the buffer.
@@ -1171,7 +1310,31 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             0
         }
         WM_KEYDOWN if wp == 0x1B => {
-            with_app(|a| a.shell.panel.close());
+            // Esc: cancels editing the name, or closes the panel.
+            with_app(|a| {
+                if a.shell.panel.panel.as_ref().is_some_and(Panel::is_editing) {
+                    a.panel_key(panel::Key::Escape);
+                } else {
+                    a.shell.panel.close();
+                }
+            });
+            0
+        }
+        WM_KEYDOWN if wp == 0x08 || wp == 0x0D => {
+            let key = if wp == 0x08 {
+                panel::Key::Backspace
+            } else {
+                panel::Key::Enter
+            };
+            with_app(|a| a.panel_key(key));
+            0
+        }
+        WM_CHAR => {
+            // Typed text for the name field (Backspace and Enter come as WM_KEYDOWN).
+            let c = char::from_u32(wp as u32).filter(|c| !c.is_control());
+            if let Some(c) = c {
+                with_app(|a| a.panel_key(panel::Key::Text(c.to_string())));
+            }
             0
         }
         WM_ACTIVATE if (wp & 0xffff) as u32 == WA_INACTIVE => {
@@ -1182,7 +1345,7 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         WM_CLOSE => {
             with_app(|a| {
                 if a.shell.panel.hwnd == Some(hwnd) {
-                    a.shell.panel.close();
+                    a.close_panel();
                 }
             });
             0

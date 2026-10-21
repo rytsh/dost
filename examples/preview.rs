@@ -146,10 +146,11 @@ fn main() {
     for (scale, tab, arrow, name) in [
         (1.0, 0, false, "panel"),
         (2.0, 0, true, "panel-200"),
-        (2.0, 1, true, "panel-200-walk"),
-        (2.0, 2, true, "panel-200-sound"),
-        (2.0, 3, true, "panel-200-history"),
-        (2.0, 4, true, "panel-200-connect"),
+        (2.0, 1, true, "panel-200-look"),
+        (2.0, 2, true, "panel-200-walk"),
+        (2.0, 3, true, "panel-200-sound"),
+        (2.0, 4, true, "panel-200-history"),
+        (2.0, 5, true, "panel-200-connect"),
     ] {
         let mut panel = dost::panel::Panel::new(scale);
         panel.set_tab(tab);
@@ -157,7 +158,11 @@ fn main() {
             panel.set_arrow(Some(dost::panel::WIDTH * scale / 2.0));
         }
         let view = dost::panel::View {
-            settings: dost::settings::Settings::default(),
+            settings: dost::settings::Settings {
+                name: "Karabaş".into(),
+                ..Default::default()
+            },
+            age: "2 years".into(),
             visible: true,
             mcp_ok: true,
             mcp_status: "http://127.0.0.1:7777/mcp".into(),
@@ -165,7 +170,7 @@ fn main() {
             autostart_label: "Start with Windows",
             history: history.clone(),
             // The Connect tab shows an update waiting for a restart.
-            update: (tab == 4).then(|| ("0.2.0".into(), true)),
+            update: (tab == 5).then(|| ("0.2.0".into(), true)),
             ..Default::default()
         };
         let (w, h) = panel.size(10_000);
@@ -208,6 +213,172 @@ fn main() {
     ip.save_png(out.replace(".png", "-icon-sleep.png")).unwrap();
     let ip = r.icon_pixmap(64, false, true);
     ip.save_png(out.replace(".png", "-icon-dot.png")).unwrap();
+
+    // Looks: every fur and collar colour, every outfit, facing both ways, and the bone carried.
+    {
+        use dost::look::{Collar, Fur, Outfit, Season, Theme, Wear};
+        let looks = [
+            (Fur::Golden, Collar::Red, Wear::None, None),
+            (Fur::Cream, Collar::Blue, Wear::Bandana, None),
+            (Fur::Chocolate, Collar::Green, Wear::Beanie, None),
+            (Fur::Black, Collar::Pink, Wear::Glasses, None),
+            (
+                Fur::Grey,
+                Collar::Purple,
+                Wear::None,
+                Some(Season::Birthday),
+            ),
+            (
+                Fur::Red,
+                Collar::Black,
+                Wear::Glasses,
+                Some(Season::Halloween),
+            ),
+            (
+                Fur::Golden,
+                Collar::Red,
+                Wear::Bandana,
+                Some(Season::Christmas),
+            ),
+        ];
+        let anims = [
+            (Anim::Idle, 0, 1.0, false),
+            (Anim::Walk, 3, -1.0, true),
+            (Anim::Sit, 1, 1.0, false),
+            (Anim::Bark, 2, -1.0, false),
+            (Anim::Sad, 2, 1.0, false),
+            (Anim::Sleep, 0, 1.0, false),
+            (Anim::Held, 1, 1.0, false),
+        ];
+        let pad = 30;
+        let (lw, lh) = (cw + 2 * pad, ch + 2 * pad);
+        let mut sheet = Pixmap::new(
+            (lw * anims.len() as i32) as u32,
+            (lh * looks.len() as i32) as u32,
+        )
+        .unwrap();
+        sheet.fill(bg);
+        for (row, (fur, collar, wear, season)) in looks.into_iter().enumerate() {
+            r.set_look(
+                fur,
+                collar,
+                Outfit::new(wear, season),
+                Theme::Classic,
+                Vec::new(),
+            );
+            for (col, (anim, f, facing, carry)) in anims.into_iter().enumerate() {
+                let frame = DogFrame {
+                    facing,
+                    carry,
+                    ..DogFrame::still(anim, f)
+                };
+                let mut pm = Pixmap::new(lw as u32, lh as u32).unwrap();
+                let (w, h) = r.size(anim, None, s);
+                let _ = (w, h);
+                // Draw through the renderer so worn items are included.
+                let mut tmp = Pixmap::new(lw as u32, (lh + 40) as u32).unwrap();
+                r.draw(&mut tmp, (lw / 2) as f32, &frame, None, s);
+                pm.draw_pixmap(
+                    0,
+                    -40,
+                    tmp.as_ref(),
+                    &Default::default(),
+                    Transform::identity(),
+                    None,
+                );
+                sheet.draw_pixmap(
+                    col as i32 * lw,
+                    row as i32 * lh,
+                    pm.as_ref(),
+                    &Default::default(),
+                    Transform::identity(),
+                    None,
+                );
+            }
+        }
+        sheet.save_png(out.replace(".png", "-looks.png")).unwrap();
+
+        // Bubble themes and source colours.
+        let mut row: Vec<Pixmap> = Vec::new();
+        for (theme, _) in Theme::ALL {
+            r.set_look(
+                Fur::Golden,
+                Collar::Red,
+                Outfit::default(),
+                theme,
+                Vec::new(),
+            );
+            let b = Bubble {
+                title: "Build failed",
+                body: "3 errors in src/auth.rs",
+                source: Some(if theme == Theme::Classic {
+                    "CI"
+                } else {
+                    "OpenCode"
+                }),
+                snooze: true,
+                ..Default::default()
+            };
+            let s2 = Scale::new(2.0, 100).with_text(1.2);
+            let frame = DogFrame::still(Anim::Sad, 0);
+            let (w, h) = r.size(frame.anim, Some(&b), s2);
+            let mut pm = Pixmap::new(w, h).unwrap();
+            pm.fill(Color::from_rgba8(0xd9, 0xdd, 0xe3, 255));
+            let mut fg = Pixmap::new(w, h).unwrap();
+            r.draw(&mut fg, w as f32 * 0.5, &frame, Some(&b), s2);
+            pm.draw_pixmap(
+                0,
+                0,
+                fg.as_ref(),
+                &Default::default(),
+                Transform::identity(),
+                None,
+            );
+            row.push(pm);
+        }
+        let w: u32 = row.iter().map(|p| p.width()).sum();
+        let h = row.iter().map(|p| p.height()).max().unwrap();
+        let mut sheet = Pixmap::new(w, h).unwrap();
+        let mut x = 0;
+        for p in &row {
+            sheet.draw_pixmap(
+                x,
+                0,
+                p.as_ref(),
+                &Default::default(),
+                Transform::identity(),
+                None,
+            );
+            x += p.width() as i32;
+        }
+        sheet.save_png(out.replace(".png", "-themes.png")).unwrap();
+
+        // The toy, turned.
+        let px = 3;
+        let size = r.toy_size(dost::look::Item::Bone, px);
+        let mut sheet = Pixmap::new(size * 4, size).unwrap();
+        sheet.fill(bg);
+        for q in 0..4u8 {
+            let mut pm = Pixmap::new(size, size).unwrap();
+            r.draw_toy(&mut pm, dost::look::Item::Bone, q, px);
+            sheet.draw_pixmap(
+                (q as u32 * size) as i32,
+                0,
+                pm.as_ref(),
+                &Default::default(),
+                Transform::identity(),
+                None,
+            );
+        }
+        sheet.save_png(out.replace(".png", "-toy.png")).unwrap();
+        r.set_look(
+            Fur::Golden,
+            Collar::Red,
+            Outfit::default(),
+            Theme::Classic,
+            Vec::new(),
+        );
+    }
 
     // MCP bubbles: a question, progress (running / done / failed) and a link.
     {

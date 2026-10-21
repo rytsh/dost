@@ -11,10 +11,13 @@ use tiny_skia::{
 };
 
 use crate::dog::{Anim, DogFrame};
+use crate::look::{self, Collar, Fur, Item, Outfit, Theme};
 use crate::notify::ProgressState;
 
 /// Output of `art/pack_atlas.py`: each row is an animation (in `Anim` order), each column a frame.
 const ATLAS_PNG: &[u8] = include_bytes!("../assets/dog.png");
+/// Output of `art/pack_items.py`: hats, glasses, the bandana and toys, in `Item` order.
+const ITEMS_PNG: &[u8] = include_bytes!("../assets/items.png");
 /// Text uses the system UI font; these families are tried in order.
 const SYSTEM_FAMILIES: [&str; 7] = [
     "Segoe UI",
@@ -39,6 +42,8 @@ const BUBBLE_GAP: f32 = 2.0;
 const BUBBLE_TAIL: f32 = 9.0;
 /// Space left above the dog for the "z" letters (logical).
 const HEADROOM: f32 = 26.0;
+/// How far a worn or carried item may reach past the cell's sides (sprite pixels).
+const ITEM_SPILL: u32 = 24;
 
 const OUTLINE: ColorU8 = rgb(0x4a, 0x2e, 0x1b);
 const INK: ColorU8 = rgb(0x2b, 0x2b, 0x33);
@@ -63,6 +68,91 @@ const SNOOZE: &str = "Later · 10 min";
 
 const fn rgb(r: u8, g: u8, b: u8) -> ColorU8 {
     ColorU8::from_rgba(r, g, b, 255)
+}
+
+/// Bubble colours of a [`Theme`].
+#[derive(Clone, Copy, Debug)]
+struct Palette {
+    /// Bubble over the dog.
+    bubble: ColorU8,
+    outline: ColorU8,
+    /// Bubble on its own (card look).
+    card: ColorU8,
+    card_border: ColorU8,
+    ink: ColorU8,
+    body: ColorU8,
+    muted: ColorU8,
+    accent: ColorU8,
+    accent_ink: ColorU8,
+    accent_soft: ColorU8,
+    track: ColorU8,
+    /// Source names are lightened this much (0-1) to read on a dark bubble.
+    lighten: f32,
+}
+
+fn palette(t: Theme) -> Palette {
+    let classic = Palette {
+        bubble: rgb(0xff, 0xff, 0xff),
+        outline: OUTLINE,
+        card: CARD_BG,
+        card_border: CARD_BORDER,
+        ink: INK,
+        body: BODY,
+        muted: MUTED,
+        accent: ACCENT,
+        accent_ink: ACCENT_INK,
+        accent_soft: ACCENT_SOFT,
+        track: TRACK,
+        lighten: 0.0,
+    };
+    match t {
+        Theme::Classic => classic,
+        Theme::Dark => Palette {
+            bubble: rgb(0x2b, 0x2a, 0x33),
+            outline: rgb(0x0d, 0x0c, 0x10),
+            card: rgb(0x2b, 0x2a, 0x33),
+            card_border: rgb(0x45, 0x43, 0x50),
+            ink: rgb(0xf3, 0xef, 0xe8),
+            body: rgb(0xcf, 0xca, 0xd6),
+            muted: rgb(0x9a, 0x95, 0xa4),
+            accent_ink: rgb(0xf2, 0xb7, 0x65),
+            accent_soft: rgb(0x4a, 0x3c, 0x2c),
+            track: rgb(0x45, 0x43, 0x50),
+            lighten: 0.4,
+            ..classic
+        },
+        Theme::Sky => Palette {
+            bubble: rgb(0xee, 0xf6, 0xff),
+            outline: rgb(0x2d, 0x4f, 0x7c),
+            card: rgb(0xee, 0xf6, 0xff),
+            card_border: rgb(0xc9, 0xdc, 0xf2),
+            accent: rgb(0x2f, 0x7a, 0xd6),
+            accent_ink: rgb(0x1d, 0x55, 0x9c),
+            accent_soft: rgb(0xd6, 0xe7, 0xfb),
+            track: rgb(0xd5, 0xe1, 0xee),
+            ..classic
+        },
+        Theme::Mint => Palette {
+            bubble: rgb(0xee, 0xfb, 0xf3),
+            outline: rgb(0x2b, 0x6b, 0x4b),
+            card: rgb(0xee, 0xfb, 0xf3),
+            card_border: rgb(0xc8, 0xe9, 0xd5),
+            accent: rgb(0x2f, 0x9a, 0x64),
+            accent_ink: rgb(0x1f, 0x6e, 0x46),
+            accent_soft: rgb(0xd3, 0xf1, 0xe0),
+            track: rgb(0xd4, 0xe8, 0xdc),
+            ..classic
+        },
+    }
+}
+
+fn mix(a: ColorU8, b: ColorU8, t: f32) -> ColorU8 {
+    let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    rgb(
+        m(a.red(), b.red()),
+        m(a.green(), b.green()),
+        m(a.blue(), b.blue()),
+    )
 }
 
 fn color(c: ColorU8) -> Color {
@@ -134,8 +224,18 @@ pub struct Hits {
 }
 
 pub struct Renderer {
+    /// The dog as drawn (`assets/dog.png`).
+    original: Pixmap,
+    /// The dog in the chosen colours.
     atlas: Pixmap,
-    /// Height of each animation's highest point above the ground (sprite pixels).
+    items: Pixmap,
+    outfit: Outfit,
+    colors: (Fur, Collar),
+    pal: Palette,
+    /// Lowercase source name -> label colour (settings).
+    source_colors: Vec<(String, ColorU8)>,
+    /// Height of each animation's highest point above the ground, with what it wears
+    /// (sprite pixels).
     heights: [u32; Anim::ALL.len()],
     text: Option<Text>,
 }
@@ -160,7 +260,8 @@ impl Renderer {
     /// `extra_fonts`: additional font files (e.g. if the system has no fonts).
     pub fn new(system_fonts: bool, extra_fonts: Vec<Vec<u8>>) -> Self {
         let atlas = Pixmap::decode_png(ATLAS_PNG).expect("assets/dog.png");
-        let heights = Anim::ALL.map(|a| sprite_height(&atlas, a));
+        let items = Pixmap::decode_png(ITEMS_PNG).expect("assets/items.png");
+        let heights = Anim::ALL.map(|a| sprite_height(&atlas, a, &Outfit::default()));
         let sources = extra_fonts
             .into_iter()
             .map(|d| cosmic_text::fontdb::Source::Binary(std::sync::Arc::new(d)));
@@ -200,9 +301,107 @@ impl Renderer {
                 .to_string();
         }
         Renderer {
+            original: atlas.clone(),
             atlas,
+            items,
+            outfit: Outfit::default(),
+            colors: (Fur::Golden, Collar::Red),
+            pal: palette(Theme::Classic),
+            source_colors: Vec::new(),
             heights,
             text,
+        }
+    }
+
+    /// Colours, what the dog wears and the bubble theme. Cheap when nothing changed.
+    pub fn set_look(
+        &mut self,
+        fur: Fur,
+        collar: Collar,
+        outfit: Outfit,
+        theme: Theme,
+        source_colors: Vec<(String, ColorU8)>,
+    ) {
+        if self.colors != (fur, collar) {
+            self.colors = (fur, collar);
+            self.atlas = self.original.clone();
+            look::recolor(&mut self.atlas, fur, collar);
+        }
+        if self.outfit != outfit {
+            self.outfit = outfit;
+            self.heights = Anim::ALL.map(|a| sprite_height(&self.atlas, a, &outfit));
+        }
+        self.pal = palette(theme);
+        self.source_colors = source_colors;
+        // Colours are part of the cached layout.
+        if let Some(t) = self.text.as_mut() {
+            t.laid_out = None;
+        }
+    }
+
+    pub fn outfit(&self) -> Outfit {
+        self.outfit
+    }
+
+    /// Size of the toy's window: a square that fits it turned any quarter turn (physical).
+    pub fn toy_size(&self, item: Item, px: u32) -> u32 {
+        let (_, _, w, h) = item.sprite().rect;
+        w.max(h) * px
+    }
+
+    /// Draws the toy turned `quarter` quarter turns, centred, resting on the bottom edge.
+    pub fn draw_toy(&self, pm: &mut Pixmap, item: Item, quarter: u8, px: u32) {
+        pm.fill(Color::TRANSPARENT);
+        let (rx, ry, w, h) = item.sprite().rect;
+        let turned = quarter % 2 == 1;
+        let (tw, th) = if turned { (h, w) } else { (w, h) };
+        let (pw, ph) = (pm.width() as i32, pm.height() as i32);
+        let x0 = (pw - (tw * px) as i32) / 2;
+        let y0 = ph - (th * px) as i32;
+        let src = self.items.pixels();
+        let iw = self.items.width();
+        let dst = pm.pixels_mut();
+        for ty in 0..th {
+            for tx in 0..tw {
+                // Pixel of the turned item -> pixel of the item.
+                let (sx, sy) = match quarter % 4 {
+                    0 => (tx, ty),
+                    1 => (ty, h - 1 - tx),
+                    2 => (w - 1 - tx, h - 1 - ty),
+                    _ => (w - 1 - ty, tx),
+                };
+                let p = src[((ry + sy) * iw + rx + sx) as usize];
+                if p.alpha() == 0 {
+                    continue;
+                }
+                let (bx, by) = (x0 + (tx * px) as i32, y0 + (ty * px) as i32);
+                for y in by.max(0)..(by + px as i32).min(ph) {
+                    for x in bx.max(0)..(bx + px as i32).min(pw) {
+                        let d = &mut dst[(y * pw + x) as usize];
+                        *d = over(p, *d);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The dog and what it wears (and carries), feet point at (`ax`, `ground`).
+    fn blit_dog(&self, pm: &mut Pixmap, f: &DogFrame, ax: i32, ground: i32, px: i32) {
+        blit_sprite(pm, &self.atlas, f, ax, ground, px);
+        let cell = f.anim.cell(f.frame);
+        let toy = self.outfit.toy.filter(|_| f.carry);
+        for item in self.outfit.worn().chain(toy) {
+            let s = item.sprite();
+            let (tx, ty) = item_target(s, cell);
+            let (rx, ry, w, h) = s.rect;
+            blit_region(
+                pm,
+                &self.items,
+                (rx, ry, w, h),
+                (tx - s.pin.0, ty - s.pin.1),
+                f.facing < 0.0,
+                (ax, ground, px),
+            );
         }
     }
 
@@ -219,7 +418,7 @@ impl Renderer {
             }
             None => HEADROOM * s.ui,
         };
-        let w = (WIDTH * s.bubble()).max((CELL.0 * s.px) as f32 + 8.0);
+        let w = (WIDTH * s.bubble()).max(((CELL.0 + 2 * ITEM_SPILL) * s.px) as f32 + 8.0);
         let h = Self::below(s) + dog + extra;
         (w.ceil() as u32, h.ceil() as u32)
     }
@@ -245,14 +444,7 @@ impl Renderer {
         pixmap.fill(Color::TRANSPARENT);
         let ground = Self::ground_offset(pixmap.height(), s);
         let ax = anchor_x.round() as i32;
-        blit_sprite(
-            pixmap,
-            &self.atlas,
-            frame,
-            ax,
-            ground.round() as i32,
-            s.px as i32,
-        );
+        self.blit_dog(pixmap, frame, ax, ground.round() as i32, s.px as i32);
 
         if frame.anim == Anim::Sleep {
             self.draw_zzz(pixmap, anchor_x, ground, frame, s);
@@ -386,6 +578,7 @@ impl Renderer {
     }
 
     fn draw_zzz(&mut self, pm: &mut Pixmap, ax: f32, ground: f32, frame: &DogFrame, s: Scale) {
+        let muted = self.pal.muted;
         let Some(text) = &mut self.text else { return };
         let px = s.px as f32;
         let head_x = ax + 50.0 * px * frame.facing;
@@ -396,7 +589,7 @@ impl Renderer {
             let y = head_y - (14.0 + p * 18.0) * s.ui;
             let alpha = ((p * PI).sin() * 0.9 * 255.0) as u8;
             let size = (9.0 + p * 6.0) * s.ui;
-            let c = cosmic_text::Color::rgba(MUTED.red(), MUTED.green(), MUTED.blue(), alpha);
+            let c = cosmic_text::Color::rgba(muted.red(), muted.green(), muted.blue(), alpha);
             let attrs = Attrs::new()
                 .family(Family::Name(&text.family))
                 .weight(Weight::BOLD);
@@ -422,12 +615,17 @@ impl Renderer {
             max.to_bits(),
         );
         if text.laid_out.as_ref() != Some(&key) {
+            let pal = self.pal;
+            let src_color = b.source.map_or(pal.accent_ink, |s| {
+                let c = look::source_color(s, &self.source_colors);
+                mix(c, rgb(0xff, 0xff, 0xff), pal.lighten)
+            });
             let base = Attrs::new()
                 .family(Family::Name(&text.family))
-                .color(cc(INK));
+                .color(cc(pal.ink));
             let source = base
                 .clone()
-                .color(cc(ACCENT_INK))
+                .color(cc(src_color))
                 .weight(Weight::SEMIBOLD)
                 .metrics(Metrics::new(11.0 * scale, 16.0 * scale));
             let title = base
@@ -436,11 +634,11 @@ impl Renderer {
                 .metrics(Metrics::new(13.5 * scale, 18.0 * scale));
             let body = base
                 .clone()
-                .color(cc(BODY))
+                .color(cc(pal.body))
                 .metrics(Metrics::new(13.0 * scale, 18.0 * scale));
             let more = base
                 .clone()
-                .color(cc(MUTED))
+                .color(cc(pal.muted))
                 .metrics(Metrics::new(11.5 * scale, 17.0 * scale));
             let body_text: String = b.body.chars().take(400).collect();
             let more_text = format!("+{} more", b.pending);
@@ -510,6 +708,7 @@ impl Renderer {
         scale: f32,
         card: bool,
     ) -> Option<Hits> {
+        let pal = self.pal;
         let max = if card { CARD_MAX_TEXT } else { BUBBLE_MAX_TEXT };
         let (widths, rows) = self.choice_layout(b, scale, max);
         let label = |c: ColorU8| TextStyle {
@@ -559,7 +758,7 @@ impl Renderer {
         }
         pm.fill_path(
             &path,
-            &paint(if card { color(CARD_BG) } else { Color::WHITE }),
+            &paint(color(if card { pal.card } else { pal.bubble })),
             FillRule::Winding,
             Transform::identity(),
             None,
@@ -570,7 +769,7 @@ impl Renderer {
         };
         pm.stroke_path(
             &path,
-            &paint(color(if card { CARD_BORDER } else { OUTLINE })),
+            &paint(color(if card { pal.card_border } else { pal.outline })),
             &stroke,
             Transform::identity(),
             None,
@@ -578,7 +777,7 @@ impl Renderer {
 
         if let Some(text) = &mut self.text {
             let x = left + pad - text.left;
-            text.draw(pm, x, top + pad, cc(INK));
+            text.draw(pm, x, top + pad, cc(pal.ink));
         }
 
         let x = left + pad;
@@ -587,9 +786,9 @@ impl Renderer {
             y += 6.0 * scale;
             let bar_h = 6.0 * scale;
             let track = Rect::from_xywh(x, y + 2.0 * scale, tw, bar_h)?;
-            fill_rrect(pm, track, bar_h / 2.0, TRACK);
+            fill_rrect(pm, track, bar_h / 2.0, pal.track);
             let fill_c = match state {
-                ProgressState::Running => ACCENT,
+                ProgressState::Running => pal.accent,
                 ProgressState::Done => OK,
                 ProgressState::Failed => FAIL,
             };
@@ -620,7 +819,7 @@ impl Renderer {
             let st = TextStyle {
                 size: 12.0 * scale,
                 bold: false,
-                color: ACCENT_INK,
+                color: pal.accent_ink,
             };
             self.draw_text(pm, x, y, "Click to open ↗", st);
             y += (LINK_H - 4.0) * scale;
@@ -631,7 +830,7 @@ impl Renderer {
             let st = TextStyle {
                 size: 12.0 * scale,
                 bold: true,
-                color: ACCENT_INK,
+                color: pal.accent_ink,
             };
             // A little slack around the text so it is easy to hit.
             let slack = 4.0 * scale;
@@ -643,7 +842,10 @@ impl Renderer {
                 lx += lw + 16.0 * scale;
             }
             if b.snooze {
-                let st = TextStyle { color: MUTED, ..st };
+                let st = TextStyle {
+                    color: pal.muted,
+                    ..st
+                };
                 let (lw, lh) = self.measure(SNOOZE, st);
                 self.draw_text(pm, lx, y, SNOOZE, st);
                 snooze = Rect::from_xywh(lx - slack, y - slack, lw + 2.0 * slack, lh + 2.0 * slack);
@@ -659,11 +861,16 @@ impl Renderer {
                 for _ in 0..*count {
                     let r = Rect::from_xywh(bx, y, widths[i], CHOICE_H * scale)?;
                     let first = i == 0;
-                    fill_rrect(pm, r, 8.0 * scale, if first { ACCENT } else { ACCENT_SOFT });
+                    fill_rrect(
+                        pm,
+                        r,
+                        8.0 * scale,
+                        if first { pal.accent } else { pal.accent_soft },
+                    );
                     let st = label(if first {
                         rgb(0xff, 0xff, 0xff)
                     } else {
-                        ACCENT_INK
+                        pal.accent_ink
                     });
                     let (lw, lh) = self.measure(&b.choices[i], st);
                     self.draw_text(
@@ -828,7 +1035,8 @@ impl Renderer {
         w
     }
 
-    /// Draws the first frame of the sitting dog at `px` scale, with its feet point at (`x`, `ground`).
+    /// Draws a frame of the dog at `px` scale, with its feet point at (`x`, `ground`), wearing
+    /// its outfit.
     pub fn draw_dog(
         &self,
         pm: &mut Pixmap,
@@ -838,14 +1046,7 @@ impl Renderer {
         ground: i32,
         px: i32,
     ) {
-        blit_sprite(
-            pm,
-            &self.atlas,
-            &DogFrame::still(anim, frame),
-            x,
-            ground,
-            px,
-        );
+        self.blit_dog(pm, &DogFrame::still(anim, frame), x, ground, px);
     }
 
     /// Draws the dog fitted into a `size`-pixel square with its top-left corner at (x, y).
@@ -1015,15 +1216,74 @@ fn opaque_box(atlas: &Pixmap, anim: Anim, frame: usize) -> (u32, u32, u32, u32) 
     (x0, y0, x1, y1)
 }
 
-/// Height above the ground of the highest point across all frames of an animation.
-fn sprite_height(atlas: &Pixmap, anim: Anim) -> u32 {
+/// Height above the ground of the highest point across all frames of an animation, hats
+/// included.
+fn sprite_height(atlas: &Pixmap, anim: Anim, outfit: &Outfit) -> u32 {
     (0..anim.frames())
         .map(|f| {
             let (_, y0, _, _) = opaque_box(atlas, anim, f);
-            (anim.row() * CELL.1 + ANCHOR.1).saturating_sub(y0)
+            let body = (anim.row() * CELL.1 + ANCHOR.1).saturating_sub(y0) as i32;
+            let cell = anim.cell(f);
+            outfit
+                .worn()
+                .map(|i| {
+                    let s = i.sprite();
+                    let (_, ty) = item_target(s, cell);
+                    -(ty - s.pin.1)
+                })
+                .fold(body, i32::max)
+                .max(0) as u32
         })
         .max()
         .unwrap_or(ANCHOR.1)
+}
+
+/// Where an item's pin goes in frame `cell`, relative to the feet point (sprite pixels).
+fn item_target(s: look::ItemSprite, cell: usize) -> (i32, i32) {
+    if s.neck {
+        let (nx, ny) = NECK[cell];
+        (nx as i32 + s.at.0, ny as i32 + s.at.1)
+    } else {
+        let (hx, hy) = HEAD[cell];
+        (s.at.0 + hx as i32, s.at.1 + hy as i32)
+    }
+}
+
+/// Draws `rect` of `src` with its top-left at `at` (sprite pixels from the feet point),
+/// mirrored around the feet point when `flip`. `(ax, ground, px)` as in [`blit_sprite`].
+fn blit_region(
+    pm: &mut Pixmap,
+    src: &Pixmap,
+    (rx, ry, w, h): (u32, u32, u32, u32),
+    at: (i32, i32),
+    flip: bool,
+    (ax, ground, px): (i32, i32, i32),
+) {
+    let (pw, ph) = (pm.width() as i32, pm.height() as i32);
+    let sw = src.width();
+    let s = src.pixels();
+    let dst = pm.pixels_mut();
+    for sy in 0..h {
+        let y0 = ground + (at.1 + sy as i32) * px;
+        for sx in 0..w {
+            let p = s[((ry + sy) * sw + rx + sx) as usize];
+            if p.alpha() == 0 {
+                continue;
+            }
+            let dx = at.0 + sx as i32;
+            let x0 = if flip {
+                ax - (dx + 1) * px
+            } else {
+                ax + dx * px
+            };
+            for y in y0.max(0)..(y0 + px).min(ph) {
+                for x in x0.max(0)..(x0 + px).min(pw) {
+                    let d = &mut dst[(y * pw + x) as usize];
+                    *d = over(p, *d);
+                }
+            }
+        }
+    }
 }
 
 /// Draws a sprite frame at `px` scale with nearest-neighbor; if `facing < 0`, mirrors it around the feet point.

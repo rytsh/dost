@@ -1,0 +1,35 @@
+{
+  "schema": "generate2dsprite.palette.v1",
+  "colors": [
+    {
+      "hex": "#000000"
+    },
+    {
+      "hex": "#010000"
+    },
+    {
+      "hex": "#020200"
+    },
+    {
+      "hex": "#080704"
+    },
+    {
+      "hex": "#15140f"
+    },
+    {
+      "hex": "#2f302d"
+    },
+    {
+      "hex": "#ebcb8b"
+    },
+    {
+      "hex": "#fde6ae"
+    },
+    {
+      "hex": "#ffffef"
+    }
+  ],
+  "transparent_index": 255,
+  "locked": false,
+  "source": "finish_frames pixel: OKLab k-means++ of 1 finished frame(s), 14 colours, seed 0; spaced to OKLab dE >= 0.04 (5 merged)"
+}

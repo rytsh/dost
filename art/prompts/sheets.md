@@ -87,3 +87,17 @@ The puppy hangs in the air as if lifted by the scruff of the neck (do NOT draw a
 2: dangling, slight swing to the other side, hind paws kick.
 3: dangling, legs straight, eyes blink.
 ```
+
+## sad — "a SAD sitting loop (something went wrong, the puppy is disappointed)."
+
+Reference: the first `sit` frame (instead of the master).
+
+```
+SITTING on its haunches exactly like the FIRST image. Sad pose in every frame: head lowered and
+drooping a little, BOTH ears flat and hanging down, big sad puppy eyes looking down with droopy
+eyelids, mouth closed, tail flat on the ground, shoulders slumped.
+0: sad sitting, head low, eyes looking down.
+1: a small sigh: head lowers a tiny bit more, eyes half closed.
+2: looks up a little with big watery sad eyes (a small shiny tear highlight in the eye), ears still down.
+3: back to almost frame 0, eyes blink closed.
+```
