@@ -49,10 +49,26 @@ struct Shell {
     win_pos: POINT,
     drag: Option<Drag>,
     last_topmost: std::time::Instant,
-    _tray: TrayIcon,
+    tray: TrayIcon,
+    /// What the tray icon shows: (sleeping dog, unread mark).
+    tray_icon: (bool, bool),
     menu: Menu,
     items: MenuItems,
     panel: PanelWindow,
+    hotkeys: crate::hotkeys::Hotkeys,
+    /// While hidden: the bubble on its own above the tray icon.
+    alone: AloneBubble,
+}
+
+/// A bubble window without the dog, above the tray icon.
+struct AloneBubble {
+    hwnd: HWND,
+    pixmap: Pixmap,
+    dib: Dib,
+    pos: POINT,
+    shown: bool,
+    /// The tray icon's top-centre, refreshed on tray events.
+    anchor: Option<POINT>,
 }
 
 struct MenuItems {
@@ -76,7 +92,7 @@ pub fn run() {
     let renderer = Renderer::new(true, Vec::new());
 
     let (menu, items) = build_menu();
-    let icon = Icon::from_rgba(renderer.icon_rgba(32), 32, 32).expect("tray icon");
+    let icon = Icon::from_rgba(renderer.icon_rgba(32, false, false), 32, 32).expect("tray icon");
     // Left click opens the panel, right click shows the short menu.
     let tray = TrayIconBuilder::new()
         .with_icon(icon)
@@ -96,16 +112,30 @@ pub fn run() {
         win_pos: POINT { x: 0, y: 0 },
         drag: None,
         last_topmost: std::time::Instant::now(),
-        _tray: tray,
+        tray,
+        tray_icon: (false, false),
         menu,
         items,
         panel: PanelWindow::default(),
+        hotkeys: crate::hotkeys::Hotkeys::new(),
+        alone: AloneBubble {
+            hwnd: unsafe { create_window() },
+            pixmap: Pixmap::new(1, 1).unwrap(),
+            dib: Dib::default(),
+            pos: POINT { x: 0, y: 0 },
+            shown: false,
+            anchor: None,
+        },
     };
+    // Hidden last time: stays hidden.
+    let shown = core.on_screen();
     APP.with(|a| *a.borrow_mut() = Some(App { core, shell }));
     with_app(App::sync_menu);
 
     unsafe {
-        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        if shown {
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
         SetTimer(hwnd, TIMER_ID, FRAME_MS, None);
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
@@ -113,6 +143,7 @@ pub fn run() {
             DispatchMessageW(&msg);
         }
     }
+    with_app(|a| a.core.shutdown());
     APP.with(|a| a.borrow_mut().take());
 }
 
@@ -156,6 +187,85 @@ impl Platform for Shell {
         let _ = std::process::Command::new("explorer").arg(path).spawn();
     }
 
+    fn open_url(&mut self, url: &str) {
+        // `explorer <url>` opens the default browser; the URL was checked to be http(s).
+        let _ = std::process::Command::new("explorer").arg(url).spawn();
+    }
+
+    fn idle_secs(&self) -> Option<u64> {
+        use windows_sys::Win32::System::SystemInformation::GetTickCount;
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+        let mut info = LASTINPUTINFO {
+            cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+            dwTime: 0,
+        };
+        if unsafe { GetLastInputInfo(&mut info) } == 0 {
+            return None;
+        }
+        let now = unsafe { GetTickCount() };
+        Some(u64::from(now.wrapping_sub(info.dwTime)) / 1000)
+    }
+
+    fn fullscreen(&self) -> bool {
+        use windows_sys::Win32::UI::Shell::{
+            QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
+            SHQueryUserNotificationState,
+        };
+        let mut state = 0;
+        if unsafe { SHQueryUserNotificationState(&mut state) } != 0 {
+            return false;
+        }
+        matches!(
+            state,
+            QUNS_BUSY | QUNS_RUNNING_D3D_FULL_SCREEN | QUNS_PRESENTATION_MODE
+        )
+    }
+
+    fn screen_locked(&self) -> bool {
+        use windows_sys::Win32::System::StationsAndDesktops::{
+            CloseDesktop, DESKTOP_SWITCHDESKTOP, OpenInputDesktop, SwitchDesktop,
+        };
+        // While locked, the input desktop is the secure one: it cannot be switched to.
+        unsafe {
+            let d = OpenInputDesktop(0, 0, DESKTOP_SWITCHDESKTOP);
+            if d.is_null() {
+                return true;
+            }
+            let ok = SwitchDesktop(d) != 0;
+            CloseDesktop(d);
+            !ok
+        }
+    }
+
+    fn system_notify(&mut self, title: &str, body: &str) {
+        use windows_sys::Win32::UI::Shell::{
+            NIF_INFO, NIF_STATE, NIIF_INFO, NIM_ADD, NIM_DELETE, NIS_HIDDEN, NOTIFYICONDATAW,
+            Shell_NotifyIconW,
+        };
+        // A hidden helper icon of our own carries the Windows notification (toast).
+        const ID: u32 = 0xD057;
+        let copy = |dst: &mut [u16], s: &str| {
+            let max = dst.len() - 1;
+            for (d, c) in dst.iter_mut().zip(s.encode_utf16().take(max)) {
+                *d = c;
+            }
+        };
+        unsafe {
+            let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
+            nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+            nid.hWnd = self.hwnd;
+            nid.uID = ID;
+            Shell_NotifyIconW(NIM_DELETE, &nid);
+            nid.uFlags = NIF_INFO | NIF_STATE;
+            nid.dwState = NIS_HIDDEN;
+            nid.dwStateMask = NIS_HIDDEN;
+            nid.dwInfoFlags = NIIF_INFO;
+            copy(&mut nid.szInfoTitle, title);
+            copy(&mut nid.szInfo, if body.is_empty() { " " } else { body });
+            Shell_NotifyIconW(NIM_ADD, &nid);
+        }
+    }
+
     fn set_dog_visible(&mut self, visible: bool) {
         unsafe { ShowWindow(self.hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE }) };
     }
@@ -174,6 +284,15 @@ impl Platform for Shell {
 }
 
 impl App {
+    /// Keyboard shortcuts for the bubble: on only while one is shown.
+    fn keys(&mut self) {
+        for k in self.shell.hotkeys.pressed() {
+            self.core.on_key(&mut self.shell, k);
+        }
+        let shown = self.core.shown.is_some();
+        self.shell.hotkeys.set_active(shown);
+    }
+
     fn tick(&mut self) {
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
             self.on_menu(ev.id.as_ref());
@@ -196,15 +315,24 @@ impl App {
 
         let bounds = self.bounds();
         self.core.tick(&mut self.shell, &bounds);
-        if self.core.visible {
+        self.keys();
+        if self.core.on_screen() {
             self.paint();
         }
+        self.paint_alone();
         if self.core.panel_dirty {
             self.core.panel_dirty = false;
             self.sync_menu();
         }
         self.paint_panel();
-
+        let state = (self.core.dog.is_sleeping(), self.core.missed > 0);
+        if state != self.shell.tray_icon {
+            self.shell.tray_icon = state;
+            let rgba = self.core.renderer.icon_rgba(32, state.0, state.1);
+            if let Ok(icon) = Icon::from_rgba(rgba, 32, 32) {
+                let _ = self.shell.tray.set_icon(Some(icon));
+            }
+        }
         let now = std::time::Instant::now();
         if now - self.shell.last_topmost > Duration::from_secs(2) {
             // Clicking the taskbar raises it above us; put the dog back on top.
@@ -255,11 +383,8 @@ impl App {
         let scale = self.core.scale(monitor_scale(self.dog_point()));
         let frame = self.core.dog.frame();
         let core = &mut self.core;
-        let bubble = core.shown.as_ref().map(|s| dost::render::Bubble {
-            title: &s.note.title,
-            body: &s.note.body,
-            pending: core.queue.len(),
-        });
+        let bubble =
+            dost::app::bubble_of(core.shown.as_ref().filter(|_| core.visible), core.waiting());
         let (w, h) = core.renderer.size(frame.anim, bubble.as_ref(), scale);
         let sh = &mut self.shell;
         if sh.pixmap.width() != w || sh.pixmap.height() != h {
@@ -279,6 +404,79 @@ impl App {
             .renderer
             .draw(&mut sh.pixmap, anchor, &frame, bubble.as_ref(), scale);
         unsafe { sh.dib.present(sh.hwnd, &sh.pixmap, sh.win_pos) };
+    }
+
+    /// While hidden: shows the current bubble on its own just above the tray icon.
+    fn paint_alone(&mut self) {
+        if !self.core.bubble_alone() {
+            if self.shell.alone.shown {
+                self.shell.alone.shown = false;
+                unsafe { ShowWindow(self.shell.alone.hwnd, SW_HIDE) };
+            }
+            return;
+        }
+        let anchor = self
+            .shell
+            .tray
+            .rect()
+            .map(|r| POINT {
+                x: (r.position.x + r.size.width as f64 / 2.0) as i32,
+                y: r.position.y as i32,
+            })
+            .or(self.shell.alone.anchor)
+            .unwrap_or_else(|| {
+                let w = work_area(POINT { x: 0, y: 0 });
+                POINT {
+                    x: w.right - 40,
+                    y: w.bottom,
+                }
+            });
+        self.shell.alone.anchor = Some(anchor);
+        let k = monitor_scale(anchor);
+        let scale = self.core.scale(k);
+        let work = work_area(anchor);
+        let core = &mut self.core;
+        let Some(bubble) = dost::app::bubble_of(core.shown.as_ref(), core.waiting()) else {
+            return;
+        };
+        let (w, h) = core.renderer.bubble_size(&bubble, scale);
+        let a = &mut self.shell.alone;
+        if a.pixmap.width() != w || a.pixmap.height() != h {
+            a.pixmap = Pixmap::new(w, h).unwrap();
+        }
+        let margin = (PANEL_MARGIN as f32 * k) as i32;
+        let x = (anchor.x - w as i32 / 2).clamp(
+            work.left + margin,
+            (work.right - w as i32 - margin).max(work.left),
+        );
+        // Above a bottom taskbar (tail down); below a top one (tail up).
+        let below = anchor.y < (work.top + work.bottom) / 2;
+        // The tail's tip right at the taskbar (the window's edge is shadow room).
+        let inset = core.renderer.alone_inset(scale) as i32 - (k.round() as i32);
+        let y = if below {
+            work.top - inset
+        } else {
+            (work.bottom - h as i32 + inset).max(work.top)
+        };
+        core.hits = core.renderer.draw_bubble_alone(
+            &mut a.pixmap,
+            (anchor.x - x) as f32,
+            !below,
+            &bubble,
+            scale,
+        );
+        a.pos = POINT { x, y };
+        unsafe { a.dib.present(a.hwnd, &a.pixmap, a.pos) };
+        if !a.shown {
+            a.shown = true;
+            unsafe { ShowWindow(a.hwnd, SW_SHOWNOACTIVATE) };
+        }
+    }
+
+    /// A click on the bubble shown on its own (while hidden).
+    fn alone_click(&mut self, client: POINT) {
+        self.core
+            .click(&mut self.shell, client.x as f32, client.y as f32);
     }
 
     fn sync_menu(&mut self) {
@@ -315,8 +513,14 @@ impl App {
             self.shell.panel.close();
             return;
         }
+        let missed = self.core.missed;
         self.shell.panel.open(anchor.unwrap_or_else(cursor_pos));
         self.shell.panel.redraw = true;
+        if self.core.panel_opened()
+            && let Some(p) = self.shell.panel.panel.as_mut()
+        {
+            p.show_missed(missed);
+        }
     }
 
     fn paint_panel(&mut self) {
@@ -392,6 +596,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_LBUTTONDOWN => {
+            if with_app(|a| a.shell.alone.hwnd == hwnd) == Some(true) {
+                return 0;
+            }
             with_app(|a| a.mouse_down(client()));
             0
         }
@@ -400,6 +607,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_LBUTTONUP => {
+            if with_app(|a| a.shell.alone.hwnd == hwnd) == Some(true) {
+                with_app(|a| a.alone_click(client()));
+                return 0;
+            }
             with_app(|a| a.mouse_up(client()));
             0
         }
@@ -437,6 +648,8 @@ unsafe fn create_window() -> HWND {
             lpfnWndProc: Some(wndproc),
             hInstance: hinstance,
             hCursor: LoadCursorW(std::ptr::null_mut(), IDC_HAND),
+            // The paw from dost.exe's resources (build.rs), id 1.
+            hIcon: LoadIconW(hinstance, 1 as _),
             lpszClassName: class.as_ptr(),
             ..std::mem::zeroed()
         };
@@ -564,11 +777,13 @@ impl Dib {
             }
             // tiny-skia: premultiplied RGBA, GDI: premultiplied BGRA.
             let dst = std::slice::from_raw_parts_mut(self.bits, (w * h * 4) as usize);
-            for (d, s) in dst.chunks_exact_mut(4).zip(pm.data().chunks_exact(4)) {
-                d[0] = s[2];
-                d[1] = s[1];
-                d[2] = s[0];
-                d[3] = s[3];
+            for (d, s) in dst
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(pm.data().as_chunks::<4>().0)
+            {
+                *d = [s[2], s[1], s[0], s[3]];
             }
             let size = SIZE {
                 cx: w as i32,
@@ -833,6 +1048,8 @@ unsafe fn create_panel_window() -> HWND {
             lpfnWndProc: Some(panel_proc),
             hInstance: hinstance,
             hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
+            // The paw from dost.exe's resources (build.rs), id 1.
+            hIcon: LoadIconW(hinstance, 1 as _),
             lpszClassName: class.as_ptr(),
             ..std::mem::zeroed()
         };

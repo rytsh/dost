@@ -11,18 +11,20 @@ use std::path::Path;
 use std::ptr::NonNull;
 
 use block2::RcBlock;
+use muda::{ContextMenu, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use objc2::rc::Retained;
 use objc2::{AnyThread, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSBitmapFormat,
-    NSBitmapImageRep, NSColor, NSEvent, NSEventMask, NSEventType, NSImage, NSImageScaling,
-    NSImageView, NSPasteboard, NSPasteboardTypeString, NSScreen, NSSound, NSStatusWindowLevel,
+    NSBitmapImageRep, NSCellImagePosition, NSColor, NSEvent, NSEventMask, NSEventType, NSImage,
+    NSImageScaling, NSImageView, NSMenu, NSPasteboard, NSPasteboardTypeString, NSScreen, NSSound,
+    NSStatusBar, NSStatusBarButton, NSStatusItem, NSStatusWindowLevel, NSVariableStatusItemLength,
     NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
 };
-use objc2_foundation::{NSData, NSPoint, NSRect, NSSize, NSString, NSTimer, NSURL};
+use objc2_foundation::{
+    NSData, NSPoint, NSRect, NSRunLoop, NSRunLoopCommonModes, NSSize, NSString, NSTimer, NSURL,
+};
 use tiny_skia::Pixmap;
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use dost::app::{self, Core, EDGE, Platform};
 use dost::dog::Bounds;
@@ -65,11 +67,31 @@ struct Shell {
     view: Retained<NSImageView>,
     pixmap: Pixmap,
     drag: Option<Drag>,
-    _tray: TrayIcon,
+    status: Retained<NSStatusItem>,
+    /// Whether the menu bar icon is drawn pressed (while the panel is open).
+    status_pressed: bool,
+    /// What the menu bar icon shows: (sleeping dog, unread mark).
+    status_icon: (bool, bool),
+    menu: Menu,
     items: MenuItems,
     panel: PanelWindow,
+    hotkeys: crate::hotkeys::Hotkeys,
+    /// While hidden: the bubble on its own under the menu bar icon.
+    alone: AloneBubble,
     sound: Option<Retained<NSSound>>,
     quit: bool,
+}
+
+/// A bubble window without the dog, hanging under the menu bar icon.
+struct AloneBubble {
+    window: Retained<NSWindow>,
+    view: Retained<NSImageView>,
+    pixmap: Pixmap,
+    shown: bool,
+    /// The mouse went down on it (a click needs both down and up here).
+    pressed: bool,
+    /// Top-left on screen (physical) and the screen's scale, for click positions.
+    pos: (f64, f64, f64),
 }
 
 struct MenuItems {
@@ -93,31 +115,42 @@ pub fn run() {
 
     let renderer = Renderer::new(true, Vec::new());
     let (menu, items) = build_menu();
-    let icon = Icon::from_rgba(renderer.icon_rgba(36), 36, 36).expect("tray icon");
-    let tray = TrayIconBuilder::new()
-        .with_icon(icon)
-        .with_tooltip("Dost")
-        .with_menu(Box::new(menu))
-        .with_menu_on_left_click(false)
-        .build()
-        .expect("menu bar icon");
+    let status = make_status_item(mtm, &renderer);
 
     let (window, view) = make_window(mtm, false);
     window.setIgnoresMouseEvents(false);
-    window.orderFrontRegardless();
 
     let screen = main_screen(mtm);
     let start_x = screen.left + (screen.right - screen.left) * 0.75;
     let core = Core::new(renderer, start_x as f32, screen.bottom as f32);
+    // Hidden last time: stays hidden.
+    if core.on_screen() {
+        window.orderFrontRegardless();
+    }
     let shell = Shell {
         mtm,
         window,
         view,
         pixmap: Pixmap::new(1, 1).unwrap(),
         drag: None,
-        _tray: tray,
+        status,
+        status_pressed: false,
+        status_icon: (false, false),
+        menu,
         items,
         panel: PanelWindow::default(),
+        hotkeys: crate::hotkeys::Hotkeys::new(),
+        alone: {
+            let (window, view) = make_window(mtm, false);
+            AloneBubble {
+                window,
+                view,
+                pixmap: Pixmap::new(1, 1).unwrap(),
+                shown: false,
+                pressed: false,
+                pos: (0.0, 0.0, 1.0),
+            }
+        },
         sound: None,
         quit: false,
     };
@@ -128,6 +161,9 @@ pub fn run() {
     let tick = RcBlock::new(|_timer: NonNull<NSTimer>| {
         let quit = with_app(|a| {
             a.tick();
+            if a.shell.quit {
+                a.core.shutdown();
+            }
             a.shell.quit
         });
         if quit == Some(true) {
@@ -135,8 +171,59 @@ pub fn run() {
             NSApplication::sharedApplication(mtm).terminate(None);
         }
     });
-    unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(FRAME, true, &tick) };
+    // Common modes: keep ticking while the menu bar menu is open (it tracks in its own mode).
+    let timer = unsafe { NSTimer::timerWithTimeInterval_repeats_block(FRAME, true, &tick) };
+    unsafe { NSRunLoop::mainRunLoop().addTimer_forMode(&timer, NSRunLoopCommonModes) };
     ns_app.run();
+}
+
+/// Menu bar icon. Clicks are handled by the event monitor: left opens the settings panel
+/// below it, right pops up the short menu.
+fn make_status_item(mtm: MainThreadMarker, renderer: &Renderer) -> Retained<NSStatusItem> {
+    let item = NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
+    if let Some(button) = item.button(mtm) {
+        set_status_icon(&button, renderer, (false, false));
+        button.setImagePosition(NSCellImagePosition::ImageOnly);
+        button.setToolTip(Some(&NSString::from_str("Dost")));
+    }
+    item
+}
+
+fn set_status_icon(
+    button: &NSStatusBarButton,
+    renderer: &Renderer,
+    (sleeping, unread): (bool, bool),
+) {
+    let icon = renderer.icon_pixmap(44, sleeping, unread);
+    button.setImage(to_image(&icon, NSSize::new(22.0, 22.0)).as_deref());
+}
+
+/// Pops up the short menu under the menu bar icon. Runs a modal loop until it closes, so it
+/// must not be called while [`APP`] is borrowed.
+fn show_status_menu() {
+    let Some((item, menu)) = with_app(|a| {
+        let menu = unsafe { Retained::retain(a.shell.menu.ns_menu().cast::<NSMenu>()) };
+        a.shell.panel.close();
+        (a.shell.status.clone(), menu)
+    }) else {
+        return;
+    };
+    if let Some(menu) = menu {
+        // Deprecated in favour of `menu`, but a permanent menu would also take left clicks.
+        #[allow(deprecated)]
+        item.popUpStatusItemMenu(&menu);
+    }
+}
+
+/// Bottom-center of the menu bar icon in core coordinates.
+fn status_anchor(mtm: MainThreadMarker, item: &NSStatusItem) -> Option<(f64, f64)> {
+    let window = item.button(mtm)?.window()?;
+    let f = window.frame();
+    let k = window.backingScaleFactor();
+    Some((
+        (f.origin.x + f.size.width / 2.0) * k,
+        (main_height(mtm) - f.origin.y) * k,
+    ))
 }
 
 fn build_menu() -> (Menu, MenuItems) {
@@ -266,6 +353,104 @@ fn screen_at(mtm: MainThreadMarker, x: f64, y: f64) -> (PxRect, PxRect) {
         .unwrap_or((main_screen(mtm), main_screen(mtm)))
 }
 
+/// The login window's "screen is locked" flag for this session.
+fn screen_locked() -> bool {
+    use std::ffi::c_void;
+    type Cf = *const c_void;
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGSessionCopyCurrentDictionary() -> Cf;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFDictionaryGetValue(d: Cf, key: Cf) -> Cf;
+        fn CFStringCreateWithCString(alloc: Cf, s: *const std::ffi::c_char, enc: u32) -> Cf;
+        fn CFBooleanGetValue(b: Cf) -> bool;
+        fn CFGetTypeID(cf: Cf) -> usize;
+        fn CFBooleanGetTypeID() -> usize;
+        fn CFRelease(cf: Cf);
+    }
+    const UTF8: u32 = 0x0800_0100;
+    unsafe {
+        let d = CGSessionCopyCurrentDictionary();
+        if d.is_null() {
+            return false;
+        }
+        let key =
+            CFStringCreateWithCString(std::ptr::null(), c"CGSSessionScreenIsLocked".as_ptr(), UTF8);
+        let v = CFDictionaryGetValue(d, key);
+        let locked = !v.is_null() && CFGetTypeID(v) == CFBooleanGetTypeID() && CFBooleanGetValue(v);
+        CFRelease(key);
+        CFRelease(d);
+        locked
+    }
+}
+
+/// On-screen, normal-level windows of process `pid`: (x, y, w, h) in points, y down.
+fn front_windows(pid: i32) -> Vec<(f64, f64, f64, f64)> {
+    use std::ffi::c_void;
+    type Cf = *const c_void;
+    #[repr(C)]
+    struct CgRect {
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+    }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGWindowListCopyWindowInfo(option: u32, relative_to: u32) -> Cf;
+        fn CGRectMakeWithDictionaryRepresentation(dict: Cf, rect: *mut CgRect) -> bool;
+        static kCGWindowOwnerPID: Cf;
+        static kCGWindowLayer: Cf;
+        static kCGWindowBounds: Cf;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFArrayGetCount(a: Cf) -> isize;
+        fn CFArrayGetValueAtIndex(a: Cf, i: isize) -> Cf;
+        fn CFDictionaryGetValue(d: Cf, key: Cf) -> Cf;
+        fn CFNumberGetValue(n: Cf, kind: isize, out: *mut c_void) -> bool;
+        fn CFRelease(cf: Cf);
+    }
+    // kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements
+    const OPTIONS: u32 = 1 | 16;
+    const SINT32: isize = 3;
+    let mut out = Vec::new();
+    unsafe {
+        let list = CGWindowListCopyWindowInfo(OPTIONS, 0);
+        if list.is_null() {
+            return out;
+        }
+        let int = |d: Cf, k: Cf| {
+            let v = CFDictionaryGetValue(d, k);
+            let mut n: i32 = -1;
+            if !v.is_null() {
+                CFNumberGetValue(v, SINT32, (&raw mut n).cast());
+            }
+            n
+        };
+        for i in 0..CFArrayGetCount(list) {
+            let w = CFArrayGetValueAtIndex(list, i);
+            if int(w, kCGWindowOwnerPID) != pid || int(w, kCGWindowLayer) != 0 {
+                continue;
+            }
+            let b = CFDictionaryGetValue(w, kCGWindowBounds);
+            let mut r = CgRect {
+                x: 0.0,
+                y: 0.0,
+                w: 0.0,
+                h: 0.0,
+            };
+            if !b.is_null() && CGRectMakeWithDictionaryRepresentation(b, &mut r) {
+                out.push((r.x, r.y, r.w, r.h));
+            }
+        }
+        CFRelease(list);
+    }
+    out
+}
+
 /// Main-screen height in points (AppKit y flips around it).
 fn main_height(mtm: MainThreadMarker) -> f64 {
     NSScreen::screens(mtm)
@@ -322,6 +507,67 @@ impl Platform for Shell {
         NSWorkspace::sharedWorkspace().openURL(&url);
     }
 
+    fn open_url(&mut self, url: &str) {
+        if let Some(u) = NSURL::URLWithString(&NSString::from_str(url)) {
+            NSWorkspace::sharedWorkspace().openURL(&u);
+        }
+    }
+
+    fn idle_secs(&self) -> Option<u64> {
+        // kCGEventSourceStateCombinedSessionState, kCGAnyInputEventType.
+        unsafe extern "C" {
+            fn CGEventSourceSecondsSinceLastEventType(state: i32, event_type: u32) -> f64;
+        }
+        let s = unsafe { CGEventSourceSecondsSinceLastEventType(0, u32::MAX) };
+        s.is_finite().then_some(s.max(0.0) as u64)
+    }
+
+    fn fullscreen(&self) -> bool {
+        let Some(app) = NSWorkspace::sharedWorkspace().frontmostApplication() else {
+            return false;
+        };
+        let pid = app.processIdentifier();
+        if pid == std::process::id() as i32 {
+            return false;
+        }
+        let screens: Vec<NSRect> = NSScreen::screens(self.mtm)
+            .iter()
+            .map(|s| s.frame())
+            .collect();
+        let Some(main_h) = screens.first().map(|r| r.size.height) else {
+            return false;
+        };
+        front_windows(pid).iter().any(|w| {
+            screens.iter().any(|s| {
+                // Window bounds are y-down from the main screen's top; screens are y-up.
+                let top = main_h - s.origin.y - s.size.height;
+                (w.0 - s.origin.x).abs() < 1.0
+                    && (w.1 - top).abs() < 1.0
+                    && (w.2 - s.size.width).abs() < 1.0
+                    && (w.3 - s.size.height).abs() < 1.0
+            })
+        })
+    }
+
+    fn screen_locked(&self) -> bool {
+        screen_locked()
+    }
+
+    fn system_notify(&mut self, title: &str, body: &str) {
+        // An unsigned app cannot use the UserNotifications framework; osascript can post.
+        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        let script = format!(
+            "display notification \"{}\" with title \"{}\" sound name \"Ping\"",
+            esc(body),
+            esc(title)
+        );
+        let _ = std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+
     fn set_dog_visible(&mut self, visible: bool) {
         if visible {
             self.window.orderFrontRegardless();
@@ -344,37 +590,47 @@ impl Platform for Shell {
 }
 
 impl App {
+    /// Keyboard shortcuts for the bubble: on only while one is shown.
+    fn keys(&mut self) {
+        for k in self.shell.hotkeys.pressed() {
+            self.core.on_key(&mut self.shell, k);
+        }
+        let shown = self.core.shown.is_some();
+        self.shell.hotkeys.set_active(shown);
+    }
+
     fn tick(&mut self) {
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
             self.on_menu(ev.id.as_ref());
         }
-        while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
-                rect,
-                ..
-            } = ev
-            {
-                // tray-icon reports physical pixels from the top of the main screen.
-                let anchor = (
-                    rect.position.x + rect.size.width as f64 / 2.0,
-                    rect.position.y + rect.size.height as f64,
-                );
-                self.toggle_panel(Some(anchor));
-            }
-        }
         self.drag_update();
         let bounds = self.bounds();
         self.core.tick(&mut self.shell, &bounds);
-        if self.core.visible {
+        self.keys();
+        if self.core.on_screen() {
             self.paint();
         }
+        self.paint_alone();
         if self.core.panel_dirty {
             self.core.panel_dirty = false;
             self.sync_menu();
         }
         self.paint_panel();
+        self.shell.panel.animate();
+        let open = self.shell.panel.is_open();
+        if open != self.shell.status_pressed {
+            self.shell.status_pressed = open;
+            if let Some(b) = self.shell.status.button(self.shell.mtm) {
+                b.highlight(open);
+            }
+        }
+        let icon = (self.core.dog.is_sleeping(), self.core.missed > 0);
+        if icon != self.shell.status_icon {
+            self.shell.status_icon = icon;
+            if let Some(b) = self.shell.status.button(self.shell.mtm) {
+                set_status_icon(&b, &self.core.renderer, icon);
+            }
+        }
     }
 
     fn dog_screen(&self) -> (PxRect, PxRect) {
@@ -410,11 +666,7 @@ impl App {
         let scale = self.core.scale(full.scale as f32);
         let frame = self.core.dog.frame();
         let core = &mut self.core;
-        let bubble = core.shown.as_ref().map(|s| dost::render::Bubble {
-            title: &s.note.title,
-            body: &s.note.body,
-            pending: core.queue.len(),
-        });
+        let bubble = app::bubble_of(core.shown.as_ref().filter(|_| core.visible), core.waiting());
         let (w, h) = core.renderer.size(frame.anim, bubble.as_ref(), scale);
         let sh = &mut self.shell;
         if sh.pixmap.width() != w || sh.pixmap.height() != h {
@@ -438,6 +690,55 @@ impl App {
         place(sh.mtm, &sh.window, x, y, w as f64, h as f64, full.scale);
     }
 
+    /// While hidden: shows the current bubble on its own under the menu bar icon, or hides it.
+    fn paint_alone(&mut self) {
+        let mtm = self.shell.mtm;
+        if !self.core.bubble_alone() {
+            if self.shell.alone.shown {
+                self.shell.alone.shown = false;
+                self.shell.alone.window.orderOut(None);
+            }
+            return;
+        }
+        let Some((ax, ay)) = status_anchor(mtm, &self.shell.status) else {
+            return;
+        };
+        let (visible, full) = screen_at(mtm, ax, ay);
+        let k = full.scale;
+        let scale = self.core.scale(k as f32);
+        let core = &mut self.core;
+        let Some(bubble) = app::bubble_of(core.shown.as_ref(), core.waiting()) else {
+            return;
+        };
+        let (w, h) = core.renderer.bubble_size(&bubble, scale);
+        let a = &mut self.shell.alone;
+        if a.pixmap.width() != w || a.pixmap.height() != h {
+            a.pixmap = Pixmap::new(w, h).unwrap();
+        }
+        let margin = PANEL_MARGIN * k;
+        let x = (ax - w as f64 / 2.0)
+            .clamp(
+                visible.left + margin,
+                (visible.right - w as f64 - margin).max(visible.left),
+            )
+            .round();
+        // The tail's tip just under the menu bar (the window's top edge is shadow room).
+        let y = (ay - core.renderer.alone_inset(scale) as f64 + 1.0 * k).round();
+        core.hits =
+            core.renderer
+                .draw_bubble_alone(&mut a.pixmap, (ax - x) as f32, false, &bubble, scale);
+        let points = NSSize::new(w as f64 / k, h as f64 / k);
+        if let Some(image) = to_image(&a.pixmap, points) {
+            a.view.setImage(Some(&image));
+        }
+        place(mtm, &a.window, x, y, w as f64, h as f64, k);
+        a.pos = (x, y, k);
+        if !a.shown {
+            a.shown = true;
+            a.window.orderFrontRegardless();
+        }
+    }
+
     fn sync_menu(&mut self) {
         let i = &self.shell.items;
         i.show
@@ -452,7 +753,10 @@ impl App {
 
     fn on_menu(&mut self, id: &str) {
         match id {
-            "panel" => self.toggle_panel(None),
+            "panel" => {
+                let anchor = status_anchor(self.shell.mtm, &self.shell.status);
+                self.toggle_panel(anchor);
+            }
             "show" => self.on_action(panel::Action::ToggleVisible),
             "mute" => self.core.toggle_mute(&mut self.shell),
             "quit" => self.on_action(panel::Action::Quit),
@@ -472,7 +776,13 @@ impl App {
             return;
         }
         let at = anchor.unwrap_or_else(|| mouse_px(self.shell.mtm));
-        self.shell.panel.open(self.shell.mtm, at);
+        let missed = self.core.missed;
+        self.shell.panel.open(self.shell.mtm, at, anchor.is_some());
+        if self.core.panel_opened()
+            && let Some(p) = self.shell.panel.panel.as_mut()
+        {
+            p.show_missed(missed);
+        }
     }
 
     fn paint_panel(&mut self) {
@@ -489,6 +799,40 @@ impl App {
         let mtm = self.shell.mtm;
         let (mx, my) = mouse_px(mtm);
         let on_dog = window.is_some_and(|w| std::ptr::eq(w, &*self.shell.window));
+        let on_alone = self.shell.alone.shown
+            && window.is_some_and(|w| std::ptr::eq(w, &*self.shell.alone.window));
+        if on_alone {
+            match kind {
+                NSEventType::LeftMouseDown => self.shell.alone.pressed = true,
+                // Only a whole click (down and up here) counts.
+                NSEventType::LeftMouseUp if std::mem::take(&mut self.shell.alone.pressed) => {
+                    let (x, y, _) = self.shell.alone.pos;
+                    self.core
+                        .click(&mut self.shell, (mx - x) as f32, (my - y) as f32);
+                }
+                _ => {}
+            }
+            return matches!(kind, NSEventType::LeftMouseDown | NSEventType::LeftMouseUp);
+        }
+        let on_status = window.is_some_and(|w| {
+            self.shell
+                .status
+                .button(mtm)
+                .and_then(|b| b.window())
+                .is_some_and(|s| std::ptr::eq(w, &*s))
+        });
+        if on_status {
+            return match kind {
+                NSEventType::LeftMouseDown => {
+                    let anchor = status_anchor(mtm, &self.shell.status);
+                    self.toggle_panel(anchor);
+                    true
+                }
+                // Swallow the rest of the click so the button does not track it.
+                NSEventType::LeftMouseUp | NSEventType::LeftMouseDragged => true,
+                _ => false,
+            };
+        }
         let on_panel = window.is_some_and(|w| {
             self.shell
                 .panel
@@ -617,6 +961,7 @@ fn install_mouse_monitor() {
         | NSEventMask::LeftMouseUp
         | NSEventMask::LeftMouseDragged
         | NSEventMask::MouseMoved
+        | NSEventMask::RightMouseDown
         | NSEventMask::RightMouseUp
         | NSEventMask::ScrollWheel
         | NSEventMask::KeyDown;
@@ -630,8 +975,28 @@ fn install_mouse_monitor() {
             return event.as_ptr();
         }
         let window = ev.window(mtm);
-        let consumed = with_app(|a| a.on_mouse(kind, window.as_deref(), ev.scrollingDeltaY()))
-            .unwrap_or(false);
+        if kind == NSEventType::RightMouseDown {
+            let on_status = with_app(|a| {
+                let status = a.shell.status.button(mtm).and_then(|b| b.window());
+                window
+                    .as_deref()
+                    .zip(status)
+                    .is_some_and(|(w, s)| std::ptr::eq(w, &*s))
+            });
+            if on_status == Some(true) {
+                show_status_menu();
+                return std::ptr::null_mut();
+            }
+            return event.as_ptr();
+        }
+        // scrollingDeltaY raises an Objective-C exception on non-scroll events, and AppKit
+        // then drops the event: read it only for the scroll wheel.
+        let scroll = if kind == NSEventType::ScrollWheel {
+            ev.scrollingDeltaY()
+        } else {
+            0.0
+        };
+        let consumed = with_app(|a| a.on_mouse(kind, window.as_deref(), scroll)).unwrap_or(false);
         if consumed {
             std::ptr::null_mut()
         } else {
@@ -662,6 +1027,8 @@ struct PanelWindow {
     /// Top-left on screen and the screen's scale.
     pos: (f64, f64, f64),
     redraw: bool,
+    /// When the panel opened, for the fade-in.
+    opened: Option<std::time::Instant>,
 }
 
 impl PanelWindow {
@@ -669,21 +1036,29 @@ impl PanelWindow {
         self.window.is_some()
     }
 
-    /// Opens below the menu bar icon at physical (`x`, `y`).
-    fn open(&mut self, mtm: MainThreadMarker, (x, y): (f64, f64)) {
+    /// Opens at physical (`x`, `y`): just below it, or when `from_icon`, hanging from the menu
+    /// bar icon there with an arrow pointing at it.
+    fn open(&mut self, mtm: MainThreadMarker, (x, y): (f64, f64), from_icon: bool) {
         let (visible, full) = screen_at(mtm, x, y);
         let k = full.scale;
-        let panel = Panel::new(k as f32);
+        let mut panel = Panel::new(k as f32);
         let margin = PANEL_MARGIN * k;
+        let probe_w = (panel::WIDTH as f64 * k).ceil();
+        let px = (x - probe_w / 2.0).clamp(visible.left + margin, visible.right - probe_w - margin);
+        if from_icon {
+            panel.set_arrow(Some((x - px) as f32));
+        }
         let (w, h) = panel.size((visible.bottom - visible.top - 2.0 * margin).max(200.0) as u32);
-        let px =
-            (x - w as f64 / 2.0).clamp(visible.left + margin, visible.right - w as f64 - margin);
-        let py = (visible.top + margin)
-            .max(y + margin)
+        // From the icon the arrow takes the place of the gap.
+        let gap = if from_icon { 2.0 * k } else { margin };
+        let py = (visible.top + gap)
+            .max(y + gap)
             .min(visible.bottom - h as f64 - margin);
         let (window, view) = make_window(mtm, true);
         place(mtm, &window, px, py, w as f64, h as f64, k);
+        window.setAlphaValue(0.0);
         window.orderFrontRegardless();
+        self.opened = Some(std::time::Instant::now());
         self.window = Some(window);
         self.view = Some(view);
         self.pixmap = Pixmap::new(w, h);
@@ -722,6 +1097,18 @@ impl PanelWindow {
             NSSize::new(pm.width() as f64 / k, pm.height() as f64 / k),
         ) {
             v.setImage(Some(&image));
+        }
+    }
+
+    /// Fades the panel in over a short ease-out after opening; call every frame.
+    fn animate(&mut self) {
+        let (Some(w), Some(t)) = (self.window.as_ref(), self.opened) else {
+            return;
+        };
+        let p = (t.elapsed().as_secs_f64() / 0.14).min(1.0);
+        w.setAlphaValue(1.0 - (1.0 - p).powi(3));
+        if p >= 1.0 {
+            self.opened = None;
         }
     }
 }

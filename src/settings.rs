@@ -62,6 +62,22 @@ pub struct Settings {
     pub notify_secs: u64,
     pub mcp_enabled: bool,
     pub mcp_addr: String,
+    /// Do not disturb: no barking and only important bubbles (questions, sticky, progress).
+    pub quiet: bool,
+    /// Daily quiet hours as "HH:MM" local time; `quiet_from` == `quiet_to` disables them.
+    /// The range may wrap past midnight (22:00-08:00).
+    pub quiet_from: String,
+    pub quiet_to: String,
+    /// Quiet while an app is full screen (a video, a presentation, screen sharing).
+    pub quiet_fullscreen: bool,
+    /// Look for new versions (at start and daily).
+    pub check_updates: bool,
+    /// Download and install new versions by itself (otherwise it only tells).
+    pub auto_update: bool,
+    /// Hidden (Hide): kept across restarts.
+    pub hidden: bool,
+    /// Put to sleep (Sleep): kept across restarts.
+    pub asleep: bool,
 }
 
 impl Default for Settings {
@@ -79,6 +95,14 @@ impl Default for Settings {
             sound_on_pet: false,
             mcp_enabled: true,
             mcp_addr: "127.0.0.1:7777".into(),
+            quiet: false,
+            quiet_from: "22:00".into(),
+            quiet_to: "22:00".into(),
+            quiet_fullscreen: true,
+            check_updates: true,
+            auto_update: true,
+            hidden: false,
+            asleep: false,
         }
     }
 }
@@ -104,7 +128,27 @@ impl Settings {
         if self.mcp_addr.trim().is_empty() {
             self.mcp_addr = d.mcp_addr;
         }
+        if parse_hhmm(&self.quiet_from).is_none() || parse_hhmm(&self.quiet_to).is_none() {
+            self.quiet_from = d.quiet_from;
+            self.quiet_to = d.quiet_to;
+        }
         self
+    }
+
+    /// Whether do-not-disturb is on at `minute` (minutes since local midnight).
+    pub fn is_quiet(&self, minute: u32) -> bool {
+        if self.quiet {
+            return true;
+        }
+        let (Some(from), Some(to)) = (parse_hhmm(&self.quiet_from), parse_hhmm(&self.quiet_to))
+        else {
+            return false;
+        };
+        match from.cmp(&to) {
+            std::cmp::Ordering::Equal => false,
+            std::cmp::Ordering::Less => (from..to).contains(&minute),
+            std::cmp::Ordering::Greater => minute >= from || minute < to,
+        }
     }
 
     /// `None`: stays until clicked.
@@ -169,6 +213,13 @@ fn mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
+/// "HH:MM" -> minutes since midnight.
+pub fn parse_hhmm(s: &str) -> Option<u32> {
+    let (h, m) = s.trim().split_once(':')?;
+    let (h, m): (u32, u32) = (h.parse().ok()?, m.parse().ok()?);
+    (h < 24 && m < 60).then_some(h * 60 + m)
+}
+
 /// `%APPDATA%\dost` (Windows) or `~/.config/dost`.
 pub fn config_dir() -> Option<PathBuf> {
     let base = if cfg!(windows) {
@@ -214,6 +265,29 @@ mod tests {
             .notify_timeout(),
             None
         );
+    }
+
+    #[test]
+    fn quiet_hours() {
+        let mut s = Settings::default();
+        assert!(!s.is_quiet(23 * 60));
+        s.quiet_from = "22:00".into();
+        s.quiet_to = "08:00".into();
+        assert!(s.is_quiet(23 * 60));
+        assert!(s.is_quiet(7 * 60 + 59));
+        assert!(!s.is_quiet(8 * 60));
+        assert!(!s.is_quiet(12 * 60));
+        s.quiet_from = "12:00".into();
+        s.quiet_to = "13:00".into();
+        assert!(s.is_quiet(12 * 60 + 30));
+        assert!(!s.is_quiet(13 * 60));
+        s.quiet = true;
+        assert!(s.is_quiet(9 * 60));
+        let bad = Settings {
+            quiet_from: "25:00".into(),
+            ..Settings::default()
+        };
+        assert_eq!(bad.sanitized().quiet_from, "22:00");
     }
 
     #[test]

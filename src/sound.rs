@@ -11,9 +11,9 @@ pub fn scaled_wav(wav: &[u8], volume: u8) -> Option<Vec<u8>> {
     let mut out = wav.to_vec();
     let gain = volume.min(100) as i32;
     let end = (data_start + data_len).min(out.len());
-    for s in out[data_start..end].chunks_exact_mut(2) {
-        let v = i16::from_le_bytes([s[0], s[1]]) as i32 * gain / 100;
-        s.copy_from_slice(&(v as i16).to_le_bytes());
+    for s in out[data_start..end].as_chunks_mut::<2>().0 {
+        let v = i16::from_le_bytes(*s) as i32 * gain / 100;
+        *s = (v as i16).to_le_bytes();
     }
     Some(out)
 }

@@ -3,14 +3,16 @@
 An [OpenCode](https://opencode.ai) V2 plugin that makes the [Dost](../../README.md) desktop dog
 bark when OpenCode needs you:
 
-| When | Bubble |
+| When | What the dog does |
 |---|---|
-| OpenCode asks you a question | **Question:** *session title · folder* |
-| A tool needs your permission | **Permission:** *session title · folder* |
-| A task finishes (after at least 10 s of work) | **Done:** *session title · folder* |
-| A session fails | **Error:** *session title · folder* |
+| A tool needs your permission | Barks and shows **Allow / Always / Reject** buttons; your click goes back to OpenCode. Answer in the terminal instead and the bubble goes away. |
+| OpenCode asks you a question | Barks and shows the question until you click it; answer it in OpenCode. |
+| A task runs longer than 10 s | Shows a progress bar with the current tool and step count. |
+| The task finishes | The bar turns green with how long it took, and the dog is happy. |
+| A session fails | The bar turns red (or a bubble shows the error) and the dog barks. |
 
-Sub-agent sessions stay quiet; only the session you are looking at reports back.
+Bubbles are labelled **OPENCODE** and carry the session title and folder. Sub-agent sessions stay
+quiet; only the session you are looking at reports back.
 
 ## Install
 
@@ -35,6 +37,8 @@ All optional, in `opencode.json`:
       "options": {
         "url": "http://127.0.0.1:7777/mcp",
         "question": true,
+        "permissions": true,
+        "progress": true,
         "done": true,
         "error": true,
         "minWorkSeconds": 10,
@@ -47,11 +51,13 @@ All optional, in `opencode.json`:
 
 | Option | Default | Meaning |
 |---|---|---|
-| `url` | `http://127.0.0.1:7777/mcp` | Dost's MCP address (Settings → MCP in the dog's tray menu) |
-| `question` | `true` | Bark on questions and permission requests |
-| `done` | `true` | Bark when a task finishes |
-| `error` | `true` | Bark when a session fails |
-| `minWorkSeconds` | `10` | Ignore tasks shorter than this |
+| `url` | `http://127.0.0.1:7777/mcp` | Dost's MCP address (Settings → Connect in the dog's menu) |
+| `question` | `true` | Bark on questions |
+| `permissions` | `true` | Permission requests with answer buttons (`false`: no bubble) |
+| `progress` | `true` | Progress bar for long tasks |
+| `done` | `true` | Tell when a task finishes |
+| `error` | `true` | Tell when a session fails |
+| `minWorkSeconds` | `10` | Tasks shorter than this get no progress bar and no "done" bubble |
 | `lang` | from `$LANG`, else `en` | `en` or `tr` |
 
 ## OpenCode in WSL, Dost on Windows

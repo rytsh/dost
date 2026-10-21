@@ -8,12 +8,26 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::dog::{Anim, Bounds, Dog};
-use crate::mcp::{self, DogStatus, Mcp};
-use crate::notify::{self, Notification, Notifier};
+use crate::mcp::{self, DogStatus, HISTORY_LEN, HistoryEntry, Mcp};
+use crate::notify::{self, Event, Notification, Notifier, ProgressState, Reaction};
 use crate::panel::{self, Action};
 use crate::render::{Bubble, Hits, Renderer, Scale};
 use crate::settings::{self, Settings, Store};
+use crate::update;
 use crate::watch::{self, Watches};
+
+/// A finished or failed progress bubble stays this long.
+const PROGRESS_END: Duration = Duration::from_secs(6);
+/// While other notifications wait, a running progress bubble yields after this long.
+const PROGRESS_TURN: Duration = Duration::from_secs(8);
+/// Away from the computer this long counts as gone: news meanwhile is summed up on return.
+const AWAY: Duration = Duration::from_secs(5 * 60);
+/// How often to look for a new version.
+const UPDATE_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
+/// "Later" shows the bubble again after this long.
+pub const SNOOZE: Duration = Duration::from_secs(10 * 60);
+/// A new bubble ignores clicks this long after it appears.
+const CLICK_GUARD: Duration = Duration::from_millis(400);
 
 /// What a platform shell provides to the shared core.
 pub trait Platform {
@@ -22,6 +36,20 @@ pub trait Platform {
     fn autostart_enabled(&self) -> bool;
     fn set_autostart(&mut self, on: bool) -> Result<(), String>;
     fn open_folder(&mut self, path: &std::path::Path);
+    /// Opens an http(s) URL in the default browser.
+    fn open_url(&mut self, url: &str);
+    /// Seconds since the last mouse or keyboard input, if the platform can tell.
+    fn idle_secs(&self) -> Option<u64>;
+    /// Something covers a whole screen (a video, a presentation, a game).
+    fn fullscreen(&self) -> bool {
+        false
+    }
+    /// The screen is locked (or the login window / screen saver is up).
+    fn screen_locked(&self) -> bool {
+        false
+    }
+    /// Posts a system notification (Notification Center / Windows toast).
+    fn system_notify(&mut self, _title: &str, _body: &str) {}
     /// Shows or hides the dog's window.
     fn set_dog_visible(&mut self, visible: bool);
     fn close_panel(&mut self);
@@ -30,9 +58,23 @@ pub trait Platform {
     fn autostart_label(&self) -> &'static str;
 }
 
+/// Global keyboard shortcuts for the bubble (⌥⌘ on macOS, Ctrl+Alt on Windows).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Key {
+    /// Enter: the first choice, or open / close plain news.
+    Accept,
+    /// 1-4: that choice.
+    Choice(usize),
+    /// Backspace: the last choice ("no") or close.
+    Dismiss,
+    /// L: later.
+    Later,
+}
+
 pub struct Shown {
     pub note: Notification,
     pub deadline: Option<Instant>,
+    pub since: Instant,
 }
 
 pub struct Core {
@@ -40,6 +82,8 @@ pub struct Core {
     pub renderer: Renderer,
     pub settings: Settings,
     pub store: Store,
+    /// The user wants the dog shown (Hide/Show). While hidden it still walks in from the
+    /// right edge to deliver important notifications; see [`Core::on_screen`].
     pub visible: bool,
     pub shown: Option<Shown>,
     pub queue: VecDeque<Notification>,
@@ -47,13 +91,52 @@ pub struct Core {
     pub mcp_error: Option<String>,
     /// The panel must be redrawn (settings or state changed).
     pub panel_dirty: bool,
-    rx: Receiver<Notification>,
+    /// Notifications that arrived while hidden and were not seen; cleared when the panel opens.
+    pub missed: usize,
+    rx: Receiver<Event>,
     notifier: Notifier,
     mcp: Arc<Mcp>,
     mcp_server: Option<mcp::Running>,
     status: Arc<Mutex<DogStatus>>,
     last: Instant,
     last_settings_check: Instant,
+    next_id: u64,
+    /// Reactions waiting for the next frame (they need the walking bounds).
+    reactions: Vec<Reaction>,
+    /// The dog window was shown last frame (to tell the shell when that changes).
+    was_on_screen: bool,
+    /// Hide/Show was asked for; applied on the next frame (it needs the walking bounds).
+    toggle_visible: bool,
+    /// The user just clicked a bubble away: the next queued one is shown without barking.
+    seen: bool,
+    /// Since when the user has been away (idle for [`AWAY`]), Unix seconds.
+    away_since: Option<u64>,
+    /// Notifications up to this id are summed up already (never twice).
+    summed: u64,
+    /// Where History is kept between runs.
+    history_path: Option<std::path::PathBuf>,
+    /// History changed since it was last written.
+    history_dirty: bool,
+    /// An app is full screen (checked each second).
+    fullscreen: bool,
+    /// The screen was locked at the last check.
+    locked: bool,
+    /// A running update check, and when the last one started.
+    update: Option<Receiver<update::Found>>,
+    last_update_check: Option<Instant>,
+    /// The version found newer than this one, for the panel.
+    pub new_version: Option<String>,
+    /// A newer version is installed and waits for a restart.
+    pub update_ready: bool,
+    /// The user asked (Check now): say so even when there is nothing new.
+    update_asked: bool,
+    /// The "Restart" question's answer.
+    restart_answer: Option<Receiver<String>>,
+    /// Important notifications that arrived while locked: (title, body), for the system
+    /// notification after unlocking.
+    while_locked: Vec<(String, String)>,
+    last_fullscreen_check: Instant,
+    last_history_save: Instant,
 }
 
 impl Core {
@@ -62,14 +145,43 @@ impl Core {
     pub fn new(renderer: Renderer, x: f32, ground: f32) -> Self {
         let mut store = Store::new(settings::config_dir().map(|d| d.join("settings.json")));
         let settings = store.load();
+        update::cleanup();
+        let mut core = Self::build(renderer, x, ground, store, watch::default_path());
+        core.load_history(settings::config_dir().map(|d| d.join("history.json")));
+        core.restore(&settings);
+        core.apply_settings(settings, false);
+        // Hidden or asleep from last time: no hello bark.
+        let quiet_start = !core.visible || core.dog.is_put_to_sleep();
+        let hello = match &core.mcp_error {
+            None if quiet_start => None,
+            None => Some(
+                Notification::new(
+                    "Woof!",
+                    "Hi, I'm Dost. Drag me around, or click my tray icon for settings.",
+                )
+                .timeout(Duration::from_secs(6)),
+            ),
+            Some(e) => Some(Notification::new("MCP server could not start", e.clone()).sticky()),
+        };
+        if let Some(hello) = hello {
+            core.notifier.send(hello);
+        }
+        core
+    }
 
+    fn build(
+        renderer: Renderer,
+        x: f32,
+        ground: f32,
+        store: Store,
+        watches_path: Option<std::path::PathBuf>,
+    ) -> Self {
         let (notifier, rx) = notify::channel();
         let status = Arc::new(Mutex::new(DogStatus::default()));
-        let watches = Watches::new(notifier.clone(), watch::default_path());
+        let watches = Watches::new(notifier.clone(), watches_path);
         watches.start();
         let mcp = Arc::new(Mcp::new(notifier.clone(), watches, Arc::clone(&status)));
-
-        let mut core = Core {
+        Core {
             dog: Dog::new(x.round(), ground),
             renderer,
             settings: Settings::default(),
@@ -87,18 +199,107 @@ impl Core {
             status,
             last: Instant::now(),
             last_settings_check: Instant::now(),
+            next_id: 0,
+            reactions: Vec::new(),
+            missed: 0,
+            was_on_screen: true,
+            toggle_visible: false,
+            seen: false,
+            away_since: None,
+            summed: 0,
+            history_path: None,
+            history_dirty: false,
+            fullscreen: false,
+            locked: false,
+            update: None,
+            last_update_check: None,
+            new_version: None,
+            update_ready: false,
+            update_asked: false,
+            restart_answer: None,
+            while_locked: Vec::new(),
+            last_fullscreen_check: Instant::now(),
+            last_history_save: Instant::now(),
+        }
+    }
+
+    /// Loads History from the last run. Whatever was still waiting then is gone now.
+    fn load_history(&mut self, path: Option<std::path::PathBuf>) {
+        let old: Vec<HistoryEntry> = path
+            .as_ref()
+            .and_then(|p| std::fs::read(p).ok())
+            .and_then(|d| serde_json::from_slice(&d).ok())
+            .unwrap_or_default();
+        self.history_path = path;
+        let Ok(mut s) = self.status.lock() else {
+            return;
         };
-        core.apply_settings(settings, false);
-        let hello = match &core.mcp_error {
-            None => Notification::new(
-                "Woof!",
-                "Hi, I'm Dost. Drag me around, or click my tray icon for settings.",
-            )
-            .timeout(Duration::from_secs(6)),
-            Some(e) => Notification::new("MCP server could not start", e.clone()).sticky(),
+        for mut h in old.into_iter().rev().take(HISTORY_LEN).rev() {
+            if h.outcome == "queued" || h.outcome == "shown" || h.outcome == "updated" {
+                h.outcome = "closed".into();
+            }
+            // Ids start over each run.
+            h.id = 0;
+            s.history.push_back(h);
+        }
+    }
+
+    /// Writes History at most every few seconds, and right away with `now`.
+    fn save_history(&mut self, now: bool) {
+        if !self.history_dirty
+            || (!now && self.last_history_save.elapsed() < Duration::from_secs(3))
+        {
+            return;
+        }
+        let Some(path) = self.history_path.clone() else {
+            return;
         };
-        core.notifier.send(hello);
-        core
+        self.history_dirty = false;
+        self.last_history_save = Instant::now();
+        let data = match self.status.lock() {
+            Ok(s) => serde_json::to_vec_pretty(&s.history),
+            Err(_) => return,
+        };
+        if let Ok(data) = data {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let tmp = path.with_extension("json.tmp");
+            if std::fs::write(&tmp, data).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
+    }
+
+    /// Saves what must survive a quit (History). Called by the shells before exiting.
+    pub fn shutdown(&mut self) {
+        self.save_history(true);
+    }
+
+    /// Hidden / asleep as saved last time; hidden starts off screen without walking off.
+    fn restore(&mut self, s: &Settings) {
+        if s.hidden {
+            // The shells check on_screen() before showing the dog's window.
+            self.visible = false;
+            self.was_on_screen = false;
+            self.dog.start_away();
+        }
+        if s.asleep {
+            self.dog.sleep();
+        }
+    }
+
+    /// Saves hidden / asleep when they change, so the next start looks the same.
+    fn remember_state(&mut self) {
+        if self.toggle_visible {
+            return;
+        }
+        let (hidden, asleep) = (!self.visible, self.dog.is_put_to_sleep());
+        if self.settings.hidden != hidden || self.settings.asleep != asleep {
+            self.settings.hidden = hidden;
+            self.settings.asleep = asleep;
+            self.store.save(&self.settings);
+        }
     }
 
     /// One frame: notifications, settings file changes, the dog's movement.
@@ -108,8 +309,28 @@ impl Core {
         let dt = (now - self.last).as_secs_f32().min(0.1);
         self.last = now;
 
-        while let Ok(n) = self.rx.try_recv() {
-            self.queue.push_back(n);
+        while let Ok(ev) = self.rx.try_recv() {
+            match ev {
+                Event::Notify(n) => self.receive(*n),
+                Event::React(r) => self.reactions.push(r),
+                Event::Dismiss(key) => self.dismiss(&key),
+            }
+        }
+        for r in std::mem::take(&mut self.reactions) {
+            self.react(p, r, bounds);
+        }
+        if std::mem::take(&mut self.toggle_visible) {
+            self.set_visible(!self.visible, bounds);
+        }
+        if now - self.last_fullscreen_check > Duration::from_secs(1) {
+            self.last_fullscreen_check = now;
+            let fs = self.settings.quiet_fullscreen && p.fullscreen();
+            if fs != self.fullscreen {
+                self.fullscreen = fs;
+                self.panel_dirty = true;
+            }
+            self.check_lock(p);
+            self.check_update(false);
         }
         if now - self.last_settings_check > Duration::from_secs(1) {
             self.last_settings_check = now;
@@ -117,28 +338,313 @@ impl Core {
                 self.apply_settings(s, false);
             }
         }
+        self.expire(now);
         if self
             .shown
             .as_ref()
-            .is_some_and(|s| s.deadline.is_some_and(|d| now >= d))
+            .is_some_and(|s| self.should_hide(s, now))
         {
-            self.shown = None;
+            let s = self.shown.take().unwrap();
+            if s.note
+                .progress
+                .as_ref()
+                .is_some_and(|p| p.state == ProgressState::Running)
+            {
+                // Taking turns with other notifications; it comes back after them.
+                let mut note = s.note;
+                note.announced = true;
+                self.queue.push_back(note);
+            }
         }
-        if self.shown.is_none()
-            && let Some(note) = self.queue.pop_front()
+        if self.shown.is_none() && self.ready_for_next() {
+            self.show_next(p, now);
+        }
+        self.dog.hold = self.shown.is_some() && !self.dog.is_performing();
+        self.welcome_back(p.idle_secs());
+        self.restart_if_asked(p);
+        self.publish_status(p);
+        self.dog.update(dt, bounds);
+        if self.dog.take_left() {
+            self.panel_dirty = true;
+        }
+        let on = self.on_screen();
+        if on != self.was_on_screen {
+            self.was_on_screen = on;
+            p.set_dog_visible(on);
+        }
+        self.remember_state();
+        self.save_history(false);
+    }
+
+    /// Notifications waiting to be shown now (not the snoozed ones).
+    pub fn waiting(&self) -> usize {
+        let now = Instant::now();
+        self.queue
+            .iter()
+            .filter(|n| n.not_before.is_none_or(|t| now >= t))
+            .count()
+    }
+
+    /// Whether the dog window should be shown: when visible, or while walking off after Hide.
+    pub fn on_screen(&self) -> bool {
+        self.visible || !self.dog.is_away()
+    }
+
+    /// While hidden, bubbles are shown on their own at the top right (under the tray icon)
+    /// instead of above the dog.
+    pub fn bubble_alone(&self) -> bool {
+        !self.visible && self.shown.is_some()
+    }
+
+    /// Waits for the dog to finish walking off before showing a detached bubble.
+    fn ready_for_next(&self) -> bool {
+        self.visible || self.dog.is_away()
+    }
+
+    /// Hide: the dog walks off to the right. Show: it walks back in.
+    pub fn set_visible(&mut self, visible: bool, b: &Bounds) {
+        if visible == self.visible {
+            return;
+        }
+        self.visible = visible;
+        if visible {
+            self.dog.enter(b);
+        } else {
+            self.dog.leave(b);
+        }
+        self.panel_dirty = true;
+    }
+
+    /// The panel was opened: if something was missed while hidden, it opens on History.
+    /// Returns true when it should (the missed count clears once that tab is shown).
+    pub fn panel_opened(&mut self) -> bool {
+        if self.missed > 0 {
+            self.missed = 0;
+            self.panel_dirty = true;
+            return true;
+        }
+        false
+    }
+
+    /// Takes in a new notification: numbers it, records it, and either queues it or applies it
+    /// as an update to a progress bubble with the same id.
+    fn receive(&mut self, mut n: Notification) {
+        if let Some(pr) = &n.progress {
+            let target = self
+                .shown
+                .as_mut()
+                .map(|s| &mut s.note)
+                .into_iter()
+                .chain(self.queue.iter_mut())
+                .find(|q| q.progress.as_ref().is_some_and(|qp| qp.id == pr.id));
+            if let Some(q) = target {
+                let done = pr.state != ProgressState::Running;
+                q.title = n.title;
+                q.body = n.body;
+                q.progress = n.progress;
+                if done {
+                    q.timeout = notify::Timeout::After(PROGRESS_END);
+                }
+                let id = q.id;
+                if done && let Some(s) = self.shown.as_mut().filter(|s| s.note.id == id) {
+                    s.deadline = Some(Instant::now() + PROGRESS_END);
+                    match s.note.progress.as_ref().map(|p| p.state) {
+                        Some(ProgressState::Done) => self.dog.pet(),
+                        _ => self.dog.notify(),
+                    }
+                }
+                self.update_history(id, |h| {
+                    h.outcome = if done {
+                        "finished".into()
+                    } else {
+                        "updated".into()
+                    };
+                });
+                return;
+            }
+        }
+        self.next_id += 1;
+        n.id = self.next_id;
+        self.note_locked(&n);
+        self.record(&n, "queued");
+        self.queue.push_back(n);
+    }
+
+    /// Withdraws notifications with this key (e.g. a question answered in the terminal).
+    /// Dropping a question also drops its reply sender, so the waiting `ask` returns.
+    fn dismiss(&mut self, key: &str) {
+        let mut gone = Vec::new();
+        if self
+            .shown
+            .as_ref()
+            .is_some_and(|s| s.note.key.as_deref() == Some(key))
         {
-            self.dog.notify();
-            if self.settings.sound {
-                p.play_bark(self.settings.volume);
+            gone.push(self.shown.take().unwrap().note.id);
+        }
+        self.queue.retain(|n| {
+            let keep = n.key.as_deref() != Some(key);
+            if !keep {
+                gone.push(n.id);
+            }
+            keep
+        });
+        for id in gone {
+            self.update_history(id, |h| h.outcome = "answered elsewhere".into());
+        }
+    }
+
+    /// Drops questions whose time ran out, shown or queued.
+    fn expire(&mut self, now: Instant) {
+        let mut gone = Vec::new();
+        if self.shown.as_ref().is_some_and(|s| s.note.is_expired(now)) {
+            gone.push(self.shown.take().unwrap().note.id);
+        }
+        self.queue.retain(|n| {
+            let keep = !n.is_expired(now);
+            if !keep {
+                gone.push(n.id);
+            }
+            keep
+        });
+        for id in gone {
+            self.update_history(id, |h| h.outcome = "expired (no answer)".into());
+        }
+    }
+
+    fn should_hide(&self, s: &Shown, now: Instant) -> bool {
+        if s.deadline.is_some_and(|d| now >= d) {
+            return true;
+        }
+        // A running progress bar does not block what is waiting behind it.
+        s.note
+            .progress
+            .as_ref()
+            .is_some_and(|p| p.state == ProgressState::Running)
+            && self.waiting() > 0
+            && now - s.since >= PROGRESS_TURN
+    }
+
+    fn show_next(&mut self, p: &mut dyn Platform, now: Instant) {
+        let quiet = self.hushed();
+        let seen = std::mem::take(&mut self.seen);
+        let why = if self.settings.is_quiet(local_minute()) {
+            "skipped (quiet)"
+        } else if self.dog.is_put_to_sleep() {
+            "skipped (asleep)"
+        } else {
+            "skipped (full screen)"
+        };
+        while let Some(i) = self
+            .queue
+            .iter()
+            .position(|n| n.not_before.is_none_or(|t| now >= t))
+        {
+            let Some(mut note) = self.queue.remove(i) else {
+                return;
+            };
+            if note.not_before.take().is_some() {
+                self.update_history(note.id, |h| h.outcome = "reminded".into());
+            }
+            if quiet && !note.is_important() {
+                self.update_history(note.id, |h| h.outcome = why.into());
+                continue;
+            }
+            // Hidden: plain news barks and waits in History; important ones get a bubble.
+            if !self.visible && !note.is_important() {
+                if !note.announced {
+                    if self.settings.sound && !quiet {
+                        p.play_bark(self.settings.volume);
+                    }
+                    if let Some(text) = &note.copy {
+                        p.copy_text(text);
+                    }
+                }
+                self.missed += 1;
+                self.update_history(note.id, |h| h.outcome = "missed (hidden)".into());
+                continue;
+            }
+            if !note.announced {
+                if !seen {
+                    self.dog.notify();
+                }
+                if self.settings.sound && !quiet && !seen {
+                    p.play_bark(self.settings.volume);
+                }
+                if let Some(text) = &note.copy {
+                    p.copy_text(text);
+                }
             }
             let deadline = note
                 .resolve_timeout(self.settings.notify_timeout())
                 .map(|t| now + t);
-            self.shown = Some(Shown { note, deadline });
+            let id = note.id;
+            self.shown = Some(Shown {
+                note,
+                deadline,
+                since: now,
+            });
+            self.update_history(id, |h| {
+                if h.outcome == "queued" {
+                    h.outcome = "shown".into();
+                }
+            });
+            return;
         }
-        self.dog.hold = self.shown.is_some();
-        self.publish_status();
-        self.dog.update(dt, bounds);
+    }
+
+    fn react(&mut self, p: &mut dyn Platform, r: Reaction, bounds: &Bounds) {
+        match r {
+            Reaction::Happy => self.dog.pet(),
+            Reaction::Bark => {
+                self.dog.notify();
+                if self.settings.sound && !self.hushed() {
+                    p.play_bark(self.settings.volume);
+                }
+            }
+            Reaction::Sleep => self.dog.sleep(),
+            Reaction::Wake => self.dog.wake_up(),
+            Reaction::Zoomies => self.dog.zoomies(bounds),
+        }
+        self.panel_dirty = true;
+    }
+
+    /// No barking and only important bubbles: quiet hours / Quiet on, or the dog was put
+    /// to sleep.
+    pub fn hushed(&self) -> bool {
+        self.settings.is_quiet(local_minute()) || self.dog.is_put_to_sleep() || self.fullscreen
+    }
+
+    fn record(&mut self, n: &Notification, outcome: &str) {
+        self.panel_dirty = true;
+        self.history_dirty = true;
+        if let Ok(mut s) = self.status.lock() {
+            s.history.push_back(HistoryEntry {
+                id: n.id,
+                at: watch::now_unix(),
+                source: n.source.clone(),
+                title: n.title.clone(),
+                message: n.body.clone(),
+                outcome: outcome.into(),
+            });
+            while s.history.len() > HISTORY_LEN {
+                s.history.pop_front();
+            }
+        }
+    }
+
+    fn update_history(&mut self, id: u64, f: impl FnOnce(&mut HistoryEntry)) {
+        self.panel_dirty = true;
+        self.history_dirty = true;
+        if let Ok(mut s) = self.status.lock()
+            && let Some(h) = s.history.iter_mut().rev().find(|h| h.id == id)
+        {
+            f(h);
+        }
+    }
+
+    /// Queues a notification from the app itself (not via MCP).
+    fn push(&mut self, n: Notification) {
+        self.receive(n);
     }
 
     /// The dog's scale on a screen with the given UI (DPI) scale.
@@ -147,26 +653,383 @@ impl Core {
     }
 
     pub fn bubble(&self) -> Option<Bubble<'_>> {
-        self.shown.as_ref().map(|s| Bubble {
-            title: &s.note.title,
-            body: &s.note.body,
-            pending: self.queue.len(),
-        })
+        bubble_of(self.shown.as_ref(), self.waiting())
     }
 
-    /// Click on the dog's window that was not a drag: closes the bubble or pets the dog.
+    /// Click on the dog's window that was not a drag: answers a question, opens a link,
+    /// closes the bubble or pets the dog.
     pub fn click(&mut self, p: &mut dyn Platform, x: f32, y: f32) {
-        let on_bubble = self
-            .hits
-            .bubble
-            .is_some_and(|r| x >= r.left() && x <= r.right() && y >= r.top() && y <= r.bottom());
-        if on_bubble {
-            self.shown = None;
+        let inside =
+            |r: tiny_skia::Rect| x >= r.left() && x <= r.right() && y >= r.top() && y <= r.bottom();
+        let choice = self.hits.choices.iter().position(|r| inside(*r));
+        let on_bubble = self.hits.bubble.is_some_and(inside);
+        if self.hits.clear.is_some_and(inside) {
+            self.clear_all();
+            return;
+        }
+        if self.hits.snooze.is_some_and(inside) {
+            self.snooze();
+            return;
+        }
+        if let Some(i) = choice {
+            self.answer(i);
+        } else if on_bubble {
+            // A question is only closed by answering it.
+            if self.shown.as_ref().is_some_and(|s| s.note.is_question()) {
+                return;
+            }
+            // A double click must not close the next bubble before it can be read.
+            if self
+                .shown
+                .as_ref()
+                .is_some_and(|s| s.since.elapsed() < CLICK_GUARD)
+            {
+                return;
+            }
+            if let Some(s) = self.shown.take() {
+                if let Some(url) = &s.note.url {
+                    p.open_url(url);
+                    self.update_history(s.note.id, |h| h.outcome = "opened link".into());
+                } else {
+                    self.update_history(s.note.id, |h| h.outcome = "dismissed".into());
+                }
+                self.seen = self.waiting() > 0;
+            }
         } else {
             self.dog.pet();
             if self.settings.sound && self.settings.sound_on_pet {
                 p.play_bark(self.settings.volume);
             }
+        }
+    }
+
+    /// Notices the user leaving (idle for [`AWAY`]) and coming back; on return, if news came
+    /// meanwhile, shows one bubble that sums it up. Idle time never holds notifications back.
+    fn welcome_back(&mut self, idle: Option<u64>) {
+        let Some(idle) = idle else { return };
+        if idle >= AWAY.as_secs() {
+            // Idle started `idle` seconds ago: what came since then counts.
+            self.away_since
+                .get_or_insert(watch::now_unix().saturating_sub(idle));
+            return;
+        }
+        let Some(since) = self.away_since.take() else {
+            return;
+        };
+        let after = std::mem::replace(&mut self.summed, self.next_id);
+        let Some(summary) = self.summary_since(since, after) else {
+            return;
+        };
+        let n = Notification::new("While you were away", summary).sticky();
+        self.push(n);
+        // It goes first, ahead of what it sums up.
+        if let Some(i) = self
+            .queue
+            .iter()
+            .position(|n| n.title == "While you were away")
+            && let Some(n) = self.queue.remove(i)
+        {
+            self.queue.push_front(n);
+        }
+    }
+
+    /// "3 notifications, 1 failed · CI, OpenCode" for what arrived since `since` (Unix
+    /// seconds) with an id above `after`.
+    fn summary_since(&self, since: u64, after: u64) -> Option<String> {
+        let s = self.status.lock().ok()?;
+        let news: Vec<&HistoryEntry> = s
+            .history
+            .iter()
+            .filter(|h| h.id > after && h.at >= since && h.title != "While you were away")
+            .collect();
+        if news.len() < 2 {
+            // One item is shown (or in History) by itself already.
+            return None;
+        }
+        let low = |h: &HistoryEntry| format!("{} {}", h.title, h.outcome).to_lowercase();
+        let failed = news
+            .iter()
+            .filter(|h| {
+                let t = low(h);
+                t.contains("fail") || t.contains("error")
+            })
+            .count();
+        let asked = news
+            .iter()
+            .filter(|h| h.outcome.starts_with("expired") || h.outcome == "answered elsewhere")
+            .count();
+        let mut parts = vec![format!("{} notifications", news.len())];
+        if failed > 0 {
+            parts.push(format!("{failed} failed"));
+        }
+        if asked > 0 {
+            parts.push(format!("{asked} unanswered"));
+        }
+        let mut sources: Vec<&str> = news.iter().filter_map(|h| h.source.as_deref()).collect();
+        sources.sort_unstable();
+        sources.dedup();
+        let mut text = parts.join(", ");
+        if !sources.is_empty() {
+            text.push_str(&format!(" · {}", sources.join(", ")));
+        }
+        let last: Vec<String> = news
+            .iter()
+            .rev()
+            .take(3)
+            .map(|h| {
+                if h.title.is_empty() {
+                    h.message.chars().take(40).collect()
+                } else {
+                    h.title.chars().take(40).collect()
+                }
+            })
+            .collect();
+        text.push_str(&format!("\nLatest: {}", last.join("; ")));
+        Some(text)
+    }
+
+    /// Looks for a new version at start and once a day (or now, with `now`); installs it when
+    /// allowed and announces it.
+    /// "Restart" on the "update installed" bubble: starts the new version and quits.
+    fn restart_if_asked(&mut self, p: &mut dyn Platform) {
+        let Some(rx) = &self.restart_answer else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(a) if a == "Restart" => {
+                self.restart_answer = None;
+                self.shutdown();
+                update::restart();
+                p.quit();
+            }
+            Ok(_) | Err(std::sync::mpsc::TryRecvError::Disconnected) => self.restart_answer = None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    pub fn check_update(&mut self, now: bool) {
+        if let Some(rx) = &self.update {
+            match rx.try_recv() {
+                Ok(found) => {
+                    self.update = None;
+                    self.on_update(found);
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.update = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            return;
+        }
+        let due = self
+            .last_update_check
+            .is_none_or(|t| t.elapsed() >= UPDATE_EVERY);
+        if self.update_ready || !(now || due && self.settings.check_updates) {
+            return;
+        }
+        self.last_update_check = Some(Instant::now());
+        let install = self.settings.auto_update && update::can_install();
+        self.update = Some(update::check(install));
+        self.update_asked = now;
+    }
+
+    fn on_update(&mut self, found: update::Found) {
+        let asked = std::mem::take(&mut self.update_asked);
+        match found {
+            update::Found::UpToDate => {
+                if asked {
+                    self.push(
+                        Notification::new(
+                            "Dost is up to date",
+                            format!("Version {}", env!("CARGO_PKG_VERSION")),
+                        )
+                        .timeout(Duration::from_secs(5)),
+                    );
+                }
+            }
+            update::Found::Failed(e) => {
+                if asked {
+                    self.push(Notification::new("Could not check for updates", e));
+                }
+            }
+            update::Found::Newer {
+                version,
+                url,
+                ready,
+            } => {
+                let first =
+                    self.new_version.as_deref() != Some(&version) || ready != self.update_ready;
+                self.new_version = Some(version.clone());
+                self.update_ready = ready;
+                self.panel_dirty = true;
+                if !(first || asked) {
+                    return;
+                }
+                if ready {
+                    let (mut n, rx) = Notification::new(
+                        format!("Dost {version} is installed"),
+                        "Restart to use it.",
+                    )
+                    .ask(
+                        vec!["Restart".into(), "Later".into()],
+                        Duration::from_secs(3600),
+                    );
+                    n.timeout = notify::Timeout::Sticky;
+                    self.restart_answer = Some(rx);
+                    self.push(n);
+                } else {
+                    let mut n = Notification::new(
+                        format!("Dost {version} is out"),
+                        "Click to open the download page.",
+                    );
+                    n.url = Some(url).filter(|u| u.starts_with("https://"));
+                    self.push(n.timeout(Duration::from_secs(30)));
+                }
+            }
+        }
+    }
+
+    /// Collects what arrives while the screen is locked; on unlock, posts it as a system
+    /// notification too, so it is seen even without looking at the dog.
+    fn check_lock(&mut self, p: &mut dyn Platform) {
+        let locked = p.screen_locked();
+        if locked == self.locked {
+            return;
+        }
+        self.locked = locked;
+        if locked {
+            self.while_locked.clear();
+            return;
+        }
+        let news = std::mem::take(&mut self.while_locked);
+        match news.as_slice() {
+            [] => {}
+            [(title, body)] => p.system_notify(title, body),
+            [.., (title, _)] => {
+                let rest = news.len() - 1;
+                p.system_notify(
+                    &format!("Dost: {} waiting", news.len()),
+                    &format!("{title} and {rest} more. Click the dog's icon to see them."),
+                );
+            }
+        }
+    }
+
+    /// Remembers an important notification that arrived while the screen was locked.
+    fn note_locked(&mut self, n: &Notification) {
+        if !self.locked || !(n.is_important() || n.title.to_lowercase().contains("fail")) {
+            return;
+        }
+        let title = match &n.source {
+            Some(s) if !n.title.is_empty() => format!("{s}: {}", n.title),
+            Some(s) => s.clone(),
+            None if n.title.is_empty() => "Dost".into(),
+            None => n.title.clone(),
+        };
+        self.while_locked
+            .push((title, n.body.chars().take(200).collect()));
+    }
+
+    /// A global keyboard shortcut. Returns true if it did something.
+    pub fn on_key(&mut self, p: &mut dyn Platform, key: Key) -> bool {
+        let Some(s) = self.shown.as_ref() else {
+            return false;
+        };
+        match key {
+            // The first (highlighted) choice; on plain news, opens its link or closes it.
+            Key::Accept if s.note.is_question() => self.answer(0),
+            Key::Accept => {
+                let s = self.shown.take().unwrap();
+                match &s.note.url {
+                    Some(url) => {
+                        p.open_url(url);
+                        self.update_history(s.note.id, |h| h.outcome = "opened link".into());
+                    }
+                    None => self.update_history(s.note.id, |h| h.outcome = "dismissed".into()),
+                }
+                self.seen = self.waiting() > 0;
+            }
+            Key::Choice(i) if i < s.note.choices.len() => self.answer(i),
+            Key::Choice(_) => return false,
+            // A question's last choice is the "no" (Reject, Deny, No).
+            Key::Dismiss if s.note.is_question() => {
+                let last = s.note.choices.len().saturating_sub(1);
+                self.answer(last);
+            }
+            Key::Dismiss => {
+                let s = self.shown.take().unwrap();
+                self.update_history(s.note.id, |h| h.outcome = "dismissed".into());
+                self.seen = self.waiting() > 0;
+            }
+            Key::Later => {
+                if !s.note.can_snooze() {
+                    return false;
+                }
+                self.snooze();
+            }
+        }
+        self.panel_dirty = true;
+        true
+    }
+
+    /// Answers the shown question with choice `i`.
+    fn answer(&mut self, i: usize) {
+        let Some(s) = self.shown.take() else { return };
+        let answer = s.note.choices.get(i).cloned().unwrap_or_default();
+        if let Some(tx) = &s.note.reply {
+            let _ = tx.send(answer.clone());
+        }
+        self.update_history(s.note.id, |h| h.outcome = format!("answered: {answer}"));
+        self.dog.pet();
+        self.seen = self.waiting() > 0;
+    }
+
+    /// "Later": the bubble goes away and comes back after [`SNOOZE`], silently.
+    pub fn snooze(&mut self) {
+        let Some(s) = self.shown.take_if(|s| s.note.can_snooze()) else {
+            return;
+        };
+        let mut note = s.note;
+        note.not_before = Some(Instant::now() + SNOOZE);
+        // It comes back as a reminder: barks again and stays until clicked.
+        note.timeout = notify::Timeout::Sticky;
+        note.announced = false;
+        self.update_history(note.id, |h| h.outcome = "later".into());
+        self.queue.push_back(note);
+        self.seen = self.waiting() > 0;
+    }
+
+    /// "Clear all": closes the shown bubble and everything waiting, except questions (an
+    /// agent waits for their answer) and running progress bars. Those stay, without barking.
+    fn clear_all(&mut self) {
+        // Snoozed ones stay too: the user asked for them later.
+        let keep = |n: &Notification| {
+            n.not_before.is_some()
+                || n.is_question()
+                || n.progress
+                    .as_ref()
+                    .is_some_and(|p| p.state == ProgressState::Running)
+        };
+        let mut gone = Vec::new();
+        if let Some(s) = self.shown.take() {
+            if keep(&s.note) {
+                let mut note = s.note;
+                note.announced = true;
+                self.queue.push_front(note);
+            } else {
+                gone.push(s.note.id);
+            }
+        }
+        self.queue.retain(|n| {
+            let k = keep(n);
+            if !k {
+                gone.push(n.id);
+            }
+            k
+        });
+        for n in self.queue.iter_mut() {
+            n.announced = true;
+        }
+        for id in gone {
+            self.update_history(id, |h| h.outcome = "dismissed".into());
         }
     }
 
@@ -192,6 +1055,17 @@ impl Core {
         if !s.mcp_enabled {
             self.mcp_error = None;
         }
+        // Edited in the file by hand (or from another copy of the settings).
+        if s.hidden != self.settings.hidden && s.hidden == self.visible {
+            self.toggle_visible = true;
+        }
+        if s.asleep != self.settings.asleep && s.asleep != self.dog.is_put_to_sleep() {
+            if s.asleep {
+                self.dog.sleep();
+            } else {
+                self.dog.wake_up();
+            }
+        }
         if save {
             self.store.save(&s);
         }
@@ -203,10 +1077,8 @@ impl Core {
         match action {
             Action::Settings(s) => {
                 self.apply_settings(s, true);
-                if let Some(e) = &self.mcp_error {
-                    self.queue.push_back(
-                        Notification::new("MCP server could not start", e.clone()).sticky(),
-                    );
+                if let Some(e) = self.mcp_error.clone() {
+                    self.push(Notification::new("MCP server could not start", e).sticky());
                 }
             }
             Action::Volume { volume, done } => {
@@ -222,20 +1094,18 @@ impl Core {
                     }
                 }
             }
-            Action::TestNotification => self.queue.push_back(Notification::new(
+            Action::TestNotification => self.push(Notification::new(
                 "Test",
                 "This is a test notification. Click the bubble to close it.",
             )),
             Action::ToggleSleep => self.dog.toggle_sleep(),
             Action::ToggleVisible => {
-                self.visible = !self.visible;
-                p.set_dog_visible(self.visible);
+                self.toggle_visible = true;
             }
             Action::ToggleAutostart => {
                 let on = !p.autostart_enabled();
                 if let Err(e) = p.set_autostart(on) {
-                    self.queue
-                        .push_back(Notification::new("Could not change autostart", e));
+                    self.push(Notification::new("Could not change autostart", e));
                 }
             }
             Action::CopyMcpUrl => {
@@ -245,9 +1115,7 @@ impl Core {
                 } else {
                     url
                 };
-                self.queue.push_back(
-                    Notification::new("MCP address", msg).timeout(Duration::from_secs(5)),
-                );
+                self.push(Notification::new("MCP address", msg).timeout(Duration::from_secs(5)));
             }
             Action::OpenConfigDir => {
                 if let Some(path) = self.store.path().map(|p| p.to_path_buf()) {
@@ -264,6 +1132,19 @@ impl Core {
                 p.quit();
             }
             Action::Close => p.close_panel(),
+            Action::CheckUpdate => {
+                if self.update_ready {
+                    self.shutdown();
+                    update::restart();
+                    p.close_panel();
+                    p.quit();
+                } else if let (Some(v), false) = (&self.new_version, update::can_install()) {
+                    p.open_url(&format!("https://github.com/rytsh/dost/releases/tag/v{v}"));
+                } else {
+                    self.last_update_check = None;
+                    self.check_update(true);
+                }
+            }
         }
         self.panel_dirty = true;
     }
@@ -292,12 +1173,45 @@ impl Core {
                 (None, None) => "Off".into(),
             },
             version: env!("CARGO_PKG_VERSION"),
+            update: self.new_version.clone().map(|v| (v, self.update_ready)),
+            history: self.history_items(),
+            quiet: self.settings.is_quiet(local_minute()) || self.fullscreen,
+            missed: self.missed,
         }
     }
 
-    fn publish_status(&self) {
+    fn history_items(&self) -> Vec<panel::HistoryItem> {
+        use chrono::TimeZone;
+        let Ok(s) = self.status.lock() else {
+            return Vec::new();
+        };
+        s.history
+            .iter()
+            .rev()
+            .take(5)
+            .map(|h| panel::HistoryItem {
+                time: chrono::Local
+                    .timestamp_opt(h.at as i64, 0)
+                    .single()
+                    .map(|t| t.format("%H:%M").to_string())
+                    .unwrap_or_default(),
+                source: h.source.clone(),
+                title: if h.title.is_empty() {
+                    h.message.clone()
+                } else {
+                    h.title.clone()
+                },
+                outcome: h.outcome.clone(),
+            })
+            .collect()
+    }
+
+    fn publish_status(&self, p: &dyn Platform) {
         let activity = match self.dog.frame().anim {
+            _ if self.dog.is_put_to_sleep() => "sleeping",
+            _ if self.dog.is_away() => "away (hidden)",
             Anim::Idle => "standing",
+            Anim::Walk if self.dog.is_performing() => "doing zoomies",
             Anim::Walk => "walking",
             Anim::Sit => "sitting",
             Anim::Bark => "barking",
@@ -305,6 +1219,8 @@ impl Core {
             Anim::Sleep => "sleeping",
             Anim::Held => "being carried",
         };
+        let idle = p.idle_secs();
+        let quiet = self.hushed();
         if let Ok(mut s) = self.status.lock() {
             s.activity = activity.into();
             s.visible = self.visible;
@@ -312,9 +1228,34 @@ impl Core {
                 .shown
                 .as_ref()
                 .map(|s| format!("{}: {}", s.note.title, s.note.body));
-            s.queued = self.queue.len();
+            s.queued = self.waiting();
+            s.idle_secs = idle;
+            s.quiet = quiet;
         }
     }
+}
+
+/// The bubble for what is shown. A free function so shells can borrow `shown` while drawing
+/// with `renderer` (another field of [`Core`]).
+pub fn bubble_of(shown: Option<&Shown>, pending: usize) -> Option<Bubble<'_>> {
+    shown.map(|s| Bubble {
+        title: &s.note.title,
+        body: &s.note.body,
+        pending,
+        source: s.note.source.as_deref(),
+        choices: &s.note.choices,
+        progress: s.note.progress.as_ref().map(|p| (p.value, p.state)),
+        link: s.note.url.is_some(),
+        snooze: s.note.can_snooze(),
+        time: s.since.elapsed().as_secs_f32(),
+    })
+}
+
+/// Minutes since local midnight.
+fn local_minute() -> u32 {
+    use chrono::Timelike;
+    let t = chrono::Local::now();
+    t.hour() * 60 + t.minute()
 }
 
 /// Where the dog stands: the base line (taskbar top / Dock top, or the screen's bottom edge)
@@ -338,3 +1279,684 @@ pub fn ground_line(
 
 /// How far from the screen's sides the dog walks (sprite pixels).
 pub const EDGE: f32 = 80.0;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::notify::Progress;
+
+    #[derive(Default)]
+    struct Fake {
+        barks: usize,
+        copied: Vec<String>,
+        opened: Vec<String>,
+        window: Option<bool>,
+        /// Overrides the idle time (default 7 s).
+        idle: Option<u64>,
+        locked: bool,
+        system: Vec<(String, String)>,
+    }
+
+    impl Platform for Fake {
+        fn play_bark(&mut self, _: u8) {
+            self.barks += 1;
+        }
+        fn copy_text(&mut self, text: &str) -> bool {
+            self.copied.push(text.into());
+            true
+        }
+        fn autostart_enabled(&self) -> bool {
+            false
+        }
+        fn set_autostart(&mut self, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn open_folder(&mut self, _: &std::path::Path) {}
+        fn open_url(&mut self, url: &str) {
+            self.opened.push(url.into());
+        }
+        fn idle_secs(&self) -> Option<u64> {
+            Some(self.idle.unwrap_or(7))
+        }
+        fn screen_locked(&self) -> bool {
+            self.locked
+        }
+        fn system_notify(&mut self, title: &str, body: &str) {
+            self.system.push((title.into(), body.into()));
+        }
+        fn set_dog_visible(&mut self, v: bool) {
+            self.window = Some(v);
+        }
+        fn close_panel(&mut self) {}
+        fn quit(&mut self) {}
+        fn autostart_label(&self) -> &'static str {
+            "Open at login"
+        }
+    }
+
+    const B: Bounds = Bounds {
+        ground: 1000.0,
+        left: 100.0,
+        right: 1800.0,
+        scale: 1.0,
+    };
+
+    fn core() -> Core {
+        let mut c = Core::build(
+            Renderer::new(false, Vec::new()),
+            900.0,
+            B.ground,
+            Store::new(None),
+            None,
+        );
+        c.settings.quiet_from = "00:00".into();
+        c.settings.quiet_to = "00:00".into();
+        c.settings.check_updates = false;
+        c
+    }
+
+    fn step(c: &mut Core, p: &mut Fake) {
+        c.tick(p, &B);
+    }
+
+    /// Ages the bubble on screen past [`CLICK_GUARD`].
+    fn settle(c: &mut Core) {
+        if let Some(s) = c.shown.as_mut() {
+            s.since -= CLICK_GUARD;
+        }
+    }
+
+    /// Clicks the middle of a rect from the last frame's hits.
+    fn click_at(c: &mut Core, p: &mut Fake, r: tiny_skia::Rect) {
+        c.click(
+            p,
+            (r.left() + r.right()) / 2.0,
+            (r.top() + r.bottom()) / 2.0,
+        );
+    }
+
+    fn history(c: &Core) -> Vec<(String, String)> {
+        let s = c.status.lock().unwrap();
+        s.history
+            .iter()
+            .map(|h| (h.title.clone(), h.outcome.clone()))
+            .collect()
+    }
+
+    fn progress(id: &str, value: Option<f32>, state: ProgressState) -> Notification {
+        let mut n = Notification::new(id, "").sticky();
+        n.progress = Some(Progress {
+            id: id.into(),
+            value,
+            state,
+        });
+        n
+    }
+
+    #[test]
+    fn question_is_answered_by_its_button_only() {
+        let (mut c, mut p) = (core(), Fake::default());
+        let (n, rx) = Notification::new("", "Deploy?")
+            .ask(vec!["Yes".into(), "No".into()], Duration::from_secs(60));
+        c.notifier.send(n);
+        step(&mut c, &mut p);
+        assert_eq!(p.barks, 1);
+        let b = c.bubble().unwrap();
+        assert_eq!(b.choices, ["Yes", "No"]);
+        // Fake the drawn frame's hit areas.
+        c.hits = Hits {
+            bubble: tiny_skia::Rect::from_xywh(0.0, 0.0, 200.0, 100.0),
+            choices: vec![
+                tiny_skia::Rect::from_xywh(10.0, 60.0, 50.0, 26.0).unwrap(),
+                tiny_skia::Rect::from_xywh(70.0, 60.0, 50.0, 26.0).unwrap(),
+            ],
+            ..Default::default()
+        };
+        // Clicking the text does not close a question.
+        c.click(&mut p, 20.0, 20.0);
+        assert!(c.shown.is_some());
+        let no = c.hits.choices[1];
+        click_at(&mut c, &mut p, no);
+        assert!(c.shown.is_none());
+        assert_eq!(rx.try_recv().unwrap(), "No");
+        assert_eq!(history(&c), [("".into(), "answered: No".into())]);
+    }
+
+    #[test]
+    fn next_after_click_does_not_bark() {
+        let (mut c, mut p) = (core(), Fake::default());
+        c.notifier.send(Notification::new("A", "first"));
+        c.notifier.send(Notification::new("B", "second"));
+        step(&mut c, &mut p);
+        assert_eq!(p.barks, 1);
+        c.hits = Hits {
+            bubble: tiny_skia::Rect::from_xywh(0.0, 0.0, 200.0, 100.0),
+            choices: Vec::new(),
+            ..Default::default()
+        };
+        settle(&mut c);
+        c.click(&mut p, 20.0, 20.0);
+        step(&mut c, &mut p);
+        assert_eq!(c.bubble().unwrap().title, "B");
+        c.click(&mut p, 20.0, 20.0);
+        assert_eq!(
+            c.bubble().unwrap().title,
+            "B",
+            "a double click does not skip it"
+        );
+        assert_eq!(p.barks, 1, "the user is already looking");
+    }
+
+    #[test]
+    fn clear_all_keeps_questions() {
+        let (mut c, mut p) = (core(), Fake::default());
+        c.notifier.send(Notification::new("A", "first"));
+        let (q, _rx) =
+            Notification::new("Q", "Deploy?").ask(vec!["Yes".into()], Duration::from_secs(60));
+        c.notifier.send(q);
+        c.notifier.send(Notification::new("B", "second"));
+        step(&mut c, &mut p);
+        assert_eq!(c.bubble().unwrap().pending, 2);
+        c.hits = Hits {
+            clear: tiny_skia::Rect::from_xywh(0.0, 80.0, 60.0, 20.0),
+            ..Default::default()
+        };
+        c.click(&mut p, 10.0, 90.0);
+        step(&mut c, &mut p);
+        assert_eq!(c.bubble().unwrap().title, "Q");
+        assert!(c.queue.is_empty());
+        assert_eq!(p.barks, 1, "the question is not announced again");
+        let h = history(&c);
+        assert_eq!(h[0], ("A".into(), "dismissed".into()));
+        assert_eq!(h[2], ("B".into(), "dismissed".into()));
+    }
+
+    #[test]
+    fn question_withdrawn_by_key() {
+        let (mut c, mut p) = (core(), Fake::default());
+        let (mut n, rx) =
+            Notification::new("", "Allow edit?").ask(vec!["Allow".into()], Duration::from_secs(60));
+        n.key = Some("per_1".into());
+        c.notifier.send(n);
+        step(&mut c, &mut p);
+        assert!(c.shown.is_some());
+        c.notifier.dismiss("per_1".into());
+        step(&mut c, &mut p);
+        assert!(c.shown.is_none());
+        assert!(rx.try_recv().is_err(), "sender dropped");
+        assert_eq!(history(&c)[0].1, "answered elsewhere");
+    }
+
+    #[test]
+    fn unanswered_question_expires() {
+        let (mut c, mut p) = (core(), Fake::default());
+        let (n, rx) =
+            Notification::new("", "Still there?").ask(vec!["Yes".into()], Duration::from_millis(1));
+        c.notifier.send(n);
+        std::thread::sleep(Duration::from_millis(5));
+        step(&mut c, &mut p);
+        assert!(c.shown.is_none());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(history(&c)[0].1, "expired (no answer)");
+    }
+
+    #[test]
+    fn progress_updates_in_place_and_barks_once() {
+        let (mut c, mut p) = (core(), Fake::default());
+        c.notifier
+            .send(progress("build", Some(0.1), ProgressState::Running));
+        step(&mut c, &mut p);
+        for v in [0.4, 0.8] {
+            c.notifier
+                .send(progress("build", Some(v), ProgressState::Running));
+            step(&mut c, &mut p);
+        }
+        assert_eq!(p.barks, 1);
+        assert!(c.queue.is_empty());
+        let shown = c.shown.as_ref().unwrap();
+        assert_eq!(shown.note.progress.as_ref().unwrap().value, Some(0.8));
+        assert_eq!(shown.deadline, None);
+
+        c.notifier
+            .send(progress("build", None, ProgressState::Done));
+        step(&mut c, &mut p);
+        let shown = c.shown.as_ref().unwrap();
+        assert_eq!(
+            shown.note.progress.as_ref().unwrap().state,
+            ProgressState::Done
+        );
+        assert!(shown.deadline.is_some());
+        assert_eq!(history(&c), [("build".into(), "finished".into())]);
+    }
+
+    #[test]
+    fn running_progress_yields_to_others() {
+        let (mut c, mut p) = (core(), Fake::default());
+        c.notifier
+            .send(progress("tests", Some(0.2), ProgressState::Running));
+        step(&mut c, &mut p);
+        c.notifier.send(Notification::new("Hello", ""));
+        step(&mut c, &mut p);
+        assert_eq!(c.shown.as_ref().unwrap().note.title, "tests");
+        c.shown.as_mut().unwrap().since -= PROGRESS_TURN;
+        step(&mut c, &mut p);
+        assert_eq!(c.shown.as_ref().unwrap().note.title, "Hello");
+        // It comes back after, without barking again.
+        let barks = p.barks;
+        c.shown = None;
+        step(&mut c, &mut p);
+        assert_eq!(c.shown.as_ref().unwrap().note.title, "tests");
+        assert_eq!(p.barks, barks);
+    }
+
+    #[test]
+    fn quiet_mode_skips_plain_notifications() {
+        let (mut c, mut p) = (core(), Fake::default());
+        c.settings.quiet = true;
+        c.notifier.send(Notification::new("FYI", ""));
+        c.notifier.send(Notification::new("Important", "").sticky());
+        step(&mut c, &mut p);
+        assert_eq!(c.shown.as_ref().unwrap().note.title, "Important");
+        assert_eq!(p.barks, 0);
+        assert_eq!(history(&c)[0], ("FYI".into(), "skipped (quiet)".into()));
+    }
+
+    #[test]
+    fn link_copy_and_idle() {
+        let (mut c, mut p) = (core(), Fake::default());
+        let mut n = Notification::new("PR ready", "");
+        n.url = Some("https://example.com".into());
+        n.copy = Some("git pull".into());
+        c.notifier.send(n);
+        step(&mut c, &mut p);
+        assert_eq!(p.copied, ["git pull"]);
+        assert!(c.bubble().unwrap().link);
+        c.hits.bubble = tiny_skia::Rect::from_xywh(0.0, 0.0, 100.0, 50.0);
+        settle(&mut c);
+        c.click(&mut p, 10.0, 10.0);
+        assert_eq!(p.opened, ["https://example.com"]);
+        assert_eq!(c.status.lock().unwrap().idle_secs, Some(7));
+    }
+
+    /// Runs frames until `done` or `secs` pass.
+    fn run(c: &mut Core, p: &mut Fake, secs: f32, done: impl Fn(&Core) -> bool) {
+        for _ in 0..(secs * 60.0) as usize {
+            c.last -= Duration::from_millis(16);
+            step(c, p);
+            if done(c) {
+                return;
+            }
+        }
+    }
+
+    fn hidden(c: &mut Core, p: &mut Fake) {
+        c.on_action(p, Action::ToggleVisible);
+        run(c, p, 30.0, |c| c.dog.is_away());
+        assert!(c.dog.is_away());
+        assert_eq!(p.window, Some(false));
+    }
+
+    #[test]
+    fn hidden_dog_barks_and_counts_missed() {
+        let (mut c, mut p) = (core(), Fake::default());
+        hidden(&mut c, &mut p);
+        let barks = p.barks;
+        let mut n = Notification::new("Done", "Build ok");
+        n.copy = Some("make run".into());
+        c.notifier.send(n);
+        step(&mut c, &mut p);
+        assert!(c.shown.is_none(), "no invisible bubble");
+        assert!(c.dog.is_away(), "the dog stays away for plain news");
+        assert_eq!(p.barks, barks + 1);
+        assert_eq!(p.copied, ["make run"]);
+        assert_eq!(c.missed, 1);
+        assert_eq!(history(&c)[0].1, "missed (hidden)");
+        assert!(c.panel_opened());
+        assert_eq!(c.missed, 0);
+        assert!(!c.panel_opened());
+    }
+
+    #[test]
+    fn hidden_question_shows_a_bubble_alone() {
+        let (mut c, mut p) = (core(), Fake::default());
+        hidden(&mut c, &mut p);
+        let (n, rx) =
+            Notification::new("", "Deploy?").ask(vec!["Yes".into()], Duration::from_secs(60));
+        c.notifier.send(n);
+        step(&mut c, &mut p);
+        assert!(c.shown.is_some(), "shown right away");
+        assert!(c.bubble_alone(), "on its own, without the dog");
+        assert!(c.dog.is_away(), "the dog does not come back");
+        assert_eq!(p.window, Some(false));
+        assert!(!c.visible);
+        c.hits = Hits {
+            bubble: tiny_skia::Rect::from_xywh(0.0, 0.0, 200.0, 100.0),
+            choices: vec![tiny_skia::Rect::from_xywh(10.0, 60.0, 50.0, 26.0).unwrap()],
+            ..Default::default()
+        };
+        c.click(&mut p, 30.0, 70.0);
+        assert_eq!(rx.try_recv().unwrap(), "Yes");
+        assert!(!c.bubble_alone());
+    }
+
+    #[test]
+    fn bubble_waits_while_the_dog_walks_off() {
+        let (mut c, mut p) = (core(), Fake::default());
+        c.on_action(&mut p, Action::ToggleVisible);
+        step(&mut c, &mut p);
+        assert!(!c.dog.is_away(), "still walking off");
+        c.notifier.send(Notification::new("Important", "").sticky());
+        step(&mut c, &mut p);
+        assert!(c.shown.is_none(), "no bubble over a dog that is leaving");
+        run(&mut c, &mut p, 30.0, |c| c.shown.is_some());
+        assert!(c.dog.is_away());
+        assert!(c.bubble_alone());
+    }
+
+    #[test]
+    fn show_brings_the_dog_back() {
+        let (mut c, mut p) = (core(), Fake::default());
+        hidden(&mut c, &mut p);
+        c.on_action(&mut p, Action::ToggleVisible);
+        step(&mut c, &mut p);
+        assert_eq!(p.window, Some(true));
+        assert!(c.visible);
+        run(&mut c, &mut p, 30.0, |c| !c.dog.is_performing());
+        assert!(c.dog.x <= B.right);
+        // Plain notifications show normally again.
+        c.notifier.send(Notification::new("Hi", ""));
+        step(&mut c, &mut p);
+        assert!(c.shown.is_some());
+        assert_eq!(c.missed, 0);
+    }
+
+    #[test]
+    fn reactions() {
+        let (mut c, mut p) = (core(), Fake::default());
+        c.notifier.react(Reaction::Zoomies);
+        step(&mut c, &mut p);
+        assert!(c.dog.is_performing());
+        c.notifier.react(Reaction::Sleep);
+        step(&mut c, &mut p);
+        assert!(c.dog.is_sleeping());
+        c.notifier.react(Reaction::Wake);
+        step(&mut c, &mut p);
+        assert!(!c.dog.is_sleeping());
+    }
+
+    #[test]
+    fn hidden_and_asleep_are_remembered() {
+        let dir = std::env::temp_dir().join(format!("dost-remember-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        let _ = std::fs::remove_file(&path);
+        let make = || {
+            let mut store = Store::new(Some(path.clone()));
+            let s = store.load();
+            let mut c = Core::build(
+                Renderer::new(false, Vec::new()),
+                900.0,
+                B.ground,
+                store,
+                None,
+            );
+            c.restore(&s);
+            c.apply_settings(s, false);
+            c
+        };
+        let (mut c, mut p) = (make(), Fake::default());
+        hidden(&mut c, &mut p);
+        c.on_action(&mut p, Action::ToggleSleep);
+        step(&mut c, &mut p);
+
+        let (mut c, mut p) = (make(), Fake::default());
+        assert!(!c.visible);
+        assert!(c.dog.is_away(), "starts off screen, no walking off");
+        assert!(c.dog.is_put_to_sleep());
+        step(&mut c, &mut p);
+        assert!(!c.on_screen());
+        assert_eq!(p.window, None, "the dog window is never shown");
+
+        c.on_action(&mut p, Action::ToggleVisible);
+        c.on_action(&mut p, Action::ToggleSleep);
+        step(&mut c, &mut p);
+        let c = make();
+        assert!(c.visible && !c.dog.is_away() && !c.dog.is_put_to_sleep());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("dost-history-{}", std::process::id()));
+        let path = dir.join("history.json");
+        let _ = std::fs::remove_file(&path);
+        let (mut c, mut p) = (core(), Fake::default());
+        c.load_history(Some(path.clone()));
+        c.notifier.send(Notification::new("Built", "ok"));
+        c.notifier.send(Notification::new("Waiting", ""));
+        step(&mut c, &mut p);
+        c.shutdown();
+
+        let mut c = core();
+        c.load_history(Some(path.clone()));
+        let h = history(&c);
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[0], ("Built".into(), "closed".into()));
+        assert_eq!(h[1], ("Waiting".into(), "closed".into()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn later_brings_it_back() {
+        let (mut c, mut p) = (core(), Fake::default());
+        c.notifier.send(Notification::new("Deploy", "done"));
+        c.notifier.send(Notification::new("Next", ""));
+        step(&mut c, &mut p);
+        assert!(c.bubble().unwrap().snooze);
+        assert_eq!(c.bubble().unwrap().pending, 1);
+        c.hits = Hits {
+            snooze: tiny_skia::Rect::from_xywh(0.0, 0.0, 50.0, 20.0),
+            ..Default::default()
+        };
+        c.click(&mut p, 10.0, 10.0);
+        step(&mut c, &mut p);
+        assert_eq!(c.bubble().unwrap().title, "Next");
+        assert_eq!(
+            c.bubble().unwrap().pending,
+            0,
+            "snoozed ones are not counted"
+        );
+        c.shown = None;
+        step(&mut c, &mut p);
+        assert!(c.shown.is_none(), "not yet");
+        let barks = p.barks;
+        for n in c.queue.iter_mut() {
+            n.not_before = Some(Instant::now());
+        }
+        step(&mut c, &mut p);
+        assert_eq!(c.bubble().unwrap().title, "Deploy");
+        assert_eq!(p.barks, barks + 1, "barks again as a reminder");
+        assert!(
+            c.shown.as_ref().unwrap().deadline.is_none(),
+            "stays until clicked"
+        );
+
+        // Questions cannot be put off: an agent is waiting.
+        let (n, _rx) =
+            Notification::new("", "Allow?").ask(vec!["Yes".into()], Duration::from_secs(60));
+        assert!(!n.can_snooze());
+    }
+
+    #[test]
+    fn keyboard_answers() {
+        let (mut c, mut p) = (core(), Fake::default());
+        let ask = |c: &mut Core| {
+            let (n, rx) = Notification::new("", "Allow?").ask(
+                vec!["Allow".into(), "Always".into(), "Reject".into()],
+                Duration::from_secs(60),
+            );
+            c.notifier.send(n);
+            rx
+        };
+        assert!(!c.on_key(&mut p, Key::Accept), "nothing shown");
+        let rx = ask(&mut c);
+        step(&mut c, &mut p);
+        assert!(!c.on_key(&mut p, Key::Later), "questions cannot be put off");
+        assert!(c.on_key(&mut p, Key::Accept));
+        assert_eq!(rx.try_recv().unwrap(), "Allow");
+        let rx = ask(&mut c);
+        step(&mut c, &mut p);
+        assert!(!c.on_key(&mut p, Key::Choice(3)));
+        c.on_key(&mut p, Key::Choice(1));
+        assert_eq!(rx.try_recv().unwrap(), "Always");
+        let rx = ask(&mut c);
+        step(&mut c, &mut p);
+        c.on_key(&mut p, Key::Dismiss);
+        assert_eq!(rx.try_recv().unwrap(), "Reject");
+
+        let mut n = Notification::new("PR", "");
+        n.url = Some("https://example.com".into());
+        c.notifier.send(n);
+        step(&mut c, &mut p);
+        c.on_key(&mut p, Key::Accept);
+        assert_eq!(p.opened, ["https://example.com"]);
+        c.notifier.send(Notification::new("FYI", ""));
+        step(&mut c, &mut p);
+        assert!(c.on_key(&mut p, Key::Later));
+        assert!(c.shown.is_none());
+        assert_eq!(c.queue.len(), 1);
+    }
+
+    #[test]
+    fn welcome_back_sums_up() {
+        let (mut c, mut p) = (core(), Fake::default());
+        p.idle = Some(600);
+        step(&mut c, &mut p);
+        c.notifier
+            .send(Notification::new("Build failed", "").source(Some("CI".into())));
+        c.notifier
+            .send(Notification::new("Tests passed", "").source(Some("OpenCode".into())));
+        step(&mut c, &mut p);
+        c.shown = None;
+        step(&mut c, &mut p);
+        c.shown = None;
+        p.idle = Some(1);
+        step(&mut c, &mut p);
+        step(&mut c, &mut p);
+        let s = c.shown.as_ref().expect("summary shown");
+        assert_eq!(s.note.title, "While you were away");
+        assert!(
+            s.note
+                .body
+                .starts_with("2 notifications, 1 failed · CI, OpenCode"),
+            "{}",
+            s.note.body
+        );
+        assert!(s.note.body.contains("Latest: Tests passed; Build failed"));
+
+        // Only once, and not for a single item.
+        c.shown = None;
+        p.idle = Some(600);
+        step(&mut c, &mut p);
+        c.notifier.send(Notification::new("One", ""));
+        step(&mut c, &mut p);
+        c.shown = None;
+        p.idle = Some(1);
+        step(&mut c, &mut p);
+        step(&mut c, &mut p);
+        assert!(c.shown.is_none());
+    }
+
+    #[test]
+    fn locked_screen_news_goes_to_the_system() {
+        let (mut c, mut p) = (core(), Fake::default());
+        let lock_check = |c: &mut Core, p: &mut Fake| {
+            c.last_fullscreen_check -= Duration::from_secs(2);
+            step(c, p);
+        };
+        p.locked = true;
+        lock_check(&mut c, &mut p);
+        c.notifier.send(Notification::new("FYI", "plain"));
+        c.notifier.send(
+            Notification::new("Deploy?", "prod")
+                .source(Some("CI".into()))
+                .sticky(),
+        );
+        step(&mut c, &mut p);
+        assert!(p.system.is_empty(), "not while locked");
+        p.locked = false;
+        lock_check(&mut c, &mut p);
+        assert_eq!(p.system, [("CI: Deploy?".into(), "prod".into())]);
+        lock_check(&mut c, &mut p);
+        assert_eq!(p.system.len(), 1, "once");
+    }
+
+    #[test]
+    fn update_found_asks_to_restart() {
+        let (mut c, mut p) = (core(), Fake::default());
+        c.on_update(update::Found::Newer {
+            version: "9.0.0".into(),
+            url: "https://github.com/rytsh/dost/releases/tag/v9.0.0".into(),
+            ready: true,
+        });
+        step(&mut c, &mut p);
+        assert_eq!(c.bubble().unwrap().title, "Dost 9.0.0 is installed");
+        assert_eq!(c.bubble().unwrap().choices, ["Restart", "Later"]);
+        c.on_key(&mut p, Key::Choice(1));
+        step(&mut c, &mut p);
+        assert!(c.restart_answer.is_none());
+        // The same news is not repeated by the daily check.
+        c.on_update(update::Found::Newer {
+            version: "9.0.0".into(),
+            url: String::new(),
+            ready: true,
+        });
+        step(&mut c, &mut p);
+        assert!(c.shown.is_none());
+
+        // Not installed (auto update off): a link to the release.
+        let (mut c, mut p) = (core(), Fake::default());
+        c.on_update(update::Found::Newer {
+            version: "9.0.0".into(),
+            url: "https://github.com/rytsh/dost/releases/tag/v9.0.0".into(),
+            ready: false,
+        });
+        step(&mut c, &mut p);
+        assert!(c.bubble().unwrap().link);
+    }
+
+    #[test]
+    fn asleep_is_quiet() {
+        let (mut c, mut p) = (core(), Fake::default());
+        c.on_action(&mut p, Action::ToggleSleep);
+        step(&mut c, &mut p);
+        assert!(c.hushed());
+        c.notifier.send(Notification::new("FYI", ""));
+        c.notifier.send(Notification::new("Important", "").sticky());
+        step(&mut c, &mut p);
+        assert_eq!(p.barks, 0, "no barking while asleep");
+        assert_eq!(c.shown.as_ref().unwrap().note.title, "Important");
+        assert!(c.dog.is_sleeping(), "an important bubble does not wake it");
+        assert_eq!(history(&c)[0], ("FYI".into(), "skipped (asleep)".into()));
+        assert!(c.status.lock().unwrap().quiet);
+    }
+
+    #[test]
+    fn asleep_while_hidden() {
+        let (mut c, mut p) = (core(), Fake::default());
+        hidden(&mut c, &mut p);
+        c.on_action(&mut p, Action::ToggleSleep);
+        step(&mut c, &mut p);
+        assert!(c.dog.is_sleeping());
+        assert!(c.dog.is_away(), "sleeping does not bring it back");
+        c.notifier.send(Notification::new("FYI", ""));
+        step(&mut c, &mut p);
+        assert_eq!(p.barks, 0);
+        assert_eq!(c.missed, 0, "skipped while asleep, not counted as missed");
+        let (n, _rx) =
+            Notification::new("", "Allow?").ask(vec!["Yes".into()], Duration::from_secs(60));
+        c.notifier.send(n);
+        step(&mut c, &mut p);
+        assert!(c.bubble_alone(), "questions still pop up next to the icon");
+        assert_eq!(p.barks, 0, "silently");
+    }
+}

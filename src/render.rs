@@ -11,6 +11,7 @@ use tiny_skia::{
 };
 
 use crate::dog::{Anim, DogFrame};
+use crate::notify::ProgressState;
 
 /// Output of `art/pack_atlas.py`: each row is an animation (in `Anim` order), each column a frame.
 const ATLAS_PNG: &[u8] = include_bytes!("../assets/dog.png");
@@ -29,6 +30,10 @@ include!("../assets/dog_atlas.rs");
 /// Logical space reserved for the bubble width.
 pub const WIDTH: f32 = 280.0;
 const BUBBLE_MAX_TEXT: f32 = 220.0;
+/// The bubble on its own (card look): wider text, panel colours.
+const CARD_MAX_TEXT: f32 = 250.0;
+const CARD_SHADOW: f32 = 6.0;
+const CARD_BG: ColorU8 = rgb(0xfb, 0xf7, 0xf1);
 const BUBBLE_PAD: f32 = 10.0;
 const BUBBLE_GAP: f32 = 2.0;
 const BUBBLE_TAIL: f32 = 9.0;
@@ -37,7 +42,24 @@ const HEADROOM: f32 = 26.0;
 
 const OUTLINE: ColorU8 = rgb(0x4a, 0x2e, 0x1b);
 const INK: ColorU8 = rgb(0x2b, 0x2b, 0x33);
-const MUTED: ColorU8 = rgb(0x5d, 0x5d, 0x6b);
+const MUTED: ColorU8 = rgb(0x76, 0x6e, 0x64);
+/// Bubble body text: softer than the title.
+const BODY: ColorU8 = rgb(0x4a, 0x46, 0x50);
+/// Card look (bubble on its own): the settings panel's border.
+const CARD_BORDER: ColorU8 = rgb(0xe8, 0xdf, 0xd2);
+const ACCENT: ColorU8 = rgb(0xe0, 0x8e, 0x2b);
+const ACCENT_INK: ColorU8 = rgb(0x9a, 0x55, 0x12);
+const ACCENT_SOFT: ColorU8 = rgb(0xfc, 0xe9, 0xcf);
+const TRACK: ColorU8 = rgb(0xe9, 0xe2, 0xd8);
+const OK: ColorU8 = rgb(0x4f, 0xa8, 0x6a);
+const FAIL: ColorU8 = rgb(0xc8, 0x4b, 0x3c);
+/// Height of an answer button row / the progress bar row (logical, at text scale 1).
+const CHOICE_H: f32 = 26.0;
+const CHOICE_GAP: f32 = 6.0;
+const PROGRESS_H: f32 = 14.0;
+const LINK_H: f32 = 18.0;
+const CLEAR_ALL: &str = "Clear all";
+const SNOOZE: &str = "Later · 10 min";
 
 const fn rgb(r: u8, g: u8, b: u8) -> ColorU8 {
     ColorU8::from_rgba(r, g, b, 255)
@@ -79,17 +101,36 @@ impl Scale {
 }
 
 /// Text to show in the bubble.
+#[derive(Default)]
 pub struct Bubble<'a> {
     pub title: &'a str,
     pub body: &'a str,
     /// Number of other notifications waiting in the queue.
     pub pending: usize,
+    /// Small label above the title (who sent it).
+    pub source: Option<&'a str>,
+    /// Answer buttons under the text.
+    pub choices: &'a [String],
+    /// Progress bar under the text: (value 0-1 or `None` for indeterminate, state).
+    pub progress: Option<(Option<f32>, ProgressState)>,
+    /// Shows "Click to open" under the text.
+    pub link: bool,
+    /// Shows "Later" (snooze) under the text.
+    pub snooze: bool,
+    /// Seconds since the bubble appeared (animates the indeterminate bar).
+    pub time: f32,
 }
 
 /// Regions of the drawn frame needed for hit testing (physical pixels, relative to the window).
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Hits {
     pub bubble: Option<Rect>,
+    /// Answer buttons, in order.
+    pub choices: Vec<Rect>,
+    /// "Clear all" next to "+N more".
+    pub clear: Option<Rect>,
+    /// "Later": shown again in a while.
+    pub snooze: Option<Rect>,
 }
 
 pub struct Renderer {
@@ -106,7 +147,7 @@ struct Text {
     cache: SwashCache,
     buffer: Buffer,
     /// Content and scale of the last bubble text layout; not laid out again if unchanged.
-    laid_out: Option<(String, String, usize, u32)>,
+    laid_out: Option<(String, String, usize, u32, u32)>,
     /// System UI font family used for all text.
     family: String,
     /// x of the leftmost glyph in the layout. Right-to-left lines are aligned to the right of the box;
@@ -171,8 +212,10 @@ impl Renderer {
         let dog = self.heights[anim.row() as usize] as f32 * px;
         let extra = match bubble {
             Some(b) => {
-                let (_, h) = self.layout_text(b, s.bubble());
-                h + (BUBBLE_PAD * 2.0 + BUBBLE_TAIL + BUBBLE_GAP + 4.0) * s.bubble()
+                let (_, rows) = self.choice_layout(b, s.bubble(), BUBBLE_MAX_TEXT);
+                let (_, h) = self.layout_text(b, s.bubble(), BUBBLE_MAX_TEXT);
+                h + extras_height(b, rows.len()) * s.bubble()
+                    + (BUBBLE_PAD * 2.0 + BUBBLE_TAIL + BUBBLE_GAP + 4.0) * s.bubble()
             }
             None => HEADROOM * s.ui,
         };
@@ -218,14 +261,81 @@ impl Renderer {
         let mut hits = Hits::default();
         if let Some(b) = bubble {
             let top = ground - (self.heights[frame.anim.row() as usize] * s.px) as f32;
-            hits.bubble = self.draw_bubble(pixmap, anchor_x, top, b, s.bubble());
+            let at = BubbleAt::Above {
+                x: anchor_x,
+                y: top,
+            };
+            if let Some(h) = self.draw_bubble(pixmap, at, b, s.bubble(), false) {
+                hits = h;
+            }
         }
         hits
     }
 
-    /// Tray icon: first frame of the sitting dog (straight, non-premultiplied RGBA).
-    pub fn icon_rgba(&self, size: u32) -> Vec<u8> {
-        let (x0, y0, x1, y1) = opaque_box(&self.atlas, Anim::Sit, 0);
+    /// Size of a bubble drawn on its own (no dog), tail on top (physical pixels).
+    pub fn bubble_size(&mut self, b: &Bubble, s: Scale) -> (u32, u32) {
+        let sc = s.bubble();
+        let (w, h) = self.bubble_box(b, sc, CARD_MAX_TEXT);
+        let shadow = CARD_SHADOW * sc;
+        (
+            (w + 2.0 * shadow).ceil() as u32,
+            (h + BUBBLE_TAIL * sc + 2.0 * shadow).ceil() as u32,
+        )
+    }
+
+    /// Empty room (for the shadow) between the edge of a bubble-on-its-own window and the tip
+    /// of its tail (physical pixels).
+    pub fn alone_inset(&self, s: Scale) -> f32 {
+        (CARD_SHADOW * s.bubble()).round()
+    }
+
+    /// Draws a bubble on its own with its tail pointing at `tail_x` (physical, window-relative):
+    /// up from the top edge (a menu bar above, macOS) or, with `tail_down`, down from the
+    /// bottom edge (a taskbar below, Windows). The window is sized by [`Renderer::bubble_size`].
+    pub fn draw_bubble_alone(
+        &mut self,
+        pixmap: &mut Pixmap,
+        tail_x: f32,
+        tail_down: bool,
+        b: &Bubble,
+        s: Scale,
+    ) -> Hits {
+        pixmap.fill(Color::TRANSPARENT);
+        let sc = s.bubble();
+        let shadow = CARD_SHADOW * sc;
+        let at = if tail_down {
+            BubbleAt::Above {
+                x: tail_x,
+                y: pixmap.height() as f32 - shadow + BUBBLE_GAP * sc,
+            }
+        } else {
+            BubbleAt::Below {
+                x: tail_x,
+                y: shadow + BUBBLE_TAIL * sc,
+                left: shadow,
+            }
+        };
+        self.draw_bubble(pixmap, at, b, sc, true)
+            .unwrap_or_default()
+    }
+
+    /// Tray icon: the sitting or the sleeping dog, straight RGBA; `unread` adds a red dash.
+    pub fn icon_rgba(&self, size: u32, sleeping: bool, unread: bool) -> Vec<u8> {
+        self.icon_pixmap(size, sleeping, unread)
+            .pixels()
+            .iter()
+            .flat_map(|p| {
+                let c = p.demultiply();
+                [c.red(), c.green(), c.blue(), c.alpha()]
+            })
+            .collect()
+    }
+
+    /// Tray icon as a premultiplied pixmap: the sitting or the sleeping dog, with a thin red
+    /// dash in the top-right corner when something was missed.
+    pub fn icon_pixmap(&self, size: u32, sleeping: bool, unread: bool) -> Pixmap {
+        let anim = if sleeping { Anim::Sleep } else { Anim::Sit };
+        let (x0, y0, x1, y1) = opaque_box(&self.atlas, anim, 0);
         let (w, h) = ((x1 - x0) as f32, (y1 - y0) as f32);
         let k = size as f32 / w.max(h);
         let mut pm = Pixmap::new(size, size).expect("icon size");
@@ -237,13 +347,42 @@ impl Renderer {
             ..Default::default()
         };
         pm.draw_pixmap(0, 0, self.atlas.as_ref(), &paint, t, None);
-        pm.pixels()
-            .iter()
-            .flat_map(|p| {
-                let c = p.demultiply();
-                [c.red(), c.green(), c.blue(), c.alpha()]
-            })
-            .collect()
+        if unread {
+            // A thin red dash in the top-right corner, with a light edge for dark menu bars.
+            let s = size as f32;
+            let (w, h) = (s * 0.34, (s * 0.09).max(2.0));
+            let (x, y) = (s - w - s * 0.03, s * 0.05);
+            let edge = (s * 0.035).max(1.0);
+            for (r, c) in [
+                (
+                    Rect::from_xywh(x - edge, y - edge, w + 2.0 * edge, h + 2.0 * edge),
+                    Color::WHITE,
+                ),
+                (Rect::from_xywh(x, y, w, h), color(FAIL)),
+            ] {
+                let Some(r) = r else { continue };
+                let rad = r.height() / 2.0;
+                let mut pb = PathBuilder::new();
+                pb.move_to(r.left() + rad, r.top());
+                pb.line_to(r.right() - rad, r.top());
+                pb.quad_to(r.right(), r.top(), r.right(), r.top() + rad);
+                pb.quad_to(r.right(), r.bottom(), r.right() - rad, r.bottom());
+                pb.line_to(r.left() + rad, r.bottom());
+                pb.quad_to(r.left(), r.bottom(), r.left(), r.top() + rad);
+                pb.quad_to(r.left(), r.top(), r.left() + rad, r.top());
+                pb.close();
+                if let Some(p) = pb.finish() {
+                    pm.fill_path(
+                        &p,
+                        &self::paint(c),
+                        FillRule::Winding,
+                        Transform::identity(),
+                        None,
+                    );
+                }
+            }
+        }
+        pm
     }
 
     fn draw_zzz(&mut self, pm: &mut Pixmap, ax: f32, ground: f32, frame: &DogFrame, s: Scale) {
@@ -271,35 +410,44 @@ impl Renderer {
     }
 
     /// Lays out the bubble text and returns (width, height) (physical pixels).
-    fn layout_text(&mut self, b: &Bubble, scale: f32) -> (f32, f32) {
+    fn layout_text(&mut self, b: &Bubble, scale: f32, max: f32) -> (f32, f32) {
         let Some(text) = &mut self.text else {
             return (40.0 * scale, 14.0 * scale);
         };
         let key = (
-            b.title.to_string(),
+            format!("{}\u{1}{}", b.source.unwrap_or(""), b.title),
             b.body.to_string(),
             b.pending,
             scale.to_bits(),
+            max.to_bits(),
         );
         if text.laid_out.as_ref() != Some(&key) {
             let base = Attrs::new()
                 .family(Family::Name(&text.family))
                 .color(cc(INK));
+            let source = base
+                .clone()
+                .color(cc(ACCENT_INK))
+                .weight(Weight::SEMIBOLD)
+                .metrics(Metrics::new(11.0 * scale, 16.0 * scale));
             let title = base
                 .clone()
-                .weight(Weight::BOLD)
-                .metrics(Metrics::new(15.0 * scale, 20.0 * scale));
+                .weight(Weight::SEMIBOLD)
+                .metrics(Metrics::new(13.5 * scale, 18.0 * scale));
             let body = base
                 .clone()
-                .metrics(Metrics::new(14.0 * scale, 19.0 * scale));
+                .color(cc(BODY))
+                .metrics(Metrics::new(13.0 * scale, 18.0 * scale));
             let more = base
                 .clone()
                 .color(cc(MUTED))
-                .metrics(Metrics::new(12.0 * scale, 17.0 * scale));
+                .metrics(Metrics::new(11.5 * scale, 17.0 * scale));
             let body_text: String = b.body.chars().take(400).collect();
             let more_text = format!("+{} more", b.pending);
+            let source_text = b.source.unwrap_or_default().to_string();
             let mut spans: Vec<(&str, Attrs)> = Vec::new();
             for (t, a) in [
+                (source_text.as_str(), source),
                 (b.title, title),
                 (body_text.as_str(), body),
                 (more_text.as_str(), more),
@@ -316,7 +464,7 @@ impl Renderer {
             text.buffer
                 .set_metrics(Metrics::new(14.0 * scale, 19.0 * scale));
             text.buffer.set_wrap(Wrap::WordOrGlyph);
-            text.buffer.set_size(Some(BUBBLE_MAX_TEXT * scale), None);
+            text.buffer.set_size(Some(max * scale), None);
             text.buffer
                 .set_rich_text(spans, &base, Shaping::Advanced, None);
             text.buffer.shape_until_scroll(&mut text.fonts, false);
@@ -334,34 +482,84 @@ impl Renderer {
         ((x1 - text.left).ceil().max(30.0 * scale), h.ceil())
     }
 
+    /// Outer size of the bubble body (without tail), physical pixels.
+    fn bubble_box(&mut self, b: &Bubble, scale: f32, max: f32) -> (f32, f32) {
+        let (_, rows) = self.choice_layout(b, scale, max);
+        let (mut tw, th) = self.layout_text(b, scale, max);
+        if let Some(widest) = rows.iter().map(|r| r.1).reduce(f32::max) {
+            tw = tw.max(widest);
+        }
+        if b.progress.is_some() || b.link {
+            tw = tw.max(160.0 * scale);
+        }
+        if b.pending > 0 || b.snooze {
+            tw = tw.max(if b.snooze { 190.0 } else { 90.0 } * scale);
+        }
+        let pad = BUBBLE_PAD * scale;
+        (
+            tw + pad * 2.0,
+            th + extras_height(b, rows.len()) * scale + pad * 2.0,
+        )
+    }
+
     fn draw_bubble(
         &mut self,
         pm: &mut Pixmap,
-        ax: f32,
-        dog_top: f32,
+        at: BubbleAt,
         b: &Bubble,
         scale: f32,
-    ) -> Option<Rect> {
-        let (tw, th) = self.layout_text(b, scale);
+        card: bool,
+    ) -> Option<Hits> {
+        let max = if card { CARD_MAX_TEXT } else { BUBBLE_MAX_TEXT };
+        let (widths, rows) = self.choice_layout(b, scale, max);
+        let label = |c: ColorU8| TextStyle {
+            size: 13.0 * scale,
+            bold: true,
+            color: c,
+        };
+        let (w, h) = self.bubble_box(b, scale, max);
+        let (_, th) = self.layout_text(b, scale, max);
         let pad = BUBBLE_PAD * scale;
-        let w = tw + pad * 2.0;
-        let h = th + pad * 2.0;
-        let bottom = dog_top - (BUBBLE_GAP + BUBBLE_TAIL) * scale;
-        let top = bottom - h;
+        let tw = w - pad * 2.0;
         let margin = 2.0 * scale;
-        let left = (ax - w / 2.0).clamp(margin, (pm.width() as f32 - w - margin).max(margin));
+        let (ax, left, top, tail_up) = match at {
+            BubbleAt::Above { x, y } => {
+                let bottom = y - (BUBBLE_GAP + BUBBLE_TAIL) * scale;
+                let left =
+                    (x - w / 2.0).clamp(margin, (pm.width() as f32 - w - margin).max(margin));
+                (x, left, bottom - h, false)
+            }
+            BubbleAt::Below { x, y, left } => (x, left, y, true),
+        };
         let rect = Rect::from_xywh(left, top, w, h)?;
 
         let tail_x = ax.clamp(left + 14.0 * scale, left + w - 14.0 * scale);
-        let path = bubble_path(rect, 9.0 * scale, tail_x, BUBBLE_TAIL * scale, 7.0 * scale)?;
+        let path = bubble_path(
+            rect,
+            if card { 12.0 } else { 9.0 } * scale,
+            tail_x,
+            BUBBLE_TAIL * scale,
+            7.0 * scale,
+            tail_up,
+        )?;
 
-        let shadow_t = Transform::from_translate(0.0, 2.0 * scale);
-        let mut shade = Color::BLACK;
-        shade.set_alpha(0.18);
-        pm.fill_path(&path, &paint(shade), FillRule::Winding, shadow_t, None);
+        if card {
+            // Soft, layered shadow like a native popover.
+            for (dy, a) in [(1.0, 0.05), (2.0, 0.05), (4.0, 0.04)] {
+                let mut shade = Color::BLACK;
+                shade.set_alpha(a);
+                let t = Transform::from_translate(0.0, dy * scale);
+                pm.fill_path(&path, &paint(shade), FillRule::Winding, t, None);
+            }
+        } else {
+            let shadow_t = Transform::from_translate(0.0, 2.0 * scale);
+            let mut shade = Color::BLACK;
+            shade.set_alpha(0.18);
+            pm.fill_path(&path, &paint(shade), FillRule::Winding, shadow_t, None);
+        }
         pm.fill_path(
             &path,
-            &paint(Color::WHITE),
+            &paint(if card { color(CARD_BG) } else { Color::WHITE }),
             FillRule::Winding,
             Transform::identity(),
             None,
@@ -372,7 +570,7 @@ impl Renderer {
         };
         pm.stroke_path(
             &path,
-            &paint(color(OUTLINE)),
+            &paint(color(if card { CARD_BORDER } else { OUTLINE })),
             &stroke,
             Transform::identity(),
             None,
@@ -383,8 +581,207 @@ impl Renderer {
             text.draw(pm, x, top + pad, cc(INK));
         }
 
-        let full = Rect::from_ltrb(left, top, left + w, bottom + BUBBLE_TAIL * scale)?;
-        Some(full)
+        let x = left + pad;
+        let mut y = top + pad + th;
+        if let Some((value, state)) = b.progress {
+            y += 6.0 * scale;
+            let bar_h = 6.0 * scale;
+            let track = Rect::from_xywh(x, y + 2.0 * scale, tw, bar_h)?;
+            fill_rrect(pm, track, bar_h / 2.0, TRACK);
+            let fill_c = match state {
+                ProgressState::Running => ACCENT,
+                ProgressState::Done => OK,
+                ProgressState::Failed => FAIL,
+            };
+            let (from, to) = match (state, value) {
+                (ProgressState::Running, None) => {
+                    // Indeterminate: a third of the bar sweeping across.
+                    let p = (b.time * 0.7).fract();
+                    let s = -0.33 + p * 1.33;
+                    (s.max(0.0), (s + 0.33).min(1.0))
+                }
+                (ProgressState::Running, Some(v)) => (0.0, v.clamp(0.0, 1.0)),
+                _ => (0.0, 1.0),
+            };
+            if to > from
+                && let Some(r) = Rect::from_xywh(
+                    x + tw * from,
+                    track.top(),
+                    (tw * (to - from)).max(bar_h),
+                    bar_h,
+                )
+            {
+                fill_rrect(pm, r, bar_h / 2.0, fill_c);
+            }
+            y += (PROGRESS_H - 6.0 + 6.0) * scale;
+        }
+        if b.link {
+            y += 4.0 * scale;
+            let st = TextStyle {
+                size: 12.0 * scale,
+                bold: false,
+                color: ACCENT_INK,
+            };
+            self.draw_text(pm, x, y, "Click to open ↗", st);
+            y += (LINK_H - 4.0) * scale;
+        }
+        let (mut clear, mut snooze) = (None, None);
+        if b.pending > 0 || b.snooze {
+            y += 4.0 * scale;
+            let st = TextStyle {
+                size: 12.0 * scale,
+                bold: true,
+                color: ACCENT_INK,
+            };
+            // A little slack around the text so it is easy to hit.
+            let slack = 4.0 * scale;
+            let mut lx = x;
+            if b.pending > 0 {
+                let (lw, lh) = self.measure(CLEAR_ALL, st);
+                self.draw_text(pm, lx, y, CLEAR_ALL, st);
+                clear = Rect::from_xywh(lx - slack, y - slack, lw + 2.0 * slack, lh + 2.0 * slack);
+                lx += lw + 16.0 * scale;
+            }
+            if b.snooze {
+                let st = TextStyle { color: MUTED, ..st };
+                let (lw, lh) = self.measure(SNOOZE, st);
+                self.draw_text(pm, lx, y, SNOOZE, st);
+                snooze = Rect::from_xywh(lx - slack, y - slack, lw + 2.0 * slack, lh + 2.0 * slack);
+            }
+            y += (LINK_H - 4.0) * scale;
+        }
+        let mut buttons = Vec::new();
+        if !rows.is_empty() {
+            y += CHOICE_GAP * scale;
+            let mut i = 0;
+            for (count, _) in &rows {
+                let mut bx = x;
+                for _ in 0..*count {
+                    let r = Rect::from_xywh(bx, y, widths[i], CHOICE_H * scale)?;
+                    let first = i == 0;
+                    fill_rrect(pm, r, 8.0 * scale, if first { ACCENT } else { ACCENT_SOFT });
+                    let st = label(if first {
+                        rgb(0xff, 0xff, 0xff)
+                    } else {
+                        ACCENT_INK
+                    });
+                    let (lw, lh) = self.measure(&b.choices[i], st);
+                    self.draw_text(
+                        pm,
+                        (r.left() + (r.width() - lw) / 2.0).round(),
+                        (r.top() + (r.height() - lh) / 2.0).round(),
+                        &b.choices[i],
+                        st,
+                    );
+                    buttons.push(r);
+                    bx += widths[i] + CHOICE_GAP * scale;
+                    i += 1;
+                }
+                y += (CHOICE_H + CHOICE_GAP) * scale;
+            }
+        }
+        // The single-line text calls above replaced the bubble layout.
+        if let Some(t) = self.text.as_mut() {
+            t.laid_out = None;
+        }
+
+        let full = if tail_up {
+            Rect::from_ltrb(left, top - BUBBLE_TAIL * scale, left + w, top + h)?
+        } else {
+            Rect::from_ltrb(left, top, left + w, top + h + BUBBLE_TAIL * scale)?
+        };
+        Some(Hits {
+            bubble: Some(full),
+            choices: buttons,
+            clear,
+            snooze,
+        })
+    }
+
+    /// Answer button widths and how they wrap into rows (physical pixels).
+    fn choice_layout(&mut self, b: &Bubble, scale: f32, max: f32) -> (Vec<f32>, Vec<(usize, f32)>) {
+        let st = TextStyle {
+            size: 13.0 * scale,
+            bold: true,
+            color: INK,
+        };
+        let widths: Vec<f32> = b
+            .choices
+            .iter()
+            .map(|c| self.measure(c, st).0 + 22.0 * scale)
+            .collect();
+        if let Some(t) = self.text.as_mut() {
+            t.laid_out = None;
+        }
+        let rows = choice_rows(&widths, max * scale, CHOICE_GAP * scale);
+        (widths, rows)
+    }
+}
+
+/// Where a bubble goes: above the dog (tail down to `x`), or on its own hanging below
+/// the tray icon (tail up to `x`, body's top-left at `left`, `y`).
+#[derive(Clone, Copy)]
+enum BubbleAt {
+    Above { x: f32, y: f32 },
+    Below { x: f32, y: f32, left: f32 },
+}
+
+/// Splits answer buttons into rows that fit `max` wide: (buttons in the row, row width).
+fn choice_rows(widths: &[f32], max: f32, gap: f32) -> Vec<(usize, f32)> {
+    let mut rows: Vec<(usize, f32)> = Vec::new();
+    for &w in widths {
+        match rows.last_mut() {
+            Some((n, rw)) if *rw + gap + w <= max => {
+                *n += 1;
+                *rw += gap + w;
+            }
+            _ => rows.push((1, w)),
+        }
+    }
+    rows
+}
+
+/// Logical height of what is drawn under the bubble text, at text scale 1.
+fn extras_height(b: &Bubble, choice_rows: usize) -> f32 {
+    let mut h = 0.0;
+    if b.progress.is_some() {
+        h += PROGRESS_H + 6.0;
+    }
+    if b.link {
+        h += LINK_H;
+    }
+    if b.pending > 0 || b.snooze {
+        h += LINK_H;
+    }
+    if choice_rows > 0 {
+        h += CHOICE_GAP + choice_rows as f32 * (CHOICE_H + CHOICE_GAP);
+    }
+    h
+}
+
+fn fill_rrect(pm: &mut Pixmap, r: Rect, rad: f32, c: ColorU8) {
+    let rad = rad.min(r.width() / 2.0).min(r.height() / 2.0);
+    let (l, t, rt, b) = (r.left(), r.top(), r.right(), r.bottom());
+    let k = 0.5523 * rad;
+    let mut pb = PathBuilder::new();
+    pb.move_to(l + rad, t);
+    pb.line_to(rt - rad, t);
+    pb.cubic_to(rt - rad + k, t, rt, t + rad - k, rt, t + rad);
+    pb.line_to(rt, b - rad);
+    pb.cubic_to(rt, b - rad + k, rt - rad + k, b, rt - rad, b);
+    pb.line_to(l + rad, b);
+    pb.cubic_to(l + rad - k, b, l, b - rad + k, l, b - rad);
+    pb.line_to(l, t + rad);
+    pb.cubic_to(l, t + rad - k, l + rad - k, t, l + rad, t);
+    pb.close();
+    if let Some(p) = pb.finish() {
+        pm.fill_path(
+            &p,
+            &paint(color(c)),
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
     }
 }
 
@@ -573,18 +970,26 @@ fn bubble_path(
     tail_x: f32,
     tail_h: f32,
     tail_w: f32,
+    tail_up: bool,
 ) -> Option<tiny_skia::Path> {
     let (l, t, rt, b) = (r.left(), r.top(), r.right(), r.bottom());
     let k = 0.5523 * rad;
     let mut pb = PathBuilder::new();
     pb.move_to(l + rad, t);
+    if tail_up {
+        pb.line_to(tail_x - tail_w, t);
+        pb.line_to(tail_x, t - tail_h);
+        pb.line_to(tail_x + tail_w, t);
+    }
     pb.line_to(rt - rad, t);
     pb.cubic_to(rt - rad + k, t, rt, t + rad - k, rt, t + rad);
     pb.line_to(rt, b - rad);
     pb.cubic_to(rt, b - rad + k, rt - rad + k, b, rt - rad, b);
-    pb.line_to(tail_x + tail_w, b);
-    pb.line_to(tail_x, b + tail_h);
-    pb.line_to(tail_x - tail_w, b);
+    if !tail_up {
+        pb.line_to(tail_x + tail_w, b);
+        pb.line_to(tail_x, b + tail_h);
+        pb.line_to(tail_x - tail_w, b);
+    }
     pb.line_to(l + rad, b);
     pb.cubic_to(l + rad - k, b, l, b - rad + k, l, b - rad);
     pb.line_to(l, t + rad);

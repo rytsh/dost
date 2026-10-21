@@ -118,6 +118,26 @@ enum Activity {
     Falling,
 }
 
+/// Walking off screen (Hide) and back in (Show), past the right edge.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Visit {
+    None,
+    /// Walking in from the right edge to `target`.
+    Entering {
+        target: f32,
+    },
+    /// Walking off past the right edge.
+    Leaving {
+        target: f32,
+    },
+}
+
+/// How far past the walkable area the dog goes off screen (sprite pixels).
+const OFFSTAGE: f32 = 200.0;
+/// Where the dog stops after walking back in, left of the walkable area's right end
+/// (sprite pixels).
+const VISIT_SPOT: f32 = 240.0;
+
 pub struct Dog {
     pub x: f32,
     pub y: f32,
@@ -136,6 +156,13 @@ pub struct Dog {
     time: f32,
     vy: f32,
     forced_sleep: bool,
+    /// Runs left in the current zoomies.
+    zoomies: u8,
+    visit: Visit,
+    /// Off screen past the right edge (hidden); nothing happens until it comes back.
+    away: bool,
+    /// Set when a walk off screen finishes; read once by [`Dog::take_left`].
+    just_left: bool,
     rng: fastrand::Rng,
 }
 
@@ -155,11 +182,18 @@ impl Dog {
             time: 0.0,
             vy: 0.0,
             forced_sleep: false,
+            zoomies: 0,
+            visit: Visit::None,
+            away: false,
+            just_left: false,
             rng: fastrand::Rng::new(),
         }
     }
 
     pub fn update(&mut self, dt: f32, b: &Bounds) {
+        if self.away {
+            return;
+        }
         self.time += dt;
         self.anim_time += dt;
 
@@ -176,11 +210,29 @@ impl Dog {
                 }
             }
             Activity::Walk { origin, target } => {
-                self.walk_dist += WALK_SPEED * self.speed * dt;
+                let boost = if self.zoomies > 0 {
+                    3.5
+                } else if matches!(self.visit, Visit::Entering { .. } | Visit::Leaving { .. }) {
+                    1.8
+                } else {
+                    1.0
+                };
+                self.walk_dist += WALK_SPEED * self.speed * boost * dt;
                 let travelled = self.steps() as f32 * WALK_STRIDE * b.scale;
                 let total = (target - origin).abs();
                 self.x = origin + self.facing * travelled.min(total);
                 if travelled >= total {
+                    match self.visit {
+                        Visit::Entering { .. } => self.visit = Visit::None,
+                        Visit::Leaving { .. } => {
+                            self.visit = Visit::None;
+                            self.away = true;
+                            self.just_left = true;
+                            self.set(Activity::Stand, 1.0);
+                            return;
+                        }
+                        _ => {}
+                    }
                     self.next(b);
                 }
             }
@@ -200,15 +252,74 @@ impl Dog {
                 return;
             }
             self.y = b.ground;
-            let x = self.x.clamp(b.left, b.right.max(b.left));
-            if x != self.x {
-                // The screen changed (resolution, taskbar): stop walking.
-                self.x = x.round();
-                if matches!(self.activity, Activity::Walk { .. }) {
-                    self.set(Activity::Stand, 1.0);
+            // Walking in or out passes the screen edge on purpose.
+            if !matches!(self.visit, Visit::Entering { .. } | Visit::Leaving { .. }) {
+                let x = self.x.clamp(b.left, b.right.max(b.left));
+                if x != self.x {
+                    // The screen changed (resolution, taskbar): stop walking.
+                    self.x = x.round();
+                    if matches!(self.activity, Activity::Walk { .. }) {
+                        self.set(Activity::Stand, 1.0);
+                    }
                 }
             }
         }
+    }
+
+    /// Comes back on screen: walks in from the right edge if away, or turns back if leaving.
+    pub fn enter(&mut self, b: &Bounds) {
+        if matches!(self.activity, Activity::Held | Activity::Falling) {
+            return;
+        }
+        match self.visit {
+            Visit::None if !self.away => return,
+            Visit::Entering { .. } => return,
+            _ => {}
+        }
+        if self.away {
+            self.away = false;
+            self.x = (b.right + OFFSTAGE * b.scale).round();
+            self.y = b.ground;
+        }
+        let target = (b.right - VISIT_SPOT * b.scale).max(b.left).round();
+        self.visit = Visit::Entering { target };
+        let origin = self.x.round();
+        self.set(Activity::Walk { origin, target }, 0.0);
+    }
+
+    /// Walks off past the right edge; [`Dog::take_left`] reports when it is gone.
+    pub fn leave(&mut self, b: &Bounds) {
+        if self.away || matches!(self.visit, Visit::Leaving { .. }) {
+            return;
+        }
+        self.zoomies = 0;
+        let target = (b.right + OFFSTAGE * b.scale).round();
+        self.visit = Visit::Leaving { target };
+        if !matches!(self.activity, Activity::Held | Activity::Falling) {
+            let origin = self.x.round();
+            self.set(Activity::Walk { origin, target }, 0.0);
+        }
+    }
+
+    /// True once after the dog has walked off screen.
+    pub fn take_left(&mut self) -> bool {
+        std::mem::take(&mut self.just_left)
+    }
+
+    /// Off screen (hidden and not visiting).
+    /// Starts off screen, as if it had walked off (hidden at startup).
+    pub fn start_away(&mut self) {
+        self.away = true;
+        self.visit = Visit::None;
+        self.zoomies = 0;
+    }
+
+    pub fn is_away(&self) -> bool {
+        self.away
+    }
+
+    pub fn is_leaving(&self) -> bool {
+        matches!(self.visit, Visit::Leaving { .. })
     }
 
     pub fn frame(&self) -> DogFrame {
@@ -234,13 +345,40 @@ impl Dog {
         }
     }
 
-    /// A new notification arrived: wake up, sit, bark.
+    /// A new notification arrived: sit up and bark. Sleeping (put to sleep) it only lifts its
+    /// head; it stays asleep.
     pub fn notify(&mut self) {
+        if self.is_busy() || self.forced_sleep {
+            return;
+        }
+        self.set(Activity::Alert, 2.4);
+    }
+
+    /// Runs back and forth fast a few times, then carries on.
+    pub fn zoomies(&mut self, b: &Bounds) {
         if self.is_busy() {
             return;
         }
         self.forced_sleep = false;
-        self.set(Activity::Alert, 2.4);
+        self.zoomies = 4;
+        self.zoom(b);
+    }
+
+    fn zoom(&mut self, b: &Bounds) {
+        let reach = 220.0 * b.scale;
+        let dir = if self.zoomies.is_multiple_of(2) {
+            1.0
+        } else {
+            -1.0
+        };
+        let target = (self.x + dir * reach).clamp(b.left, b.right).round();
+        let target = if (target - self.x).abs() < MIN_WALK * b.scale {
+            (self.x - dir * reach).clamp(b.left, b.right).round()
+        } else {
+            target
+        };
+        let origin = self.x.round();
+        self.set(Activity::Walk { origin, target }, 0.0);
     }
 
     /// The dog was clicked.
@@ -253,6 +391,7 @@ impl Dog {
     }
 
     pub fn grab(&mut self) {
+        self.zoomies = 0;
         self.set(Activity::Held, 0.0);
     }
 
@@ -278,21 +417,47 @@ impl Dog {
         self.forced_sleep || self.activity == Activity::Sleep
     }
 
+    /// Put to sleep (Sleep button, `react: sleep`), not just napping: notifications stay quiet.
+    pub fn is_put_to_sleep(&self) -> bool {
+        self.forced_sleep
+    }
+
     pub fn toggle_sleep(&mut self) {
-        if self.is_busy() {
-            return;
-        }
         if self.is_sleeping() {
-            self.forced_sleep = false;
-            self.set(Activity::Stand, 1.5);
+            self.wake_up();
         } else {
-            self.forced_sleep = true;
+            self.sleep();
+        }
+    }
+
+    /// Lies down to sleep until [`Dog::wake_up`]. While away (hidden) only the state is kept;
+    /// the dog falls asleep when it comes back.
+    pub fn sleep(&mut self) {
+        self.forced_sleep = true;
+        if !self.is_busy() {
             self.set(Activity::Sleep, f32::INFINITY);
+        }
+    }
+
+    /// Ends [`Dog::sleep`].
+    pub fn wake_up(&mut self) {
+        let was = self.is_sleeping();
+        self.forced_sleep = false;
+        if was && !self.is_busy() {
+            self.set(Activity::Stand, 1.5);
         }
     }
 
     fn is_busy(&self) -> bool {
         matches!(self.activity, Activity::Held | Activity::Falling)
+            || matches!(self.visit, Visit::Entering { .. } | Visit::Leaving { .. })
+            || self.away
+    }
+
+    /// True while the dog does something it was asked to (zoomies, walking in or out), so a
+    /// notification or a held bubble does not cut it short.
+    pub fn is_performing(&self) -> bool {
+        self.zoomies > 0 || matches!(self.visit, Visit::Entering { .. } | Visit::Leaving { .. })
     }
 
     fn steps(&self) -> usize {
@@ -316,6 +481,22 @@ impl Dog {
     }
 
     fn next(&mut self, b: &Bounds) {
+        if self.zoomies > 0 {
+            self.zoomies -= 1;
+            if self.zoomies > 0 {
+                return self.zoom(b);
+            }
+            return self.set(Activity::Happy, 1.5);
+        }
+        if let Visit::Leaving { target } = self.visit {
+            // Resume walking off (e.g. after being dropped).
+            let origin = self.x.round();
+            return self.set(Activity::Walk { origin, target }, 0.0);
+        }
+        if let Visit::Entering { .. } = self.visit {
+            // Dropped while walking in: it is on screen now, close enough.
+            self.visit = Visit::None;
+        }
         if self.forced_sleep {
             return self.set(Activity::Sleep, f32::INFINITY);
         }
@@ -405,6 +586,63 @@ mod tests {
     }
 
     #[test]
+    fn zoomies_run_then_end_happy() {
+        let mut dog = Dog::new(500.0, B.ground);
+        dog.zoomies(&B);
+        assert!(dog.is_performing());
+        assert_eq!(dog.frame().anim, Anim::Walk);
+        let mut moved = 0.0f32;
+        for _ in 0..(60 * 20) {
+            let x = dog.x;
+            dog.update(1.0 / 60.0, &B);
+            moved += (dog.x - x).abs();
+            if !dog.is_performing() {
+                break;
+            }
+        }
+        assert!(!dog.is_performing());
+        assert!(moved > 400.0 * B.scale, "{moved}");
+        assert_eq!(dog.frame().anim, Anim::Happy);
+    }
+
+    #[test]
+    fn walks_off_and_back_in_from_the_right() {
+        let mut dog = Dog::new(500.0, B.ground);
+        let run = |dog: &mut Dog, secs: usize| {
+            for _ in 0..(60 * secs) {
+                dog.update(1.0 / 60.0, &B);
+            }
+        };
+        dog.leave(&B);
+        assert!(dog.is_performing());
+        // Notifications and petting do not interrupt the walk.
+        dog.notify();
+        dog.pet();
+        assert_eq!(dog.frame().anim, Anim::Walk);
+        run(&mut dog, 30);
+        assert!(dog.is_away());
+        assert!(dog.x > B.right);
+        assert!(dog.take_left());
+        assert!(!dog.take_left());
+
+        // Show: in from the right edge.
+        dog.enter(&B);
+        assert!(!dog.is_away());
+        assert!(dog.x > B.right);
+        run(&mut dog, 30);
+        assert!(!dog.is_performing());
+        assert!(dog.x <= B.right);
+
+        // Leaving and coming back turns around mid-way.
+        dog.leave(&B);
+        run(&mut dog, 1);
+        dog.enter(&B);
+        run(&mut dog, 30);
+        assert!(!dog.is_away() && !dog.is_performing());
+        assert!(dog.x <= B.right);
+    }
+
+    #[test]
     fn forced_sleep_until_woken() {
         let mut dog = Dog::new(500.0, B.ground);
         dog.toggle_sleep();
@@ -413,8 +651,33 @@ mod tests {
         }
         assert!(dog.is_sleeping());
         assert_eq!(dog.frame().anim, Anim::Sleep);
+        // Notifications do not wake it; petting does.
+        dog.notify();
+        assert!(dog.is_put_to_sleep());
+        assert_eq!(dog.frame().anim, Anim::Sleep);
         dog.pet();
         assert!(!dog.is_sleeping());
+    }
+
+    #[test]
+    fn sleep_survives_hide_and_show() {
+        let mut dog = Dog::new(500.0, B.ground);
+        let run = |dog: &mut Dog| {
+            for _ in 0..(60 * 30) {
+                dog.update(1.0 / 60.0, &B);
+            }
+        };
+        dog.sleep();
+        dog.leave(&B);
+        run(&mut dog);
+        assert!(dog.is_away());
+        assert!(dog.is_put_to_sleep(), "still asleep while away");
+        dog.wake_up();
+        dog.sleep();
+        dog.enter(&B);
+        run(&mut dog);
+        assert!(!dog.is_away());
+        assert_eq!(dog.frame().anim, Anim::Sleep, "lies down again once back");
     }
 
     #[test]

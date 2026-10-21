@@ -38,6 +38,30 @@ pub enum Check {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         contains: Option<String>,
     },
+    /// Condition: something accepts TCP connections on `host:port`.
+    Port { host: String, port: u16 },
+    /// Condition: the file exists and, if `contains` is given, its last 1 MB contains it.
+    File {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        contains: Option<String>,
+    },
+    /// Condition: the process is running.
+    Process { pid: u32 },
+    /// Condition: the time has come (Unix seconds). Reminders.
+    Time { at: u64 },
+    /// Condition: a GitHub Actions run finished (any result). `run`: a run id; otherwise the
+    /// newest run of `branch` (or of the repo) that started after the watch was added.
+    Github {
+        repo: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+        /// Unix seconds; runs created before this are ignored (no `run` given).
+        #[serde(default)]
+        since: u64,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -58,6 +82,8 @@ pub struct Watch {
     pub once: bool,
     #[serde(default)]
     pub sticky: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     #[serde(default)]
     pub state: WatchState,
 }
@@ -87,6 +113,7 @@ pub struct NewWatch {
     pub message: String,
     pub once: bool,
     pub sticky: bool,
+    pub source: Option<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -150,13 +177,18 @@ impl Watches {
         let w = Watch {
             id: st.stored.next_id,
             name: n.name,
+            interval_secs: match n.check {
+                // Cheap and must fire on time.
+                Check::Time { .. } => 1,
+                _ => n.interval_secs.max(MIN_INTERVAL),
+            },
             check: n.check,
             negate: n.negate,
-            interval_secs: n.interval_secs.max(MIN_INTERVAL),
             title: n.title,
             message: n.message,
             once: n.once,
             sticky: n.sticky,
+            source: n.source,
             state: WatchState::default(),
         };
         st.stored.watches.push(w.clone());
@@ -218,12 +250,18 @@ impl Watches {
         w.state.checked_at = Some(unix_now());
         if fire {
             w.state.fired += 1;
-            let body = if w.message.is_empty() {
-                format!("{}: {detail}", w.name)
-            } else {
-                w.message.clone()
-            };
-            let mut n = Notification::new(w.title.clone(), body);
+            let mut n = match &w.check {
+                Check::Github { repo, .. } => github_notification(w, repo, &detail),
+                _ => {
+                    let body = if w.message.is_empty() {
+                        format!("{}: {detail}", w.name)
+                    } else {
+                        w.message.clone()
+                    };
+                    Notification::new(w.title.clone(), body)
+                }
+            }
+            .source(w.source.clone());
             if w.sticky {
                 n = n.sticky();
             }
@@ -249,11 +287,54 @@ impl Watches {
     }
 }
 
+/// "CI passed" / "CI failed" with a link to the run.
+fn github_notification(w: &Watch, repo: &str, detail: &str) -> Notification {
+    let mut parts = detail.splitn(3, " · ");
+    let conclusion = parts.next().unwrap_or("");
+    let name = parts.next().unwrap_or("run");
+    let link = parts.next().unwrap_or("");
+    let ok = conclusion == "success";
+    let title = if w.title.is_empty() || w.title == w.name {
+        format!("{name} {}", if ok { "passed" } else { "failed" })
+    } else {
+        w.title.clone()
+    };
+    let body = if w.message.is_empty() {
+        format!("{repo}: {conclusion}")
+    } else {
+        w.message.clone()
+    };
+    let mut n = Notification::new(title, body);
+    if link.starts_with("https://") {
+        n.url = Some(link.to_string());
+        n = n.timeout(Duration::from_secs(30));
+    }
+    n
+}
+
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Unix seconds for the next local "HH:MM" (today, or tomorrow if it has passed).
+pub fn next_local_time(hhmm: &str) -> Option<u64> {
+    use chrono::{Local, NaiveTime, TimeZone};
+    let mins = crate::settings::parse_hhmm(hhmm)?;
+    let t = NaiveTime::from_hms_opt(mins / 60, mins % 60, 0)?;
+    let now = Local::now();
+    let mut day = now.date_naive();
+    if now.time() >= t {
+        day = day.succ_opt()?;
+    }
+    let at = Local.from_local_datetime(&day.and_time(t)).earliest()?;
+    u64::try_from(at.timestamp()).ok()
+}
+
+pub fn now_unix() -> u64 {
+    unix_now()
 }
 
 /// Runs a check: `Ok((condition, detail))`, or `Err(detail)` if unreachable.
@@ -265,6 +346,193 @@ pub fn run_check(check: &Check) -> Result<(bool, String), String> {
             contains,
         } => check_http(url, *status, contains.as_deref()),
         Check::Command { command, contains } => check_command(command, contains.as_deref()),
+        Check::Port { host, port } => Ok(check_port(host, *port)),
+        Check::File { path, contains } => Ok(check_file(path, contains.as_deref())),
+        Check::Process { pid } => Ok(check_process(*pid)),
+        Check::Github {
+            repo,
+            run,
+            branch,
+            since,
+        } => check_github(repo, *run, branch.as_deref(), *since),
+        Check::Time { at } => {
+            let now = unix_now();
+            Ok(if now >= *at {
+                (true, "time is up".into())
+            } else {
+                (false, format!("in {}", human_secs(at - now)))
+            })
+        }
+    }
+}
+
+/// "1 h 5 min", "3 min", "40 s".
+pub fn human_secs(s: u64) -> String {
+    match s {
+        0..60 => format!("{s} s"),
+        60..3600 => format!("{} min", s.div_ceil(60)),
+        _ => {
+            let (h, m) = (s / 3600, (s % 3600) / 60);
+            if m == 0 {
+                format!("{h} h")
+            } else {
+                format!("{h} h {m} min")
+            }
+        }
+    }
+}
+
+/// The run's state from the GitHub API. Detail: "<conclusion> · <name> · <url>" when done.
+/// Uses $GITHUB_TOKEN / $GH_TOKEN when set (needed for private repos, raises rate limits).
+fn check_github(
+    repo: &str,
+    run: Option<u64>,
+    branch: Option<&str>,
+    since: u64,
+) -> Result<(bool, String), String> {
+    let url = match run {
+        Some(id) => format!("https://api.github.com/repos/{repo}/actions/runs/{id}"),
+        None => {
+            let mut u = format!("https://api.github.com/repos/{repo}/actions/runs?per_page=5");
+            if let Some(b) = branch {
+                u.push_str(&format!("&branch={b}"));
+            }
+            u
+        }
+    };
+    let agent = http_agent(HTTP_TIMEOUT);
+    let mut req = agent
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "dost");
+    if let Some(t) = ["GITHUB_TOKEN", "GH_TOKEN"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|t| !t.is_empty()))
+    {
+        req = req.header("Authorization", &format!("Bearer {t}"));
+    }
+    let mut resp = req.call().map_err(|e| format!("unreachable: {e}"))?;
+    let code = resp.status().as_u16();
+    let body = resp
+        .body_mut()
+        .with_config()
+        .limit(BODY_LIMIT)
+        .read_to_string()
+        .unwrap_or_default();
+    if code != 200 {
+        return Err(format!("GitHub HTTP {code}"));
+    }
+    let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    let r = match run {
+        Some(_) => Some(&v),
+        None => v["workflow_runs"].as_array().and_then(|runs| {
+            runs.iter().find(|r| {
+                r["created_at"]
+                    .as_str()
+                    .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                    .is_some_and(|t| t.timestamp() >= since as i64)
+            })
+        }),
+    };
+    let Some(r) = r else {
+        return Ok((false, "no new run yet".into()));
+    };
+    let name = r["name"].as_str().unwrap_or("run");
+    let status = r["status"].as_str().unwrap_or("");
+    if status != "completed" {
+        return Ok((false, format!("{name}: {status}")));
+    }
+    let conclusion = r["conclusion"].as_str().unwrap_or("done");
+    let link = r["html_url"].as_str().unwrap_or("");
+    Ok((true, format!("{conclusion} · {name} · {link}")))
+}
+
+/// An HTTP client with the platform's TLS: rustls on Windows, the system's on macOS (the
+/// provider must be chosen; the default is rustls, which is not built there).
+pub fn http_agent(timeout: Duration) -> ureq::Agent {
+    let mut cfg = ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .http_status_as_error(false);
+    if cfg!(target_os = "macos") {
+        cfg = cfg.tls_config(
+            ureq::tls::TlsConfig::builder()
+                .provider(ureq::tls::TlsProvider::NativeTls)
+                .build(),
+        );
+    }
+    cfg.build().into()
+}
+
+fn check_port(host: &str, port: u16) -> (bool, String) {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let addrs = match (host, port).to_socket_addrs() {
+        Ok(a) => a.collect::<Vec<_>>(),
+        Err(e) => return (false, format!("{host}: {e}")),
+    };
+    for a in &addrs {
+        if TcpStream::connect_timeout(a, Duration::from_secs(3)).is_ok() {
+            return (true, format!("{host}:{port} is open"));
+        }
+    }
+    (false, format!("{host}:{port} is closed"))
+}
+
+fn check_file(path: &str, contains: Option<&str>) -> (bool, String) {
+    use std::io::{Seek, SeekFrom};
+    let path = expand_home(path);
+    let Ok(mut f) = std::fs::File::open(&path) else {
+        return (false, "file does not exist".into());
+    };
+    let Some(needle) = contains else {
+        return (true, "file exists".into());
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let _ = f.seek(SeekFrom::Start(len.saturating_sub(BODY_LIMIT)));
+    let mut buf = Vec::new();
+    let _ = f.take(BODY_LIMIT).read_to_end(&mut buf);
+    if String::from_utf8_lossy(&buf).contains(needle) {
+        (true, format!("file contains \"{needle}\""))
+    } else {
+        (false, format!("file does not contain \"{needle}\" yet"))
+    }
+}
+
+fn expand_home(path: &str) -> PathBuf {
+    match path.strip_prefix("~/").zip(std::env::var_os("HOME")) {
+        Some((rest, home)) => PathBuf::from(home).join(rest),
+        None => PathBuf::from(path),
+    }
+}
+
+#[cfg(unix)]
+fn check_process(pid: u32) -> (bool, String) {
+    // `kill -0` checks existence without sending a signal.
+    let alive = Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if alive {
+        (true, format!("process {pid} is running"))
+    } else {
+        (false, format!("process {pid} is not running"))
+    }
+}
+
+#[cfg(windows)]
+fn check_process(pid: u32) -> (bool, String) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    let alive =
+        out.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")));
+    if alive {
+        (true, format!("process {pid} is running"))
+    } else {
+        (false, format!("process {pid} is not running"))
     }
 }
 
@@ -273,11 +541,7 @@ fn check_http(
     status: Option<u16>,
     contains: Option<&str>,
 ) -> Result<(bool, String), String> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(HTTP_TIMEOUT))
-        .http_status_as_error(false)
-        .build()
-        .into();
+    let agent = http_agent(HTTP_TIMEOUT);
     let mut resp = agent
         .get(url)
         .call()
@@ -371,7 +635,104 @@ mod tests {
             message: String::new(),
             once: true,
             sticky: false,
+            source: None,
         }
+    }
+
+    #[test]
+    fn github_bubble_links_to_the_run() {
+        let w = Watch {
+            id: 1,
+            name: "CI a/b".into(),
+            check: Check::Github {
+                repo: "a/b".into(),
+                run: None,
+                branch: None,
+                since: 0,
+            },
+            negate: false,
+            interval_secs: 30,
+            title: "CI a/b".into(),
+            message: String::new(),
+            once: true,
+            sticky: false,
+            source: None,
+            state: WatchState::default(),
+        };
+        let n = github_notification(
+            &w,
+            "a/b",
+            "failure · Tests · https://github.com/a/b/actions/runs/9",
+        );
+        assert_eq!(n.title, "Tests failed");
+        assert_eq!(n.body, "a/b: failure");
+        assert_eq!(
+            n.url.as_deref(),
+            Some("https://github.com/a/b/actions/runs/9")
+        );
+        let n = github_notification(
+            &w,
+            "a/b",
+            "success · CI · https://github.com/a/b/actions/runs/9",
+        );
+        assert_eq!(n.title, "CI passed");
+    }
+
+    #[test]
+    fn new_checks() {
+        let dir = std::env::temp_dir().join(format!("dost-file-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("log.txt");
+        let file = |contains: Option<&str>| Check::File {
+            path: f.to_string_lossy().into(),
+            contains: contains.map(String::from),
+        };
+        assert!(!run_check(&file(None)).unwrap().0);
+        std::fs::write(&f, "starting\nbuild ok\n").unwrap();
+        assert!(run_check(&file(None)).unwrap().0);
+        assert!(run_check(&file(Some("build ok"))).unwrap().0);
+        assert!(!run_check(&file(Some("ERROR"))).unwrap().0);
+        let _ = std::fs::remove_dir_all(dir);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let open = Check::Port {
+            host: "127.0.0.1".into(),
+            port,
+        };
+        assert!(run_check(&open).unwrap().0);
+        drop(listener);
+        assert!(!run_check(&open).unwrap().0);
+
+        assert!(
+            run_check(&Check::Process {
+                pid: std::process::id()
+            })
+            .unwrap()
+            .0
+        );
+        assert!(!run_check(&Check::Process { pid: 4_000_000 }).unwrap().0);
+
+        assert!(run_check(&Check::Time { at: 1 }).unwrap().0);
+        assert!(
+            !run_check(&Check::Time {
+                at: unix_now() + 120
+            })
+            .unwrap()
+            .0
+        );
+    }
+
+    #[test]
+    fn local_times_and_durations() {
+        let at = next_local_time("00:00").unwrap();
+        let now = unix_now();
+        assert!(at > now && at <= now + 24 * 3600 + 3600);
+        assert_eq!(next_local_time("24:00"), None);
+        assert_eq!(human_secs(40), "40 s");
+        assert_eq!(human_secs(150), "3 min");
+        assert_eq!(human_secs(3900), "1 h 5 min");
+        assert_eq!(human_secs(7200), "2 h");
     }
 
     #[test]
@@ -405,7 +766,7 @@ mod tests {
         n.negate = true;
         let w = ws.add(n);
         ws.finish(w.id, Err("unreachable".into()));
-        let got = rx.try_recv().unwrap();
+        let got = rx.try_recv().unwrap().into_notification().unwrap();
         assert!(got.body.contains("unreachable"));
         assert!(ws.list().is_empty());
     }

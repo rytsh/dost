@@ -24,6 +24,9 @@ jobs:
 
   windows:
     runs-on: windows-latest
+    env:
+      WINDOWS_CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
+      WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -32,13 +35,32 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo build --release
+      - run: Copy-Item target/release/dost.exe dost-windows.exe
+      # Signed only when the certificate is set up (repo secrets WINDOWS_CERT_PFX as base64,
+      # WINDOWS_CERT_PASSWORD); otherwise the exe stays unsigned.
+      - name: Sign
+        if: env.WINDOWS_CERT_PFX != ''
+        run: |
+          [IO.File]::WriteAllBytes("cert.pfx", [Convert]::FromBase64String($env:WINDOWS_CERT_PFX))
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" | Select-Object -Last 1
+          & $signtool.FullName sign /f cert.pfx /p $env:WINDOWS_CERT_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 dost-windows.exe
+          Remove-Item cert.pfx
+      - run: (Get-FileHash dost-windows.exe -Algorithm SHA256).Hash.ToLower() + "  dost-windows.exe" | Out-File -Encoding ascii dost-windows.exe.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: dost-windows
-          path: target/release/dost.exe
+          path: |
+            dost-windows.exe
+            dost-windows.exe.sha256
 
   macos:
     runs-on: macos-latest
+    env:
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -47,11 +69,38 @@ jobs:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
-      - run: make dmg
+      # Signed with a Developer ID and notarized when the secrets are set up (see
+      # packaging/macos/README.md); otherwise ad-hoc signed.
+      - name: Import certificate
+        if: env.MACOS_CERT_P12 != ''
+        run: |
+          echo "$MACOS_CERT_P12" | base64 --decode > cert.p12
+          security create-keychain -p ci build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p ci build.keychain
+          security import cert.p12 -k build.keychain -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k ci build.keychain
+          rm cert.p12
+          echo "SIGN_ID=$(security find-identity -v -p codesigning build.keychain | grep -o '"Developer ID Application[^"]*"' | head -1 | tr -d '"')" >> "$GITHUB_ENV"
+      - run: make dmg SIGN_ID="${SIGN_ID:--}"
+      - name: Notarize
+        if: env.SIGN_ID != '' && env.APPLE_ID != ''
+        run: |
+          xcrun notarytool submit target/Dost-*.dmg --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple target/Dost-*.dmg
+          xcrun stapler staple target/Dost.app
+      # The app on its own, for updates (the dmg is for people).
+      - run: |
+          ditto -c -k --keepParent target/Dost.app Dost-macos.zip
+          shasum -a 256 Dost-macos.zip > Dost-macos.zip.sha256
+          cp target/Dost-*.dmg Dost.dmg
       - uses: actions/upload-artifact@v4
         with:
           name: dost-macos
-          path: target/Dost-*.dmg
+          path: |
+            Dost.dmg
+            Dost-macos.zip
+            Dost-macos.zip.sha256
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -62,5 +111,8 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            dost-windows/dost.exe
-            dost-macos/*.dmg
+            dost-windows/dost-windows.exe
+            dost-windows/dost-windows.exe.sha256
+            dost-macos/Dost.dmg
+            dost-macos/Dost-macos.zip
+            dost-macos/Dost-macos.zip.sha256

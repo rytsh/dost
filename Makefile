@@ -7,8 +7,10 @@ WIN_DIR     = $(shell wslpath "$$(cmd.exe /c 'echo %LOCALAPPDATA%' 2>/dev/null |
 MAC_TARGETS := aarch64-apple-darwin x86_64-apple-darwin
 APP         := target/Dost.app
 VERSION     := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+# codesign identity: "-" (ad hoc) or "Developer ID Application: ..." for a release.
+SIGN_ID     ?= -
 
-.PHONY: help build test check clippy fmt preview atlas install-opencode-plugin \
+.PHONY: help build test check clippy fmt preview atlas icons install-opencode-plugin \
 	build-windows run-windows stop-windows app dmg clean
 
 help:
@@ -18,6 +20,7 @@ help:
 	@echo "make fmt                     Format the code"
 	@echo "make preview                 Render the dog, bubbles and panel to preview*.png"
 	@echo "make atlas                   Rebuild assets/dog.png from art/px"
+	@echo "make icons                   (on a Mac) Rebuild the app icons from examples/icon.rs"
 	@echo "make build-windows           Release build for Windows from WSL ($(WIN_EXE))"
 	@echo "make run-windows             Build, copy to Windows and start it"
 	@echo "make stop-windows            Stop a running dost.exe"
@@ -52,6 +55,20 @@ preview:
 atlas:
 	~/tools/agent-sprite-forge/.venv/bin/python art/pack_atlas.py
 
+# examples/icon.rs -> packaging/macos/AppIcon.icns and packaging/windows/dost.ico.
+ICON_TMP := target/icons
+icons:
+	@test "$$(uname)" = Darwin || { echo "make icons needs macOS (iconutil)"; exit 1; }
+	rm -rf $(ICON_TMP) && mkdir -p $(ICON_TMP)/AppIcon.iconset packaging/windows
+	cargo run -q --example icon $(ICON_TMP)
+	for s in 16 32 128 256 512; do \
+		cp $(ICON_TMP)/icon_$$s.png $(ICON_TMP)/AppIcon.iconset/icon_$${s}x$${s}.png; \
+		cp $(ICON_TMP)/icon_$$((s*2)).png $(ICON_TMP)/AppIcon.iconset/icon_$${s}x$${s}@2x.png; \
+	done
+	iconutil -c icns $(ICON_TMP)/AppIcon.iconset -o packaging/macos/AppIcon.icns
+	magick $(foreach s,16 20 24 32 48 64 128 256,$(ICON_TMP)/icon_$(s).png) packaging/windows/dost.ico
+	@echo "-> packaging/macos/AppIcon.icns, packaging/windows/dost.ico"
+
 build-windows:
 	@command -v cargo-xwin >/dev/null || { echo "cargo-xwin is missing: cargo install --locked cargo-xwin"; exit 1; }
 	@rustup target list --installed | grep -qx $(WIN_TARGET) || rustup target add $(WIN_TARGET)
@@ -76,8 +93,8 @@ app:
 	mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources
 	lipo -create $(foreach t,$(MAC_TARGETS),target/$(t)/release/dost) -output $(APP)/Contents/MacOS/dost
 	sed 's/@VERSION@/$(VERSION)/g' packaging/macos/Info.plist > $(APP)/Contents/Info.plist
-	cp packaging/macos/AppIcon.icns $(APP)/Contents/Resources/ 2>/dev/null || true
-	codesign --force --deep --sign - $(APP)
+	cp packaging/macos/AppIcon.icns $(APP)/Contents/Resources/
+	codesign --force --deep --options runtime $(if $(filter -,$(SIGN_ID)),--timestamp=none,--timestamp) --sign "$(SIGN_ID)" $(APP)
 	@echo "-> $(APP)"
 
 dmg: app
