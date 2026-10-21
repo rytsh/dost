@@ -1,0 +1,253 @@
+//! User settings: changed from "Settings" in the tray menu and saved to `settings.json`.
+//! The file can also be edited by hand; the app notices the change and reloads it.
+
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
+
+use serde::{Deserialize, Serialize};
+
+/// Dog size, percent. The sprite is 128 px tall; on screen it is rounded to a whole multiple so
+/// pixels stay crisp and even (100 = 1:1).
+pub const SIZES: [(u32, &str); 3] = [(100, "1×"), (200, "2×"), (300, "3×")];
+pub const SPEEDS: [(f32, &str); 3] = [(0.6, "Slow"), (1.0, "Normal"), (1.6, "Fast")];
+/// How long the notification bubble stays on screen; 0 = until clicked.
+/// Upward offset of the ground from the baseline, in logical pixels (multiplied by the screen scale).
+/// A negative value sinks the dog slightly below the baseline (into the taskbar edge).
+pub const LIFTS: [(i32, &str); 6] = [
+    (-6, "−6"),
+    (-3, "−3"),
+    (0, "0"),
+    (20, "+20"),
+    (60, "+60"),
+    (150, "+150"),
+];
+/// Bubble text size multipliers.
+pub const TEXT_SIZES: [(f32, &str); 4] = [(1.0, "S"), (1.2, "M"), (1.45, "L"), (1.75, "XL")];
+pub const NOTIFY_SECS: [(u64, &str); 4] =
+    [(5, "5 s"), (10, "10 s"), (30, "30 s"), (0, "Until click")];
+
+/// The baseline the dog stands on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Ground {
+    /// Top of the taskbar (bottom of the screen if there is no taskbar or it auto-hides).
+    #[default]
+    Taskbar,
+    /// Very bottom of the screen; the dog stands in front of the taskbar.
+    Screen,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    /// Dog size, percent (50-400); values 1-6 from old files are multiplied by 50.
+    pub size: u32,
+    /// Walking speed multiplier.
+    pub speed: f32,
+    /// false: the dog stays in place; it only stands, sits or sleeps.
+    pub wander: bool,
+    pub ground: Ground,
+    /// Raises the ground this much above the baseline (logical pixels, -20..2000).
+    /// If negative, the dog starts slightly below the line.
+    pub lift: i32,
+    /// Bubble text size multiplier (0.8-3.0).
+    pub text_size: f32,
+    /// Bark sound when a notification arrives.
+    pub sound: bool,
+    /// Volume, percent (0-100).
+    pub volume: u8,
+    /// Also bark when the dog is clicked.
+    pub sound_on_pet: bool,
+    /// How long notifications without an explicit timeout stay in the bubble; 0 = until clicked.
+    pub notify_secs: u64,
+    pub mcp_enabled: bool,
+    pub mcp_addr: String,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            size: 100,
+            speed: 1.0,
+            wander: true,
+            ground: Ground::Taskbar,
+            lift: -3,
+            notify_secs: 10,
+            text_size: 1.2,
+            sound: true,
+            volume: 50,
+            sound_on_pet: false,
+            mcp_enabled: true,
+            mcp_addr: "127.0.0.1:7777".into(),
+        }
+    }
+}
+
+impl Settings {
+    /// Fixes invalid values (for hand-edited files).
+    pub fn sanitized(mut self) -> Self {
+        let d = Settings::default();
+        // In old settings files (64 px sprite) size was a multiplier from 1 to 6.
+        if self.size <= 6 {
+            self.size *= 50;
+        }
+        self.size = self.size.clamp(50, 400);
+        if !(self.speed.is_finite() && (0.1..=5.0).contains(&self.speed)) {
+            self.speed = d.speed;
+        }
+        self.notify_secs = self.notify_secs.min(3600);
+        self.lift = self.lift.clamp(-20, 2000);
+        self.volume = self.volume.min(100);
+        if !(self.text_size.is_finite() && (0.8..=3.0).contains(&self.text_size)) {
+            self.text_size = d.text_size;
+        }
+        if self.mcp_addr.trim().is_empty() {
+            self.mcp_addr = d.mcp_addr;
+        }
+        self
+    }
+
+    /// `None`: stays until clicked.
+    pub fn notify_timeout(&self) -> Option<Duration> {
+        (self.notify_secs > 0).then(|| Duration::from_secs(self.notify_secs))
+    }
+}
+
+/// The settings file and the last read/written modification time.
+pub struct Store {
+    path: Option<PathBuf>,
+    mtime: Option<SystemTime>,
+}
+
+impl Store {
+    pub fn new(path: Option<PathBuf>) -> Self {
+        Store { path, mtime: None }
+    }
+
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// Defaults if the file is missing or corrupt.
+    pub fn load(&mut self) -> Settings {
+        let Some(path) = &self.path else {
+            return Settings::default();
+        };
+        self.mtime = mtime(path);
+        std::fs::read(path)
+            .ok()
+            .and_then(|d| serde_json::from_slice::<Settings>(&d).ok())
+            .unwrap_or_default()
+            .sanitized()
+    }
+
+    pub fn save(&mut self, s: &Settings) {
+        let Some(path) = &self.path else { return };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(data) = serde_json::to_vec_pretty(s) {
+            let tmp = path.with_extension("json.tmp");
+            if std::fs::write(&tmp, data).is_ok() && std::fs::rename(&tmp, path).is_ok() {
+                self.mtime = mtime(path);
+            }
+        }
+    }
+
+    /// Returns the new settings if the file was changed externally.
+    pub fn reload_if_changed(&mut self) -> Option<Settings> {
+        let path = self.path.as_ref()?;
+        let now = mtime(path);
+        if now.is_none() || now == self.mtime {
+            return None;
+        }
+        Some(self.load())
+    }
+}
+
+fn mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// `%APPDATA%\dost` (Windows) or `~/.config/dost`.
+pub fn config_dir() -> Option<PathBuf> {
+    let base = if cfg!(windows) {
+        std::env::var_os("APPDATA").map(PathBuf::from)
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+    };
+    base.map(|b| b.join("dost"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partial_and_bad_files() {
+        let s: Settings = serde_json::from_str(r#"{ "size": 300 }"#).unwrap();
+        assert_eq!(
+            s,
+            Settings {
+                size: 300,
+                ..Settings::default()
+            }
+        );
+        let s: Settings =
+            serde_json::from_str(r#"{ "size": 999, "speed": -1, "mcp_addr": " ", "lift": -50 }"#)
+                .unwrap();
+        assert_eq!(
+            s.sanitized(),
+            Settings {
+                size: 400,
+                lift: -20,
+                ..Settings::default()
+            }
+        );
+        assert_eq!(
+            Settings {
+                notify_secs: 0,
+                ..Settings::default()
+            }
+            .notify_timeout(),
+            None
+        );
+    }
+
+    #[test]
+    fn ground_settings() {
+        let s: Settings = serde_json::from_str(r#"{ "ground": "screen", "lift": 35 }"#).unwrap();
+        assert_eq!((s.ground, s.lift), (Ground::Screen, 35));
+        let s: Settings = serde_json::from_str(r#"{ "lift": 99999 }"#).unwrap();
+        assert_eq!(s.sanitized().lift, 2000);
+    }
+
+    #[test]
+    fn save_load_reload() {
+        let dir = std::env::temp_dir().join(format!("dost-settings-{}", std::process::id()));
+        let path = dir.join("settings.json");
+        let mut store = Store::new(Some(path.clone()));
+        assert_eq!(store.load(), Settings::default());
+        let s = Settings {
+            size: 200,
+            wander: false,
+            ..Settings::default()
+        };
+        store.save(&s);
+        assert_eq!(store.reload_if_changed(), None);
+        assert_eq!(Store::new(Some(path.clone())).load(), s);
+
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&path, r#"{ "size": 2 }"#).unwrap();
+        let t = SystemTime::now() + Duration::from_secs(5);
+        let _ = std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .and_then(|f| f.set_modified(t));
+        // A "2" from an old file (64 px sprite × 2) maps to the same on-screen size, 100%.
+        assert_eq!(store.reload_if_changed().map(|s| s.size), Some(100));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

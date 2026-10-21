@@ -1,0 +1,13 @@
+target/
+/*.png
+
+# Sprite Forge intermediates: raw generations, HD frames, QC reports.
+# art/px and art/pack_atlas.py are enough to rebuild the atlas (make atlas).
+art/raw/
+art/hd/
+art/qc/
+art/walk-guide/
+art/master-prompt/
+art/master/source.png
+art/master/master.png
+art/px/*/review-contact.png

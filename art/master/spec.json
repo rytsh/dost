@@ -1,0 +1,24 @@
+{
+  "schema": "generate2dsprite.master_spec.v1",
+  "name": "dost",
+  "subject": "a cute small scruffy terrier puppy, full body, side view, standing on all four legs",
+  "identity": "a small friendly terrier-mix puppy with warm golden-tan fur, a cream-white muzzle, chest and paw tips, a big expressive head, one floppy dark-brown ear and one half-perked ear, large shiny dark eyes with a white highlight, a small black nose, a short fluffy upturned tail, a bright red collar with a small round gold tag, compact chubby body with short sturdy legs, all four legs visible (the two FAR legs one shade darker and partly hidden)",
+  "pose": null,
+  "recap": "cute small scruffy terrier puppy, full body, side view, standing on all four legs (a small friendly terrier-mix puppy with warm golden-tan fur, a cream-white muzzle, chest and paw tips, a big expressive head, one floppy dark-brown ear and one half-perked ear, large shiny dark eyes with a white highlight, a small black nose, a short fluffy upturned tail, a bright red collar with a small round gold tag, compact chubby body with short sturdy legs, all four legs visible (the two FAR legs one shade darker and partly hidden))",
+  "facing": "right",
+  "facing_parts": null,
+  "view": null,
+  "class": "mob",
+  "finish": "pixel",
+  "key": "#FF00FF",
+  "genre": "for a cosy desktop pet game",
+  "pronoun": "they",
+  "identity_ref": null,
+  "style_ref": null,
+  "allowed_text": null,
+  "extra_bans": [
+    "shadow under the dog"
+  ],
+  "opaque_parts": null,
+  "extra": null
+}

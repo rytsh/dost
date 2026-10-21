@@ -1,0 +1,161 @@
+{
+  "schema": "generate2dsprite.master.v1",
+  "tool": {
+    "name": "master_still",
+    "version": "0.4.0"
+  },
+  "created": "2026-10-20T23:01:57.791Z",
+  "name": "dost",
+  "subject": "a cute small scruffy terrier puppy, full body, side view, standing on all four legs",
+  "identity_recap": "cute small scruffy terrier puppy, full body, side view, standing on all four legs (a small friendly terrier-mix puppy with warm golden-tan fur, a cream-white muzzle, chest and paw tips, a big expressive head, one floppy dark-brown ear and one half-perked ear, large shiny dark eyes with a white highlight, a small black nose, a short fluffy upturned tail, a bright red collar with a small round gold tag, compact chubby body with short sturdy legs, all four legs visible (the two FAR legs one shade darker and partly hidden))",
+  "facing": "right",
+  "view": "side view (profile to three-quarter)",
+  "finish": "pixel",
+  "class": "mob",
+  "framing": {
+    "canvas": [
+      1024,
+      1024
+    ],
+    "subject_height_px": 471,
+    "top_margin_px": 406,
+    "lead_px": 100,
+    "preset": "mob",
+    "subject_bbox": [
+      185,
+      406,
+      639,
+      877
+    ],
+    "anchor": [
+      377.0,
+      877.0
+    ],
+    "opaque_area_px": 129224,
+    "width_limited": false
+  },
+  "key": "#FF00FF",
+  "files": {
+    "master": {
+      "path": "master.png",
+      "sha256": "7c451dbd5bdb9c02fee8d4de70659ac2d92293526d839f5b54f5653fe571d2c1",
+      "bytes": 202587,
+      "size": [
+        1024,
+        1024
+      ]
+    },
+    "cutout": {
+      "path": "master_rgba.png",
+      "sha256": "7b546eefb2abf86f5c82e60435f840394a87c5af66a01e632e53b7fad5bda970",
+      "bytes": 238818,
+      "size": [
+        1024,
+        1024
+      ]
+    },
+    "source": {
+      "path": "source.png",
+      "sha256": "92c26bfe1c34a095011f868e39f0ee1d95156a6816f905e6b04f6db9e16d75f0",
+      "bytes": 1334394,
+      "size": [
+        1254,
+        1254
+      ]
+    },
+    "spec": {
+      "path": "spec.json",
+      "sha256": "04561c4c8d90c015f5f29831f461957c0261c46d6d22aa665472f986bb961608",
+      "bytes": 1526
+    },
+    "prompt": {
+      "path": "prompt.txt",
+      "sha256": "993e3ed3927bde23cffe0a437de56b7075bf664d7e412e04160cca14e25f6b56",
+      "bytes": 1834
+    }
+  },
+  "references": [],
+  "transform": {
+    "mapping": "master = scale * source + offset (continuous pixel coordinates: pixel i spans [i, i + 1))",
+    "source_size": [
+      1254,
+      1254
+    ],
+    "source_subject_bbox": [
+      213,
+      261,
+      926,
+      1003
+    ],
+    "crop_box": [
+      207,
+      255,
+      932,
+      1009
+    ],
+    "crop_margin_px": 6,
+    "scale": 0.6347708894878706,
+    "offset": [
+      50.49797843665766,
+      240.32479784366578
+    ],
+    "canvas": [
+      1024,
+      1024
+    ],
+    "resampler": "lanczos",
+    "premultiplied": true,
+    "alpha_floor_px": 2407,
+    "subject_parts": 1,
+    "ignored_parts": 0,
+    "ignored_px": 0,
+    "source_touches": [],
+    "key_rgb": [
+      255,
+      0,
+      255
+    ]
+  },
+  "route": "at-image-mcp",
+  "provenance": {
+    "command": "prompt",
+    "run": "../master-prompt",
+    "take": null,
+    "source_name": "master-take1.png",
+    "source_sha256": "92c26bfe1c34a095011f868e39f0ee1d95156a6816f905e6b04f6db9e16d75f0",
+    "media": null,
+    "media_cli_source": null,
+    "edit": null
+  },
+  "matte": {
+    "requested": "soft",
+    "key_estimate": {
+      "key": [
+        252.0,
+        3.0,
+        250.0
+      ],
+      "source": "border_median",
+      "valid": true,
+      "ring_share": 1.0,
+      "coverage": 0.7940122707813466,
+      "distance_from_declared": 6.56
+    },
+    "quality": "soft",
+    "interior_despill": false,
+    "qa": {
+      "opaque_key_px": 0,
+      "outer_ring_spill_fraction": 0.0024203307785397336,
+      "semitransparent_fraction": 0.021384528193200927,
+      "enclosed_key_pockets": 0,
+      "key_hued_px": 17,
+      "visible_px": 322897
+    },
+    "key_choice": {
+      "status": "ok",
+      "overlap_share": 0.000196,
+      "rule": "reject a key when more than 0.5% of subject pixels have key dominance >= 40; first acceptable candidate wins"
+    }
+  },
+  "warnings": []
+}

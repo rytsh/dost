@@ -1,0 +1,9 @@
+Create exactly ONE square image (1024x1024).
+
+Style: premium 16-bit pixel art (SNES era) for a cosy desktop pet game, crisp visible chunky pixels, limited palette, strong dark outline, 3-tone cel shading, no smooth gradients, no blur. No text, no letters, no numbers, no logo, no watermark, no signature, no UI, no border, no frame, no grid, no shadow under the dog.
+
+Subject: a cute small scruffy terrier puppy, full body, side view, standing on all four legs, side view (profile to three-quarter), clearly FACING RIGHT: their face, gaze and chest turn toward the RIGHT edge of the image; forward is RIGHT and their back is toward the LEFT edge. A small friendly terrier-mix puppy with warm golden-tan fur, a cream-white muzzle, chest and paw tips, a big expressive head, one floppy dark-brown ear and one half-perked ear, large shiny dark eyes with a white highlight, a small black nose, a short fluffy upturned tail, a bright red collar with a small round gold tag, compact chubby body with short sturdy legs, all four legs visible (the two FAR legs one shade darker and partly hidden).
+
+Size and position: one single figure, the top of the figure (including hair, headgear, raised weapons and effects) about 35 percent below the top edge of the canvas and its lowest point about 15 percent above the bottom edge (the figure about 50 percent of the canvas height), the body a little left of centre so there is extra empty room on the RIGHT side for forward motion, generous empty magenta margin on every side, nothing touching or crossing the edges. The whole figure is drawn with solid, fully opaque pixels: no transparency, no semi-transparent glow, no soft aura, nothing blended with the background.
+
+Background: solid flat pure magenta #FF00FF everywhere outside the character, no shadow, no ground, no glow on the background.

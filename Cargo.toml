@@ -1,0 +1,51 @@
+[package]
+name = "dost"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+repository = "https://github.com/rytsh/dost"
+description = "A pixel-art desktop dog that lives on your taskbar and barks when your AI agents need you"
+license = "MIT"
+
+[dependencies]
+tiny-skia = "0.11"
+fastrand = "2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tiny_http = "0.12.0"
+cosmic-text = "0.19"
+
+# HTTPS for watch checks: rustls on Windows/Linux, the system TLS on macOS.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ureq = { version = "3.4.2", default-features = false, features = ["native-tls"] }
+tray-icon = "0.26"
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSArray", "NSData", "NSURL", "NSTimer", "NSDate", "NSGeometry", "block2"] }
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSWindow", "NSView", "NSControl", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSImageView", "NSImageCell", "NSScreen", "NSEvent", "NSResponder", "NSRunningApplication", "NSGraphics", "NSColor", "NSSound", "NSPasteboard", "NSWorkspace", "block2", "objc2-core-foundation"] }
+
+[target.'cfg(windows)'.dependencies]
+tray-icon = "0.26"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = true
+strip = true

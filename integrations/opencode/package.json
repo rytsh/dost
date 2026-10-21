@@ -1,0 +1,25 @@
+{
+  "name": "opencode-dost",
+  "version": "0.1.0",
+  "description": "OpenCode plugin: the Dost desktop dog barks when OpenCode asks a question, needs a permission, finishes or fails.",
+  "type": "module",
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "README.md"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "notifications",
+    "desktop-pet"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rytsh/dost.git",
+    "directory": "integrations/opencode"
+  },
+  "license": "MIT"
+}
