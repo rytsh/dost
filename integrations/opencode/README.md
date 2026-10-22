@@ -19,7 +19,7 @@ quiet; only the session you are looking at reports back.
 Dost must be running with its MCP server on (the default, `http://127.0.0.1:7777/mcp`).
 
 ```sh
-opencode plugin add 'github:rytsh/dost::path:integrations/opencode'
+opencode plugin add 'github:rytsh/dost#main::path:integrations/opencode'
 ```
 
 Or copy [`index.js`](index.js) to `~/.config/opencode/plugins/dost.js`. OpenCode picks up the plugin
@@ -33,7 +33,7 @@ All optional, in `opencode.json`:
 {
   "plugins": [
     {
-      "package": "github:rytsh/dost::path:integrations/opencode",
+      "package": "github:rytsh/dost#main::path:integrations/opencode",
       "options": {
         "url": "http://127.0.0.1:7777/mcp",
         "question": true,

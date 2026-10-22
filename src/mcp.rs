@@ -64,6 +64,8 @@ pub struct Mcp {
     status: Arc<Mutex<DogStatus>>,
     /// What agents are doing (`session`).
     sessions: Arc<crate::sessions::Sessions>,
+    /// Scheduled jobs (`cron_*`).
+    pub cron: Arc<crate::cron::Cron>,
     /// The workspace tools at `/mcp/local`.
     pub local: crate::local::Local,
     /// The dog's name (settings), used in the tool descriptions.
@@ -143,6 +145,7 @@ impl Mcp {
         todos: Arc<Todos>,
         status: Arc<Mutex<DogStatus>>,
         sessions: Arc<crate::sessions::Sessions>,
+        cron: Arc<crate::cron::Cron>,
     ) -> Self {
         Mcp {
             notifier,
@@ -150,6 +153,7 @@ impl Mcp {
             todos,
             status,
             sessions,
+            cron,
             local: crate::local::Local::new(Default::default()),
             name: Mutex::new(crate::settings::DEFAULT_NAME.into()),
             cors: Mutex::new(Cors::default()),
@@ -629,6 +633,11 @@ impl Mcp {
             "list_watches" => Ok(self.tool_list_watches()),
             "remove_watch" => self.tool_remove_watch(&args),
             "check_now" => self.tool_check_now(&args),
+            "cron_add" => self.tool_cron_add(&args),
+            "cron_list" => Ok(self.tool_cron_list()),
+            "cron_remove" => self.tool_cron_id(&args, "remove"),
+            "cron_run" => self.tool_cron_id(&args, "run"),
+            "cron_enable" => self.tool_cron_id(&args, "enable"),
             "status" => Ok(self.tool_status()),
             "session" => self.tool_session(&args),
             "sessions" => Ok(self.tool_sessions()),
@@ -894,6 +903,119 @@ impl Mcp {
                 "It will bark every time the condition is met."
             }
         ))
+    }
+
+    fn tool_cron_add(&self, a: &Value) -> Result<String, String> {
+        use crate::cron::{Action as Job, NewJob, NotifyWhen};
+        let schedule = str_arg(a, "schedule").ok_or("`schedule` is required")?;
+        let kind = str_arg(a, "kind").unwrap_or_else(|| "notify".into());
+        let action = match kind.as_str() {
+            "notify" => Job::Notify {
+                title: str_arg(a, "title").unwrap_or_else(|| "Reminder".into()),
+                message: str_arg(a, "message").unwrap_or_default(),
+                sticky: a.get("sticky").and_then(Value::as_bool).unwrap_or(false),
+            },
+            "http" => Job::Http {
+                method: str_arg(a, "method")
+                    .unwrap_or_else(|| "GET".into())
+                    .to_ascii_uppercase(),
+                url: str_arg(a, "url").ok_or("`url` is required for http")?,
+                headers: a
+                    .get("headers")
+                    .and_then(Value::as_object)
+                    .map(|h| {
+                        h.iter()
+                            .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                body: str_arg(a, "body"),
+                expect_status: a
+                    .get("expect_status")
+                    .and_then(Value::as_u64)
+                    .map(|s| s as u16),
+                contains: str_arg(a, "contains"),
+            },
+            "command" => Job::Command {
+                command: str_arg(a, "command").ok_or("`command` is required for command")?,
+                workdir: str_arg(a, "workdir"),
+            },
+            k => return Err(format!("unknown kind `{k}`; use notify, http or command")),
+        };
+        let notify = match str_arg(a, "notify").as_deref() {
+            None | Some("failure") => NotifyWhen::Failure,
+            Some("always") => NotifyWhen::Always,
+            Some("never") => NotifyWhen::Never,
+            Some(n) => {
+                return Err(format!(
+                    "unknown notify `{n}`; use always, failure or never"
+                ));
+            }
+        };
+        let job = self.cron.add(NewJob {
+            name: str_arg(a, "name").unwrap_or_default(),
+            schedule,
+            action,
+            notify,
+            source: str_arg(a, "source"),
+        })?;
+        self.notifier.panel_changed();
+        let next = self
+            .cron
+            .next_run(&job)
+            .map(|t| {
+                format!(
+                    " Next run in {}.",
+                    crate::watch::human_secs(t.saturating_sub(crate::watch::now_unix()))
+                )
+            })
+            .unwrap_or_default();
+        Ok(format!(
+            "Job #{} \"{}\" scheduled ({}).{next} The user sees it in Schedule; cron_remove deletes it.",
+            job.id, job.name, job.schedule
+        ))
+    }
+
+    fn tool_cron_list(&self) -> String {
+        let jobs = self.cron.list();
+        if jobs.is_empty() {
+            return "No scheduled jobs.".into();
+        }
+        let list: Vec<Value> = jobs
+            .iter()
+            .map(|j| {
+                let mut v = serde_json::to_value(j).unwrap_or_default();
+                if let Some(t) = self.cron.next_run(j) {
+                    v["next_run"] = json!(t);
+                }
+                v
+            })
+            .collect();
+        serde_json::to_string_pretty(&list).unwrap_or_default()
+    }
+
+    fn tool_cron_id(&self, a: &Value, what: &str) -> Result<String, String> {
+        let id = a
+            .get("id")
+            .and_then(Value::as_u64)
+            .ok_or("`id` is required")?;
+        let ok = match what {
+            "remove" => self.cron.remove(id),
+            "run" => self.cron.run_now(id),
+            _ => self.cron.set_enabled(
+                id,
+                a.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+            ),
+        };
+        if !ok {
+            return Err(format!("no job #{id}"));
+        }
+        self.notifier.panel_changed();
+        Ok(match what {
+            "remove" => format!("Job #{id} removed."),
+            "run" => format!("Job #{id} is running now; cron_list shows how it went."),
+            _ => format!("Job #{id} updated."),
+        })
     }
 
     fn tool_list_watches(&self) -> String {
@@ -1165,6 +1287,67 @@ impl Mcp {
     }
 }
 
+/// The scheduler's tools (`cron_*`).
+fn cron_tools(name: &str) -> Value {
+    let dog = dog_label(name);
+    let source = json!({ "type": "string", "description": "Who is sending this (your name, e.g. \"OpenCode\", \"CI\"); shown above the title." });
+    json!([
+        {
+            "name": "cron_add",
+            "title": "Schedule a job",
+            "description": format!("Schedules a repeating job with a cron expression, in the user's local time: a reminder that {dog} barks (kind notify), an HTTP request (kind http), or a shell command (kind command). Requests and commands tell the user when they fail (notify: failure, the default), every time (always) or never; each run goes to History. Use remind for a one-off reminder instead."),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "schedule": { "type": "string", "description": "5 fields: minute hour day-of-month month day-of-week (e.g. \"0 9 * * 1-5\" weekdays at 09:00, \"*/15 * * * *\" every 15 minutes), or @hourly, @daily, @weekly, @monthly, @yearly." },
+                    "kind": { "type": "string", "enum": ["notify", "http", "command"], "description": "Default notify." },
+                    "name": { "type": "string", "description": "Shown in the user's Schedule list; default describes the schedule." },
+                    "title": { "type": "string", "description": "notify: the bubble's title (default \"Reminder\")." },
+                    "message": { "type": "string", "description": "notify: the text." },
+                    "sticky": { "type": "boolean", "description": "notify: stays until clicked." },
+                    "method": { "type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"] },
+                    "url": { "type": "string", "description": "http: an http(s) URL." },
+                    "headers": { "type": "object", "additionalProperties": { "type": "string" } },
+                    "body": { "type": "string" },
+                    "expect_status": { "type": "integer", "description": "http: success status (default any 2xx)." },
+                    "contains": { "type": "string", "description": "http: the body must contain this." },
+                    "command": { "type": "string", "description": "command: run with the user's shell; succeeds on exit 0." },
+                    "workdir": { "type": "string" },
+                    "notify": { "type": "string", "enum": ["failure", "always", "never"] },
+                    "source": source
+                },
+                "required": ["schedule"]
+            }
+        },
+        {
+            "name": "cron_list",
+            "title": "Scheduled jobs",
+            "description": "Lists the scheduled jobs with their next run and how the last run went.",
+            "inputSchema": { "type": "object", "properties": {} },
+            "annotations": { "readOnlyHint": true }
+        },
+        {
+            "name": "cron_remove",
+            "title": "Remove a scheduled job",
+            "description": "Deletes a scheduled job by id.",
+            "inputSchema": { "type": "object", "properties": { "id": { "type": "integer" } }, "required": ["id"] },
+            "annotations": { "destructiveHint": true }
+        },
+        {
+            "name": "cron_run",
+            "title": "Run a scheduled job now",
+            "description": "Runs a scheduled job once right away, without changing its schedule.",
+            "inputSchema": { "type": "object", "properties": { "id": { "type": "integer" } }, "required": ["id"] }
+        },
+        {
+            "name": "cron_enable",
+            "title": "Pause or resume a scheduled job",
+            "description": "Turns a scheduled job off (enabled: false) or on again.",
+            "inputSchema": { "type": "object", "properties": { "id": { "type": "integer" }, "enabled": { "type": "boolean" } }, "required": ["id", "enabled"] }
+        }
+    ])
+}
+
 /// Default name for a watch.
 fn check_label(c: &Check) -> String {
     match c {
@@ -1289,6 +1472,20 @@ fn parse_github(s: &str, a: &Value) -> Result<Check, String> {
 }
 
 fn tools(name: &str) -> Value {
+    let mut all = base_tools(name);
+    if let (Some(list), Value::Array(more)) = (all.as_array_mut(), cron_tools(name)) {
+        // The scheduler's tools go right after the watches'.
+        let at = list
+            .iter()
+            .position(|t| t["name"] == "check_now")
+            .unwrap_or(list.len());
+        list.splice(at..at, more);
+    }
+    all
+}
+
+/// The tools, without the scheduler's (one `json!` can only hold so many).
+fn base_tools(name: &str) -> Value {
     let dog = dog_label(name);
     let source = json!({ "type": "string", "description": "Who is sending this (your name, e.g. \"OpenCode\", \"CI\"); shown above the title." });
     let session = json!({ "type": "string", "description": "Your session id (see `session`): the user's Agents list shows this session waiting, done or failed." });
@@ -1664,7 +1861,14 @@ mod tests {
         let watches = Watches::new(tx.clone(), None);
         let todos = Arc::new(Todos::new(None));
         (
-            Mcp::new(tx, watches, todos, Arc::default(), Arc::default()),
+            Mcp::new(
+                tx.clone(),
+                watches,
+                todos,
+                Arc::default(),
+                Arc::default(),
+                crate::cron::Cron::new(tx, None),
+            ),
             rx,
         )
     }
@@ -1726,6 +1930,11 @@ mod tests {
                 "add_watch",
                 "list_watches",
                 "remove_watch",
+                "cron_add",
+                "cron_list",
+                "cron_remove",
+                "cron_run",
+                "cron_enable",
                 "check_now",
                 "status",
                 "session",

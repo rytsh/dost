@@ -6,7 +6,7 @@
 //  - Long tasks show a progress bar while they run; it turns green when done (the dog is
 //    happy) and red on errors, with how long it took.
 //
-// Install:  opencode plugin add 'github:rytsh/dost::path:integrations/opencode'
+// Install:  opencode plugin add 'github:rytsh/dost#main::path:integrations/opencode'
 // Options (opencode.json "plugins" entry, all optional):
 //   url ("http://127.0.0.1:7777/mcp"), question (true), permissions (true), done (true),
 //   error (true), progress (true), minWorkSeconds (10), lang ("en" | "tr")

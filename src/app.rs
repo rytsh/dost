@@ -285,15 +285,26 @@ impl Core {
         watches.start();
         // Todo lists live next to the watches (none in tests).
         let todos = Arc::new(Todos::new(
-            watches_path.and_then(|p| Some(p.parent()?.join("todos.json"))),
+            watches_path
+                .as_ref()
+                .and_then(|p| Some(p.parent()?.join("todos.json"))),
         ));
         let sessions = Arc::new(Sessions::default());
+        // Scheduled jobs live next to the watches too.
+        let cron = crate::cron::Cron::new(
+            notifier.clone(),
+            watches_path
+                .as_ref()
+                .and_then(|p| Some(p.parent()?.join("cron.json"))),
+        );
+        cron.start();
         let mcp = Arc::new(Mcp::new(
             notifier.clone(),
             watches,
             Arc::clone(&todos),
             Arc::clone(&status),
             Arc::clone(&sessions),
+            cron,
         ));
         let remote = Remote::new(notifier.remote_sender());
         Core {
@@ -1777,6 +1788,43 @@ impl Core {
             }
             Action::OpenUrl(url) => p.open_url(&url),
             Action::ClearSessions => self.sessions.clear_finished(),
+            Action::Cron(edit) => {
+                use crate::cron::NotifyWhen;
+                use panel::CronEdit;
+                let cron = &self.mcp.cron;
+                match edit {
+                    CronEdit::Add {
+                        schedule,
+                        action,
+                        always,
+                    } => {
+                        let added = cron.add(crate::cron::NewJob {
+                            name: String::new(),
+                            schedule,
+                            action,
+                            notify: if always {
+                                NotifyWhen::Always
+                            } else {
+                                NotifyWhen::Failure
+                            },
+                            source: None,
+                        });
+                        if let Err(e) = added {
+                            self.push(Notification::new(t("Schedule"), e).local());
+                        }
+                    }
+                    CronEdit::Remove(id) => {
+                        cron.remove(id);
+                    }
+                    CronEdit::Enable(id, on) => {
+                        cron.set_enabled(id, on);
+                    }
+                    CronEdit::Run(id) => {
+                        cron.run_now(id);
+                    }
+                }
+                self.panel_dirty = true;
+            }
             Action::RemoveSession(id) => {
                 self.sessions.remove(&id);
             }
@@ -1829,6 +1877,16 @@ impl Core {
             quiet: self.settings.is_quiet(local_minute()) || self.fullscreen,
             missed: self.missed,
             todos: self.mcp.todo_lists(),
+            jobs: self
+                .mcp
+                .cron
+                .list()
+                .into_iter()
+                .map(|j| {
+                    let next = self.mcp.cron.next_run(&j);
+                    (j, next)
+                })
+                .collect(),
             sessions: self.sessions.list(),
             phone_status: self.phone_status.clone(),
             screens: p.screen_count(),

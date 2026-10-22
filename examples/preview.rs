@@ -247,6 +247,66 @@ fn main() {
                 ..Default::default()
             },
         ];
+        let now = dost::watch::now_unix();
+        let job = |id, name: &str, schedule: &str, action, last: Option<(bool, &str)>, enabled| {
+            let j = dost::cron::Job {
+                id,
+                name: name.into(),
+                schedule: schedule.into(),
+                action,
+                notify: dost::cron::NotifyWhen::Failure,
+                enabled,
+                source: None,
+                last: last.map(|(ok, d)| dost::cron::Run {
+                    at: now - 600,
+                    ok,
+                    detail: d.into(),
+                    secs: 0,
+                }),
+                runs: 3,
+            };
+            (j, Some(now + 3 * 3600))
+        };
+        let jobs = vec![
+            job(
+                1,
+                "Standup",
+                "0 9 * * 1-5",
+                dost::cron::Action::Notify {
+                    title: "Standup".into(),
+                    message: String::new(),
+                    sticky: false,
+                },
+                None,
+                true,
+            ),
+            job(
+                2,
+                "api health",
+                "*/15 * * * *",
+                dost::cron::Action::Http {
+                    method: "GET".into(),
+                    url: "https://api.example.com/health".into(),
+                    headers: Vec::new(),
+                    body: None,
+                    expect_status: None,
+                    contains: None,
+                },
+                Some((true, "200 OK")),
+                true,
+            ),
+            job(
+                3,
+                "Nightly backup",
+                "30 2 * * *",
+                dost::cron::Action::Command {
+                    command: "./backup.sh".into(),
+                    workdir: None,
+                },
+                Some((false, "exit 1")),
+                false,
+            ),
+        ];
         for (lang, page, name) in [
             (dost::settings::Lang::En, Page::General, "window-general"),
             (dost::settings::Lang::Tr, Page::General, "window-general-tr"),
@@ -255,6 +315,12 @@ fn main() {
             (dost::settings::Lang::Tr, Page::Dog, "window-dog-tr"),
             (dost::settings::Lang::En, Page::Look, "window-look"),
             (dost::settings::Lang::En, Page::Connect, "window-connect"),
+            (dost::settings::Lang::En, Page::Schedule, "window-schedule"),
+            (
+                dost::settings::Lang::Tr,
+                Page::Schedule,
+                "window-schedule-tr",
+            ),
         ] {
             dost::i18n::set(lang);
             let scale = 2.0;
@@ -284,6 +350,7 @@ fn main() {
                 history: history.clone(),
                 todos: todo_lists(),
                 sessions: sessions.clone(),
+                jobs: jobs.clone(),
                 screens: 2,
                 special: Some(dost::special::Day::Remembrance),
                 ..Default::default()

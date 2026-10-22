@@ -598,7 +598,7 @@ fn check_command(command: &str, contains: Option<&str>) -> Result<(bool, String)
 }
 
 #[cfg(windows)]
-fn shell(command: &str) -> Command {
+pub(crate) fn shell(command: &str) -> Command {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let mut c = Command::new("cmd");
@@ -609,7 +609,7 @@ fn shell(command: &str) -> Command {
 }
 
 #[cfg(not(windows))]
-fn shell(command: &str) -> Command {
+pub(crate) fn shell(command: &str) -> Command {
     let mut c = Command::new("sh");
     c.arg("-c").arg(command);
     c

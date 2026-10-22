@@ -71,6 +71,8 @@ pub enum Page {
     Phone,
     Agents,
     Todo,
+    /// Scheduled jobs (cron).
+    Schedule,
     History,
     Connect,
     /// Answering a question in words (opened from the bubble's "Reply…").
@@ -88,6 +90,7 @@ impl Page {
             Page::Phone => "Phone",
             Page::Agents => "Agents",
             Page::Todo => "Todo",
+            Page::Schedule => "Schedule",
             Page::History => "History",
             Page::Connect => "Connect",
             Page::Reply => "Reply",
@@ -104,11 +107,46 @@ impl Page {
             Page::Phone => Glyph::Phone,
             Page::Agents => Glyph::Agents,
             Page::Todo => Glyph::Check,
+            Page::Schedule => Glyph::Calendar,
             Page::History => Glyph::Clock,
             Page::Connect => Glyph::Plug,
             Page::Reply => Glyph::Agents,
         }
     }
+}
+
+/// A change to the scheduled jobs, from the Schedule page.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CronEdit {
+    /// A new job: schedule, action, and whether every run shows a bubble.
+    Add {
+        schedule: String,
+        action: crate::cron::Action,
+        always: bool,
+    },
+    Remove(u64),
+    Enable(u64, bool),
+    Run(u64),
+}
+
+/// The kinds of job, as the Schedule page offers them.
+const JOB_KINDS: [&str; 3] = ["Reminder", "Request", "Command"];
+/// Quick schedules: (label, cron expression).
+const JOB_PRESETS: [(&str, &str); 4] = [
+    ("Hourly", "0 * * * *"),
+    ("Daily 9:00", "0 9 * * *"),
+    ("Weekdays", "0 9 * * 1-5"),
+    ("Mondays", "0 9 * * 1"),
+];
+
+/// The job being put together: its schedule, what kind it is and its text / URL / command.
+#[derive(Clone, Debug, Default)]
+struct JobDraft {
+    schedule: String,
+    kind: usize,
+    what: String,
+    notify_always: bool,
+    error: Option<String>,
 }
 
 /// The panel's tabs, left to right.
@@ -128,7 +166,10 @@ const SIDEBAR: [(&str, &[Page]); 4] = [
         &[Page::General, Page::Dog, Page::Look, Page::Play],
     ),
     ("Notifications", &[Page::Sound, Page::Phone]),
-    ("Work", &[Page::Agents, Page::Todo, Page::History]),
+    (
+        "Work",
+        &[Page::Agents, Page::Todo, Page::Schedule, Page::History],
+    ),
     ("Connect", &[Page::Connect]),
 ];
 #[cfg(test)]
@@ -190,6 +231,8 @@ pub enum Action {
     OpenUrl(String),
     /// Forgets finished agent sessions.
     ClearSessions,
+    /// A change to the scheduled jobs.
+    Cron(CronEdit),
     RemoveSession(String),
     /// The version in the footer: checks for updates (or restarts into an installed one).
     CheckUpdate,
@@ -223,6 +266,8 @@ pub struct View {
     /// Notifications missed while the dog was hidden (badge on the History tab).
     pub missed: usize,
     pub todos: Vec<crate::todo::List>,
+    /// Scheduled jobs, each with its next run (Unix seconds).
+    pub jobs: Vec<(crate::cron::Job, Option<u64>)>,
     /// What agents are doing.
     pub sessions: Vec<Session>,
     /// A phone channel's last problem.
@@ -247,6 +292,10 @@ pub struct HistoryItem {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Hit {
     Tab(Page),
+    /// A scheduled job's switch, Run now and ✕ (job id).
+    JobToggle(u64),
+    JobRun(u64),
+    JobRemove(u64),
     /// A session on the Agents page (index): opens it; and its ✕.
     Session(usize),
     RemoveSession(usize),
@@ -291,6 +340,9 @@ enum TextField {
     NewList,
     NtfyServer,
     NtfyTopic,
+    /// A new scheduled job: its schedule and what it does (text, URL or command).
+    JobSchedule,
+    JobWhat,
     /// The workspace tools' root folder, and a folder to allow.
     LocalRoot,
     AddLocalDir,
@@ -336,6 +388,9 @@ enum Field {
     /// The workspace tools: what to ask about, and the commands' time limit.
     LocalApprove,
     LocalTimeLimit,
+    /// A new job: its kind, and a quick schedule.
+    JobKind,
+    JobPreset,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -359,6 +414,8 @@ enum Toggle {
     Telegram,
     LocalMcp,
     LocalReadOnly,
+    /// A new job tells about every run, not only failures.
+    JobNotifyAlways,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -378,6 +435,7 @@ enum Button {
     ReplySend,
     ReplyCancel,
     ClearSessions,
+    AddJob,
 }
 
 /// A key typed while a text field is being edited.
@@ -422,6 +480,8 @@ pub struct Panel {
     cw: f32,
     /// The question being answered in words: (id, title, question), and the page to go back to.
     reply: Option<(u64, String, String, Page)>,
+    /// The new job being put together on the Schedule page.
+    job: JobDraft,
     /// Draws an arrow at the top pointing at this x (physical, panel-relative).
     arrow: Option<f32>,
     /// Missed while hidden; shown as a badge on History.
@@ -449,6 +509,7 @@ impl Panel {
             cx: 0.0,
             cw: 0.0,
             reply: None,
+            job: JobDraft::default(),
             arrow: None,
             missed: 0,
             editing: None,
@@ -572,6 +633,16 @@ impl Panel {
                     s.mcp_addr = t.to_string();
                 }
             }
+            TextField::JobSchedule => {
+                self.job.schedule = t.to_string();
+                self.job.error = None;
+                return None;
+            }
+            TextField::JobWhat => {
+                self.job.what = t.to_string();
+                self.job.error = None;
+                return None;
+            }
             TextField::LocalRoot => s.local_mcp.root = t.to_string(),
             TextField::AddLocalDir => {
                 if !t.is_empty() && !s.local_mcp.allowed_dirs.iter().any(|d| d == t) {
@@ -663,7 +734,7 @@ impl Panel {
     }
 
     /// The text a field starts with when clicked.
-    fn field_value(f: TextField, s: &Settings) -> String {
+    fn field_value(&self, f: TextField, s: &Settings) -> String {
         match f {
             TextField::Name => s.name.clone(),
             TextField::Birthday => s.birthday.clone(),
@@ -673,6 +744,8 @@ impl Panel {
             TextField::McpAddr => s.mcp_addr.clone(),
             TextField::NtfyServer => s.phone.ntfy.server.clone(),
             TextField::LocalRoot => s.local_mcp.root.clone(),
+            TextField::JobSchedule => self.job.schedule.clone(),
+            TextField::JobWhat => self.job.what.clone(),
             TextField::AddLocalDir => String::new(),
             TextField::NtfyTopic => s.phone.ntfy.topic.clone(),
             TextField::NtfyToken => s.phone.ntfy.token.clone(),
@@ -847,24 +920,30 @@ impl Panel {
             dot,
         );
         r.draw_text(pm, x + 54.0 * u, y + 20.0 * u, t(label), st);
-        y += 52.0 * u;
+        y += 48.0 * u;
         let missed = self.missed.max(v.missed);
         let waiting = v
             .sessions
             .iter()
             .filter(|s| s.state == SessionState::Waiting)
             .count();
+        // Rows get closer together when the window is too short for all of them.
+        let fy = h - 40.0 * u;
+        let pages_n: usize = SIDEBAR.iter().map(|(_, p)| p.len()).sum();
+        let need = SIDEBAR.len() as f32 * 26.0 * u + pages_n as f32 * 31.0 * u;
+        let k = ((fy - y - 8.0 * u) / need).clamp(0.72, 1.0);
+        let row_h = (30.0 * u * k).max(22.0 * u);
         for (group, pages) in SIDEBAR {
             r.draw_text(
                 pm,
                 x + 8.0 * u,
-                y + 4.0 * u,
+                y + 4.0 * u * k,
                 t(group),
                 sys(11.0 * u, true, MUTED),
             );
-            y += 24.0 * u;
+            y += 22.0 * u * k;
             for &page in pages {
-                let Some(row) = Rect::from_xywh(x, y, sw - 2.0 * x, 30.0 * u) else {
+                let Some(row) = Rect::from_xywh(x, y, sw - 2.0 * x, row_h) else {
                     continue;
                 };
                 let on = self.page == page
@@ -885,12 +964,14 @@ impl Panel {
                     u,
                     if on { ACCENT_INK } else { MUTED },
                 );
+                let st = sys(13.0 * u, on, c);
+                let (_, th) = r.measure(t(page.title()), st);
                 r.draw_text(
                     pm,
                     row.left() + 36.0 * u,
-                    row.top() + 6.0 * u,
+                    (row.top() + (row.height() - th) / 2.0).round(),
                     t(page.title()),
-                    sys(13.0 * u, on, c),
+                    st,
                 );
                 let badge = match page {
                     Page::History => missed,
@@ -902,47 +983,35 @@ impl Panel {
                         pm,
                         r,
                         row.right() - 14.0 * u,
-                        row.top() + 15.0 * u,
+                        row.top() + row.height() / 2.0,
                         badge,
                         u,
                     );
                 }
                 self.hits.push((row, hit));
-                y += 32.0 * u;
+                y += row_h + 1.0 * u;
             }
-            y += 8.0 * u;
+            y += 4.0 * u * k;
         }
-        // Footer of the sidebar: settings file, quit and the version.
-        let fy = h - 64.0 * u;
-        let mut ly = fy;
-        for (label, b) in [
-            ("Open settings file", Button::OpenDir),
-            ("Quit", Button::Quit),
-        ] {
-            let hover = self.hover == Some(Hit::Button(b));
-            let color = match (b, hover) {
-                (Button::Quit, true) => DANGER,
-                (_, true) => INK,
-                _ => MUTED,
-            };
-            let st = sys(12.0 * u, false, color);
-            let (tw, th) = r.measure(t(label), st);
-            if let Some(rect) = Rect::from_xywh(x, ly, tw + 16.0 * u, 22.0 * u) {
-                if hover {
-                    fill_round(pm, Some(rect), 6.0 * u, HOVER);
-                }
-                r.draw_text(
-                    pm,
-                    rect.left() + 8.0 * u,
-                    (rect.top() + (rect.height() - th) / 2.0).round(),
-                    t(label),
-                    st,
-                );
-                self.hits.push((rect, Hit::Button(b)));
+        // Footer of the sidebar: Quit and the version (the settings file is under General).
+        let b = Button::Quit;
+        let hover = self.hover == Some(Hit::Button(b));
+        let st = sys(12.0 * u, false, if hover { DANGER } else { MUTED });
+        let (tw, th) = r.measure(t("Quit"), st);
+        if let Some(rect) = Rect::from_xywh(x, fy, tw + 16.0 * u, 22.0 * u) {
+            if hover {
+                fill_round(pm, Some(rect), 6.0 * u, HOVER);
             }
-            ly += 24.0 * u;
+            r.draw_text(
+                pm,
+                rect.left() + 8.0 * u,
+                (rect.top() + (rect.height() - th) / 2.0).round(),
+                t("Quit"),
+                st,
+            );
+            self.hits.push((rect, Hit::Button(b)));
         }
-        self.version_link(pm, r, sw - 12.0 * u, fy + 24.0 * u, v);
+        self.version_link(pm, r, sw - 12.0 * u, fy, v);
 
         // The page.
         let px = sw + 28.0 * u;
@@ -989,6 +1058,7 @@ impl Panel {
                 Page::Phone => self.page_phone(c, r, cy, x, inner, v),
                 Page::Agents => self.page_agents(c, r, cy, x, inner, v),
                 Page::Todo => self.tab_todo(c, r, cy, x, inner, v),
+                Page::Schedule => self.page_schedule(c, r, cy, x, inner, v),
                 Page::History => self.tab_history(c, r, cy, x, inner, v),
                 Page::Connect => self.tab_connect(c, r, cy, x, inner, v),
                 Page::Reply => self.page_reply(c, r, cy, x, inner, v),
@@ -1994,7 +2064,7 @@ impl Panel {
         cy += 6.0 * u + GAP * u;
         if self.window {
             cy = self.section(pm, r, cy, x, "App");
-            let start = self.card(pm, cy, 2);
+            let start = self.card(pm, cy, 3);
             cy = self.toggle_row(
                 pm,
                 r,
@@ -2015,6 +2085,12 @@ impl Panel {
                 s.auto_update,
                 Toggle::AutoUpdate,
             );
+            let st = sys(13.0 * u, false, INK);
+            r.draw_text(pm, x + 12.0 * u, cy + 8.0 * u, t("Settings file"), st);
+            let open = if i18n::is_turkish() { "Aç" } else { "Open" };
+            let b = Rect::from_xywh(x + inner - 70.0 * u, cy + 4.0 * u, 62.0 * u, 24.0 * u);
+            self.button(pm, r, b, open, Button::OpenDir, true);
+            cy += ROW * u;
         }
         cy
     }
@@ -2370,6 +2446,283 @@ impl Panel {
             cy += 34.0 * u;
         }
         cy
+    }
+
+    /// Scheduled jobs: each with its schedule, next run and last result; a form to add one.
+    fn page_schedule(
+        &mut self,
+        pm: &mut Pixmap,
+        r: &mut Renderer,
+        y: f32,
+        x: f32,
+        inner: f32,
+        v: &View,
+    ) -> f32 {
+        let u = self.ui;
+        let tr = i18n::is_turkish();
+        let mut cy = y;
+        if v.jobs.is_empty() {
+            cy = self.note(
+                pm,
+                r,
+                cy,
+                x,
+                if tr {
+                    "Henüz iş yok. Aşağıdan ekle ya da bir ajana sor:"
+                } else {
+                    "No jobs yet. Add one below, or ask an agent:"
+                },
+            );
+            cy = self.note(
+                pm,
+                r,
+                cy,
+                x,
+                if tr {
+                    "“hafta içi her sabah 9'da standup'ı hatırlat”."
+                } else {
+                    "“remind me of the standup on weekdays at 9”."
+                },
+            );
+            cy += GAP * u / 2.0;
+        } else {
+            let row_h = SESSION_ROW * u;
+            if let Some(card) = Rect::from_xywh(self.cx, cy, self.cw, v.jobs.len() as f32 * row_h) {
+                fill_card(pm, Some(card), u);
+            }
+            let now = crate::watch::now_unix();
+            for (i, (job, next)) in v.jobs.iter().enumerate() {
+                let ry = cy + i as f32 * row_h;
+                if i > 0
+                    && let Some(rule) = Rect::from_xywh(x + 12.0 * u, ry, inner - 24.0 * u, 1.0)
+                {
+                    fill_round(pm, Some(rule), 0.0, TRACK);
+                }
+                // Right side: run now, on/off, remove.
+                let right = x + inner - 8.0 * u;
+                let rm = Rect::from_xywh(right - 24.0 * u, ry + 11.0 * u, 24.0 * u, 24.0 * u);
+                if let Some(rect) = rm {
+                    let hit = Hit::JobRemove(job.id);
+                    if self.hover == Some(hit) {
+                        fill_round(pm, Some(rect), 7.0 * u, HOVER);
+                    }
+                    let c = if self.hover == Some(hit) {
+                        DANGER
+                    } else {
+                        MUTED
+                    };
+                    draw_glyph(
+                        pm,
+                        Glyph::Close,
+                        rect.left() + rect.width() / 2.0,
+                        rect.top() + rect.height() / 2.0,
+                        u * 0.8,
+                        c,
+                    );
+                    self.hits.push((rect, hit));
+                }
+                let sw_x = right - 24.0 * u - 44.0 * u;
+                if let Some(sw) = Rect::from_xywh(sw_x, ry + 14.0 * u, 34.0 * u, 18.0 * u) {
+                    fill_round(
+                        pm,
+                        Some(sw),
+                        9.0 * u,
+                        if job.enabled { ACCENT } else { TRACK },
+                    );
+                    let kx = if job.enabled {
+                        sw_x + 18.0 * u
+                    } else {
+                        sw_x + 2.0 * u
+                    };
+                    fill_round(
+                        pm,
+                        Rect::from_xywh(kx, ry + 16.0 * u, 14.0 * u, 14.0 * u),
+                        7.0 * u,
+                        CARD,
+                    );
+                    if let Some(hit_r) =
+                        Rect::from_xywh(sw_x - 4.0 * u, ry + 8.0 * u, 42.0 * u, 30.0 * u)
+                    {
+                        self.hits.push((hit_r, Hit::JobToggle(job.id)));
+                    }
+                }
+                let run_label = if tr { "Çalıştır" } else { "Run" };
+                let st = sys(11.0 * u, false, MUTED);
+                let (rw, _) = r.measure(run_label, st);
+                let run_x = sw_x - rw - 22.0 * u;
+                if let Some(rect) = Rect::from_xywh(run_x, ry + 12.0 * u, rw + 14.0 * u, 22.0 * u) {
+                    let hit = Hit::JobRun(job.id);
+                    let c = if self.hover == Some(hit) {
+                        fill_round(pm, Some(rect), 6.0 * u, HOVER);
+                        INK
+                    } else {
+                        MUTED
+                    };
+                    r.draw_text(
+                        pm,
+                        rect.left() + 7.0 * u,
+                        ry + 15.0 * u,
+                        run_label,
+                        sys(11.0 * u, false, c),
+                    );
+                    self.hits.push((rect, hit));
+                }
+                // Left side: a dot for the last result, the name, the schedule and runs.
+                let dot = match &job.last {
+                    _ if !job.enabled => TRACK,
+                    Some(l) if !l.ok => DANGER,
+                    Some(_) => AWAKE,
+                    None => ACCENT,
+                };
+                let d = 8.0 * u;
+                fill_round(
+                    pm,
+                    Rect::from_xywh(x + 14.0 * u, ry + 11.0 * u, d, d),
+                    d / 2.0,
+                    dot,
+                );
+                let tx = x + 30.0 * u;
+                let text_w = run_x - tx - 8.0 * u;
+                let st = sys(12.5 * u, true, if job.enabled { INK } else { MUTED });
+                let kind = match job.action {
+                    crate::cron::Action::Notify { .. } => "🔔",
+                    crate::cron::Action::Http { .. } => "↗",
+                    crate::cron::Action::Command { .. } => "$",
+                };
+                let shown = fit(r, &format!("{kind} {}", job.name), st, text_w);
+                r.draw_text(pm, tx, ry + 5.0 * u, &shown, st);
+                let when = crate::cron::Schedule::parse(&job.schedule)
+                    .map(|sc| sc.describe(tr))
+                    .unwrap_or_else(|_| job.schedule.clone());
+                let mut line = when;
+                if let Some(t) = next.filter(|_| job.enabled) {
+                    let left = crate::watch::human_secs(t.saturating_sub(now));
+                    line += &if tr {
+                        format!(" · {left} sonra")
+                    } else {
+                        format!(" · in {left}")
+                    };
+                }
+                if let Some(l) = &job.last {
+                    let ago = crate::watch::human_secs(now.saturating_sub(l.at));
+                    let res = if l.ok { "✓" } else { "✗" };
+                    line += &if tr {
+                        format!(" · son {res} {ago} önce")
+                    } else {
+                        format!(" · last {res} {ago} ago")
+                    };
+                }
+                let st = sys(11.0 * u, false, MUTED);
+                let shown = fit(r, &line, st, text_w);
+                r.draw_text(pm, tx, ry + 25.0 * u, &shown, st);
+            }
+            cy += v.jobs.len() as f32 * row_h + GAP * u;
+        }
+
+        // A new job.
+        cy = self.section(pm, r, cy, x, "New job");
+        // Requests and commands also get "Tell me every run".
+        let rows = if self.job.kind == 0 { 4 } else { 5 };
+        let start = self.card(pm, cy, rows);
+        cy = self.choice_row(
+            pm,
+            r,
+            start,
+            x,
+            inner,
+            "Kind",
+            Field::JobKind,
+            &JOB_KINDS,
+            Some(self.job.kind),
+        );
+        let (label, hint) = match self.job.kind {
+            0 => (
+                "Text",
+                if tr {
+                    "Standup'a katıl"
+                } else {
+                    "Join the standup"
+                },
+            ),
+            1 => ("URL", "https://example.com/health"),
+            _ => ("Command", "./backup.sh"),
+        };
+        cy = self.text_row(
+            pm,
+            r,
+            cy,
+            x,
+            inner,
+            label,
+            TextField::JobWhat,
+            &v.settings,
+            None,
+            hint,
+        );
+        cy = self.choice_row(
+            pm,
+            r,
+            cy,
+            x,
+            inner,
+            "Repeat",
+            Field::JobPreset,
+            &JOB_PRESETS.map(|(l, _)| l),
+            JOB_PRESETS
+                .iter()
+                .position(|(_, e)| *e == self.job.schedule),
+        );
+        cy = self.text_row(
+            pm,
+            r,
+            cy,
+            x,
+            inner,
+            "Cron",
+            TextField::JobSchedule,
+            &v.settings,
+            None,
+            "*/15 9-17 * * 1-5",
+        );
+        if self.job.kind != 0 {
+            cy = self.toggle_row(
+                pm,
+                r,
+                cy,
+                x,
+                inner,
+                if tr {
+                    "Her çalışmada haber ver"
+                } else {
+                    "Tell me every run"
+                },
+                self.job.notify_always,
+                Toggle::JobNotifyAlways,
+            );
+        }
+        // What the schedule means, or what is wrong.
+        let (msg, c) = match (
+            &self.job.error,
+            crate::cron::Schedule::parse(&self.job.schedule),
+        ) {
+            (Some(e), _) => (e.clone(), DANGER),
+            (None, Ok(sc)) if !self.job.schedule.is_empty() => (sc.describe(tr), MUTED),
+            (None, Err(e)) if !self.job.schedule.is_empty() => (e, DANGER),
+            _ => (
+                if tr {
+                    "dakika saat gün ay haftanın günü".to_string()
+                } else {
+                    "minute hour day month weekday".to_string()
+                },
+                MUTED,
+            ),
+        };
+        let st = sys(11.5 * u, false, c);
+        let shown = fit(r, &msg, st, inner - 130.0 * u);
+        r.draw_text(pm, x + 4.0 * u, cy + 12.0 * u, &shown, st);
+        let add = Rect::from_xywh(x + inner - 110.0 * u, cy + 6.0 * u, 110.0 * u, 28.0 * u);
+        self.button(pm, r, add, "Add", Button::AddJob, false);
+        cy + 44.0 * u
     }
 
     /// Answering a question in words: the question, a field and Send / Cancel.
@@ -2818,7 +3171,7 @@ impl Panel {
             border,
             if editing.is_some() { 1.5 * u } else { 1.0 },
         );
-        let mut value = Self::field_value(f, s);
+        let mut value = self.field_value(f, s);
         if f.secret() && editing.is_none() && !value.is_empty() {
             value = "•".repeat(value.chars().count().min(16));
         }
@@ -3182,7 +3535,7 @@ impl Panel {
             };
             self.editing = Some(Editing {
                 field: f,
-                text: Self::field_value(f, s),
+                text: self.field_value(f, s),
                 since: std::time::Instant::now(),
             });
             return saved;
@@ -3221,6 +3574,12 @@ impl Panel {
                     .and_then(|s| s.open.clone())
                     .map(Action::OpenUrl);
             }
+            Hit::JobToggle(id) => {
+                let on = v.jobs.iter().any(|(j, _)| j.id == id && j.enabled);
+                return Some(Action::Cron(CronEdit::Enable(id, !on)));
+            }
+            Hit::JobRun(id) => return Some(Action::Cron(CronEdit::Run(id))),
+            Hit::JobRemove(id) => return Some(Action::Cron(CronEdit::Remove(id))),
             Hit::RemoveSession(i) => {
                 return v
                     .sessions
@@ -3308,6 +3667,19 @@ impl Panel {
                 Field::LocalTimeLimit => {
                     s.local_mcp.time_limit_secs = crate::local::TIME_LIMITS[i].0
                 }
+                Field::JobKind => {
+                    if self.job.kind != i {
+                        self.job.kind = i;
+                        self.job.what.clear();
+                        self.job.error = None;
+                    }
+                    return None;
+                }
+                Field::JobPreset => {
+                    self.job.schedule = JOB_PRESETS[i].1.into();
+                    self.job.error = None;
+                    return None;
+                }
                 Field::Theme => s.theme = Theme::ALL[i].0,
                 Field::Browsers => {
                     self.custom_origins = i == 2;
@@ -3354,6 +3726,10 @@ impl Panel {
                 Toggle::Telegram => s.phone.telegram.enabled = !s.phone.telegram.enabled,
                 Toggle::LocalMcp => s.local_mcp.enabled = !s.local_mcp.enabled,
                 Toggle::LocalReadOnly => s.local_mcp.read_only = !s.local_mcp.read_only,
+                Toggle::JobNotifyAlways => {
+                    self.job.notify_always = !self.job.notify_always;
+                    return None;
+                }
                 Toggle::Autostart => return Some(Action::ToggleAutostart),
             },
             Hit::Slider => return None,
@@ -3372,6 +3748,7 @@ impl Panel {
                     Button::CopyTopic => Action::CopyText(ntfy_link(&s)),
                     Button::CopyLocalMcp => Action::CopyText(local_mcp_url(&s)),
                     Button::ClearSessions => Action::ClearSessions,
+                    Button::AddJob => return self.add_job(),
                     Button::ReplyCancel => {
                         self.end_reply();
                         return None;
@@ -3381,6 +3758,62 @@ impl Panel {
             }
         }
         (s != v.settings).then(|| Action::Settings(Box::new(s)))
+    }
+
+    /// The Add button of the Schedule page: the draft as a new job, or why it cannot be one.
+    fn add_job(&mut self) -> Option<Action> {
+        let d = &mut self.job;
+        let what = d.what.trim().to_string();
+        let err = |d: &mut JobDraft, en: &str, tr: &str| {
+            d.error = Some(if i18n::is_turkish() { tr } else { en }.to_string());
+            None
+        };
+        if let Err(e) = crate::cron::Schedule::parse(d.schedule.trim()) {
+            return if d.schedule.trim().is_empty() {
+                err(d, "Pick when it repeats.", "Ne zaman tekrarlanacağını seç.")
+            } else {
+                d.error = Some(e);
+                None
+            };
+        }
+        if what.is_empty() {
+            return err(d, "Fill in what it does.", "Ne yapacağını yaz.");
+        }
+        let action = match d.kind {
+            0 => crate::cron::Action::Notify {
+                title: what,
+                message: String::new(),
+                sticky: false,
+            },
+            1 => {
+                if !(what.starts_with("http://") || what.starts_with("https://")) {
+                    return err(
+                        d,
+                        "The URL must start with http:// or https://.",
+                        "Adres http:// ya da https:// ile başlamalı.",
+                    );
+                }
+                crate::cron::Action::Http {
+                    method: "GET".into(),
+                    url: what,
+                    headers: Vec::new(),
+                    body: None,
+                    expect_status: None,
+                    contains: None,
+                }
+            }
+            _ => crate::cron::Action::Command {
+                command: what,
+                workdir: None,
+            },
+        };
+        let edit = CronEdit::Add {
+            schedule: d.schedule.trim().to_string(),
+            action,
+            always: d.notify_always,
+        };
+        *d = JobDraft::default();
+        Some(Action::Cron(edit))
     }
 
     fn hit(&self, x: f32, y: f32) -> Option<Hit> {
@@ -3651,6 +4084,8 @@ enum Glyph {
     Phone,
     /// Two heads: the Agents page.
     Agents,
+    /// A calendar page: Schedule.
+    Calendar,
 }
 
 fn draw_glyph(pm: &mut Pixmap, g: Glyph, cx: f32, cy: f32, u: f32, c: ColorU8) {
@@ -3852,6 +4287,30 @@ fn draw_glyph(pm: &mut Pixmap, g: Glyph, cx: f32, cy: f32, u: f32, c: ColorU8) {
             pb.move_to(x0, y0);
             pb.quad_to(xm, ym, x1, y1);
             stroke(pm, pb, 1.8);
+        }
+        Glyph::Calendar => {
+            let (bx, by) = p(-6.5, -5.5);
+            if let Some(r) = Rect::from_xywh(bx, by, 13.0 * u, 12.0 * u)
+                && let Some(path) = round_rect(r, 2.0 * u)
+            {
+                let st = Stroke {
+                    width: 1.6 * u,
+                    ..Stroke::default()
+                };
+                pm.stroke_path(&path, &paint(c), &st, Transform::identity(), None);
+            }
+            let mut pb = PathBuilder::new();
+            for xx in [-3.0, 3.0] {
+                let (x0, y0) = p(xx, -7.5);
+                let (x1, y1) = p(xx, -3.5);
+                pb.move_to(x0, y0);
+                pb.line_to(x1, y1);
+            }
+            let (x0, y0) = p(-6.5, -1.5);
+            let (x1, y1) = p(6.5, -1.5);
+            pb.move_to(x0, y0);
+            pb.line_to(x1, y1);
+            stroke(pm, pb, 1.6);
         }
     }
 }

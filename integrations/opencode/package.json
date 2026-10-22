@@ -1,6 +1,6 @@
 {
   "name": "opencode-dost",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "OpenCode plugin: the Dost desktop dog barks when OpenCode needs you, lets you answer permission requests from its bubble and shows progress of long tasks.",
   "type": "module",
   "exports": {

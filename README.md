@@ -28,7 +28,7 @@ bubble to dismiss it.
 Bark when OpenCode asks a question or needs permission (answer it from the bubble), show progress of long tasks, and tell when they finish or fail:
 
 ```sh
-opencode plugin add 'github:rytsh/dost::path:integrations/opencode'
+opencode plugin add 'github:rytsh/dost#main::path:integrations/opencode'
 ```
 
 Details in the [plugin's README](integrations/opencode/README.md).
@@ -107,6 +107,7 @@ watches that run shell commands, so only allow pages you trust.
 | `react` | Happy, sad, bark, fetch (throws the bone), sleep, wake or zoomies. |
 | `copy` | Puts text on the clipboard and says so. |
 | `status` · `history` | What the dog is doing, how long you have been idle, and what you may have missed. |
+| `cron_add` · `cron_list` · `cron_remove` · `cron_run` · `cron_enable` | Repeating jobs on a cron schedule: reminders, HTTP requests and commands (see Schedule). |
 | `session` · `sessions` | An agent says what its session is doing (working, waiting, done, failed); you follow them all in **Agents**. `notify`, `ask` and `progress` take a `session` too. |
 | `check_now` · `list_watches` · `remove_watch` | Manage watches and reminders. |
 | `todo_lists` · `todo_create_list` · `todo_add` · `todo_update` · `todo_remove` | Todo lists the dog keeps for you: a list per piece of work, items to check off, and a reminder per item (the dog barks it unless it is done by then). |
@@ -122,6 +123,17 @@ does not bark and only shows questions, progress and sticky messages; the rest g
 
 > [!WARNING]
 > Watches can run shell commands on your computer. Only connect clients you trust.
+
+## Schedule
+
+Settings → **Schedule** runs jobs on a cron schedule, in your local time: a **reminder** (the dog
+barks), an HTTP **request** (a health check, a webhook) or a **command** (a backup script). Pick a
+quick schedule (hourly, daily at 9, weekdays, Mondays) or write a cron expression
+(`*/15 9-17 * * 1-5`: every 15 minutes, 9 to 17, Monday to Friday; or `@daily`). Requests and
+commands bark when they fail (or every time, if you like), and every run goes to History. Each job
+can be paused, run now or removed. Agents add jobs with the MCP tools `cron_add`, `cron_list`,
+`cron_remove`, `cron_run` and `cron_enable`. Runs missed while Dost was not running are not made
+up.
 
 ## Workspace tools
 

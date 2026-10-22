@@ -1,5 +1,6 @@
 pub mod app;
 pub mod cli;
+pub mod cron;
 pub mod dog;
 pub mod i18n;
 pub mod local;

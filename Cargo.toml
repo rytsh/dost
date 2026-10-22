@@ -1,6 +1,6 @@
 [package]
 name = "dost"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.88"
 repository = "https://github.com/rytsh/dost"
@@ -22,6 +22,7 @@ ignore = "0.4.33"
 globset = "0.4.20"
 regex = "1.13.1"
 similar = "3.2.0"
+croner = "4"
 
 # HTTPS for watch checks: rustls on Windows/Linux, the system TLS on macOS.
 [target.'cfg(not(target_os = "macos"))'.dependencies]
