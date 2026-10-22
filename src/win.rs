@@ -90,6 +90,8 @@ struct AloneBubble {
 struct MenuItems {
     show: MenuItem,
     mute: MenuItem,
+    panel: MenuItem,
+    quit: MenuItem,
 }
 
 thread_local! {
@@ -177,15 +179,17 @@ fn build_menu() -> (Menu, MenuItems) {
     let items = MenuItems {
         show: MenuItem::with_id("show", "Hide", true, None),
         mute: MenuItem::with_id("mute", "Mute", true, None),
+        panel: MenuItem::with_id("panel", "Settings…", true, None),
+        quit: MenuItem::with_id("quit", "Quit Dost", true, None),
     };
     let menu = Menu::new();
     menu.append_items(&[
-        &MenuItem::with_id("panel", "Settings…", true, None),
+        &items.panel,
         &PredefinedMenuItem::separator(),
         &items.show,
         &items.mute,
         &PredefinedMenuItem::separator(),
-        &MenuItem::with_id("quit", "Quit Dost", true, None),
+        &items.quit,
     ])
     .expect("menu");
     (menu, items)
@@ -650,14 +654,17 @@ impl App {
     }
 
     fn sync_menu(&mut self) {
+        use dost::i18n::t;
         let i = &self.shell.items;
         i.show
-            .set_text(if self.core.visible { "Hide" } else { "Show" });
+            .set_text(t(if self.core.visible { "Hide" } else { "Show" }));
         i.mute.set_text(if self.core.settings.sound {
-            "Mute"
+            t("Mute")
         } else {
-            "Unmute"
+            t("Unmute")
         });
+        i.panel.set_text(t("Settings…"));
+        i.quit.set_text(t("Quit Dost"));
         self.shell.panel.redraw = true;
         self.shell.settings.redraw = true;
     }
@@ -1304,6 +1311,10 @@ const SETTINGS_MIN: (f32, f32) = (640.0, 460.0);
 const VK_BACK: WPARAM = 0x08;
 const VK_RETURN: WPARAM = 0x0D;
 const VK_ESCAPE: WPARAM = 0x1B;
+const VK_UP: WPARAM = 0x26;
+const VK_DOWN: WPARAM = 0x28;
+const VK_HOME: WPARAM = 0x24;
+const VK_END: WPARAM = 0x23;
 
 impl PanelWindow {
     fn is_open(&self) -> bool {
@@ -1525,12 +1536,10 @@ unsafe fn create_panel_window() -> HWND {
 
 unsafe fn create_settings_window(x: i32, y: i32, w: i32, h: i32) -> HWND {
     let class: Vec<u16> = SETTINGS_CLASS.encode_utf16().chain(Some(0)).collect();
-    let title = if dost::i18n::is_turkish() {
-        "Dost Ayarları"
-    } else {
-        "Dost Settings"
-    };
-    let title: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
+    let title: Vec<u16> = dost::i18n::t("Dost Settings")
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
     unsafe {
         let hinstance = register_class(&class, Some(settings_proc));
         CreateWindowExW(
@@ -1556,6 +1565,10 @@ fn panel_key_of(msg: u32, wp: WPARAM) -> Option<panel::Key> {
     match (msg, wp) {
         (WM_KEYDOWN, VK_BACK) => Some(panel::Key::Backspace),
         (WM_KEYDOWN, VK_RETURN) => Some(panel::Key::Enter),
+        (WM_KEYDOWN, VK_UP) => Some(panel::Key::Up),
+        (WM_KEYDOWN, VK_DOWN) => Some(panel::Key::Down),
+        (WM_KEYDOWN, VK_HOME) => Some(panel::Key::Home),
+        (WM_KEYDOWN, VK_END) => Some(panel::Key::End),
         (WM_CHAR, 0x16) => clipboard::get_text().map(panel::Key::Text),
         (WM_CHAR, _) => char::from_u32(wp as u32)
             .filter(|c| !c.is_control())

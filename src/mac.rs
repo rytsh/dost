@@ -907,16 +907,13 @@ impl App {
         let i = &self.shell.items;
         i.show
             .set_text(t(if self.core.visible { "Hide" } else { "Show" }));
-        let tr = dost::i18n::is_turkish();
-        i.mute.set_text(match (self.core.settings.sound, tr) {
-            (true, false) => "Mute",
-            (false, false) => "Unmute",
-            (true, true) => "Sesi kapat",
-            (false, true) => "Sesi aç",
+        i.mute.set_text(if self.core.settings.sound {
+            t("Mute")
+        } else {
+            t("Unmute")
         });
         i.settings.set_text(t("All settings…"));
-        i.quit
-            .set_text(if tr { "Dost'tan çık" } else { "Quit Dost" });
+        i.quit.set_text(t("Quit Dost"));
         self.shell.panel.redraw = true;
         self.shell.settings.redraw = true;
     }
@@ -1372,6 +1369,10 @@ fn install_mouse_monitor() {
                         53 => panel::Key::Escape,
                         36 | 76 => panel::Key::Enter,
                         51 => panel::Key::Backspace,
+                        126 => panel::Key::Up,
+                        125 => panel::Key::Down,
+                        115 => panel::Key::Home,
+                        119 => panel::Key::End,
                         9 if cmd => {
                             let pb = NSPasteboard::generalPasteboard();
                             let s = pb.stringForType(unsafe { NSPasteboardTypeString });
@@ -1396,6 +1397,10 @@ fn install_mouse_monitor() {
                     53 => panel::Key::Escape,
                     36 | 76 => panel::Key::Enter,
                     51 => panel::Key::Backspace,
+                    126 => panel::Key::Up,
+                    125 => panel::Key::Down,
+                    115 => panel::Key::Home,
+                    119 => panel::Key::End,
                     // ⌘V: paste.
                     9 if cmd => {
                         let pb = NSPasteboard::generalPasteboard();
@@ -1598,12 +1603,7 @@ impl SettingsWindow {
             )
         };
         unsafe { window.setReleasedWhenClosed(false) };
-        let title = if dost::i18n::is_turkish() {
-            "Dost Ayarları"
-        } else {
-            "Dost Settings"
-        };
-        window.setTitle(&NSString::from_str(title));
+        window.setTitle(&NSString::from_str(dost::i18n::t("Dost Settings")));
         window.setContentMinSize(NSSize::new(640.0, 460.0));
         window.setAcceptsMouseMovedEvents(true);
         // Centred the first time; after that where the user left it.

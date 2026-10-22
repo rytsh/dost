@@ -382,6 +382,24 @@ pub fn human_secs(s: u64) -> String {
     }
 }
 
+/// [`human_secs`] in the app's language (for the panel; agents get English).
+pub fn human_secs_t(s: u64) -> String {
+    use crate::i18n::tf;
+    let n = |v: u64| v.to_string();
+    match s {
+        0..60 => tf("{n} s", &[("n", &n(s))]),
+        60..3600 => tf("{n} min", &[("n", &n(s.div_ceil(60)))]),
+        _ => {
+            let (h, m) = (s / 3600, (s % 3600) / 60);
+            if m == 0 {
+                tf("{n} h", &[("n", &n(h))])
+            } else {
+                tf("{n} h {m} min", &[("n", &n(h)), ("m", &n(m))])
+            }
+        }
+    }
+}
+
 /// The run's state from the GitHub API. Detail: "<conclusion> · <name> · <url>" when done.
 /// Uses $GITHUB_TOKEN / $GH_TOKEN when set (needed for private repos, raises rate limits).
 fn check_github(

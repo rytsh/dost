@@ -8,6 +8,7 @@ use std::sync::Mutex;
 use chrono::{Datelike, NaiveDate, Timelike};
 use serde::{Deserialize, Serialize};
 
+use crate::i18n::{t, tf};
 use crate::special::Pin;
 
 /// The built-in days, each with its own switch.
@@ -323,7 +324,7 @@ impl Days {
     /// Bubbles due at local time `now` that were not shown yet today: each day's own at its
     /// time, and the "in N days" reminders. Marks them shown (also saved, so a restart does
     /// not repeat them); removes one-off days once they are over.
-    pub fn take_due(&self, now: chrono::NaiveDateTime, turkish: bool) -> Vec<Due> {
+    pub fn take_due(&self, now: chrono::NaiveDateTime) -> Vec<Due> {
         let today = now.date();
         let minute = now.hour() * 60 + now.minute();
         let mut st = self.state.lock().unwrap();
@@ -345,7 +346,7 @@ impl Days {
                 if !falls_on(d, date) || st.shown.contains(&key) {
                     continue;
                 }
-                let (title, body) = texts(d, date, before, turkish);
+                let (title, body) = texts(d, date, before);
                 out.push(Due {
                     id: d.id,
                     days_before: before,
@@ -450,7 +451,7 @@ const EN_MONTHS: [&str; 12] = [
     "December",
 ];
 
-/// Turkish month names with their "on" suffix.
+/// Turkish month names with their "on" suffix (Turkish grammar).
 const TR_MONTHS: [&str; 12] = [
     "Ocak'ta",
     "Şubat'ta",
@@ -466,29 +467,47 @@ const TR_MONTHS: [&str; 12] = [
     "Aralık'ta",
 ];
 
+/// "14 March" in the app's language (month names are translated).
+pub fn day_month(day: u32, month: u32) -> String {
+    let m = match month {
+        1 => t("January"),
+        2 => t("February"),
+        3 => t("March"),
+        4 => t("April"),
+        5 => t("May"),
+        6 => t("June"),
+        7 => t("July"),
+        8 => t("August"),
+        9 => t("September"),
+        10 => t("October"),
+        11 => t("November"),
+        _ => t("December"),
+    };
+    tf("{n} {month}", &[("n", &day.to_string()), ("month", m)])
+}
+
 /// The bubble for a day on `date`, `before` days ahead (0: today): (title, body).
-fn texts(d: &Day, date: NaiveDate, before: u32, turkish: bool) -> (String, String) {
+fn texts(d: &Day, date: NaiveDate, before: u32) -> (String, String) {
     let name = d.name.as_str();
+    let turkish = crate::i18n::is_turkish();
     if before > 0 {
-        let title = match (turkish, before) {
-            (false, 1) => format!("{name} tomorrow"),
-            (false, n) => format!("{name} in {n} days"),
-            (true, 1) => format!("Yarın: {name}"),
-            (true, n) => format!("{n} gün sonra: {name}"),
+        let n = before.to_string();
+        let title = match before {
+            1 => tf("{name} tomorrow", &[("name", name)]),
+            _ => tf("{name} in {n} days", &[("name", name), ("n", &n)]),
         };
-        let kind = match (d.kind, turkish) {
-            (Kind::Birthday, false) => "Birthday",
-            (Kind::Birthday, true) => "Doğum günü",
-            (Kind::Anniversary, false) => "Anniversary",
-            (Kind::Anniversary, true) => "Yıl dönümü",
+        let kind = match d.kind {
+            Kind::Birthday => t("Birthday"),
+            Kind::Anniversary => t("Anniversary"),
             _ => name,
         };
-        let m = date.month0() as usize;
-        let body = if turkish {
-            format!("{kind} {} {}.", date.day(), TR_MONTHS[m])
+        // Turkish puts "on" on the month: 14 Mart'ta.
+        let on = if turkish {
+            format!("{} {}", date.day(), TR_MONTHS[date.month0() as usize])
         } else {
-            format!("{kind} on {} {}.", date.day(), EN_MONTHS[m])
+            day_month(date.day(), date.month())
         };
+        let body = tf("{name} on {date}.", &[("name", kind), ("date", &on)]);
         return (title, body);
     }
     let years = d
@@ -496,32 +515,34 @@ fn texts(d: &Day, date: NaiveDate, before: u32, turkish: bool) -> (String, Strin
         .filter(|_| !d.once)
         .map(|y| date.year() - y)
         .filter(|n| *n > 0);
-    let (title, body) = match (d.kind, turkish) {
-        (Kind::Birthday, false) => (
-            format!("🎂 {name}'s birthday"),
+    // Turkish says whose birthday with a suffix: Ayşe'nin.
+    let whose = if turkish {
+        genitive(name)
+    } else {
+        name.to_string()
+    };
+    let (title, body) = match d.kind {
+        Kind::Birthday => (
+            tf("🎂 {name}'s birthday", &[("name", &whose)]),
             match years {
-                Some(n) => format!("{name} is {n} today!"),
-                None => format!("Wish {name} a happy birthday!"),
+                Some(n) => tf(
+                    "{name} is {n} today!",
+                    &[("name", name), ("n", &n.to_string())],
+                ),
+                None => tf("Wish {name} a happy birthday!", &[("name", &whose)]),
             },
         ),
-        (Kind::Birthday, true) => (
-            format!("🎂 {} doğum günü", genitive(name)),
-            match years {
-                Some(n) => format!("{name} bugün {n} yaşında!"),
-                None => format!("{} doğum gününü kutlamayı unutma!", genitive(name)),
-            },
-        ),
-        (Kind::Anniversary, _) => (
+        Kind::Anniversary => (
             format!("💞 {name}"),
-            match (years, turkish) {
-                (Some(n), false) => format!("{n} years today."),
-                (Some(n), true) => format!("Bugün {n}. yıl."),
-                (None, false) => "Today is the day.".into(),
-                (None, true) => "Bugün o gün.".into(),
+            match years {
+                Some(n) => tf("{n} years today.", &[("n", &n.to_string())]),
+                None => t("Today is the day.").into(),
             },
         ),
-        (_, false) => (format!("⭐ {name}"), format!("Today is {name}.")),
-        (_, true) => (format!("⭐ {name}"), format!("Bugün: {name}.")),
+        _ => (
+            format!("⭐ {name}"),
+            tf("Today is {name}.", &[("name", name)]),
+        ),
     };
     let body = if d.message.is_empty() {
         body
@@ -564,6 +585,8 @@ pub fn default_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::i18n::with_lang;
+    use crate::settings::Lang;
 
     fn date(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()
@@ -699,10 +722,10 @@ mod tests {
         n.at = "18:00".into();
         days.add_on(n, date(2026, 10, 1)).unwrap();
         assert!(days.on(date(2027, 10, 22)).is_empty());
-        assert!(days.take_due(at(2026, 10, 22, 17, 0), false).is_empty());
-        assert_eq!(days.take_due(at(2026, 10, 22, 18, 0), false).len(), 1);
+        assert!(days.take_due(at(2026, 10, 22, 17, 0)).is_empty());
+        assert_eq!(days.take_due(at(2026, 10, 22, 18, 0)).len(), 1);
         assert_eq!(days.list_from(date(2026, 10, 22)).len(), 1);
-        assert!(days.take_due(at(2026, 10, 23, 9, 0), false).is_empty());
+        assert!(days.take_due(at(2026, 10, 23, 9, 0)).is_empty());
         assert!(days.list_from(date(2026, 10, 23)).is_empty());
     }
 
@@ -781,8 +804,8 @@ mod tests {
         n.phone = true;
         let d = days.add_on(n, date(2026, 1, 1)).unwrap();
 
-        assert!(days.take_due(at(2026, 3, 11, 9, 59), false).is_empty());
-        let due = days.take_due(at(2026, 3, 11, 10, 0), false);
+        assert!(days.take_due(at(2026, 3, 11, 9, 59)).is_empty());
+        let due = days.take_due(at(2026, 3, 11, 10, 0));
         assert_eq!(
             due,
             [Due {
@@ -793,24 +816,26 @@ mod tests {
                 phone: true,
             }]
         );
-        assert!(days.take_due(at(2026, 3, 11, 12, 0), false).is_empty());
-        assert!(days.take_due(at(2026, 3, 12, 12, 0), false).is_empty());
+        assert!(days.take_due(at(2026, 3, 11, 12, 0)).is_empty());
+        assert!(days.take_due(at(2026, 3, 12, 12, 0)).is_empty());
 
         let again = Days::new(Some(path.clone()));
-        assert!(again.take_due(at(2026, 3, 11, 13, 0), false).is_empty());
-        assert!(again.take_due(at(2026, 3, 14, 9, 0), true).is_empty());
-        let due = again.take_due(at(2026, 3, 14, 10, 30), true);
-        assert_eq!(due.len(), 1);
-        assert_eq!(due[0].days_before, 0);
-        assert_eq!(due[0].title, "🎂 Ayşe'nin doğum günü");
-        assert_eq!(due[0].body, "Ayşe bugün 36 yaşında!");
-        assert!(
-            Days::new(Some(path.clone()))
-                .take_due(at(2026, 3, 14, 23, 0), true)
-                .is_empty()
-        );
+        assert!(again.take_due(at(2026, 3, 11, 13, 0)).is_empty());
+        with_lang(Lang::Tr, || {
+            assert!(again.take_due(at(2026, 3, 14, 9, 0)).is_empty());
+            let due = again.take_due(at(2026, 3, 14, 10, 30));
+            assert_eq!(due.len(), 1);
+            assert_eq!(due[0].days_before, 0);
+            assert_eq!(due[0].title, "🎂 Ayşe'nin doğum günü");
+            assert_eq!(due[0].body, "Ayşe bugün 36 yaşında!");
+            assert!(
+                Days::new(Some(path.clone()))
+                    .take_due(at(2026, 3, 14, 23, 0))
+                    .is_empty()
+            );
+        });
         // Next year again.
-        assert_eq!(again.take_due(at(2027, 3, 14, 10, 0), false).len(), 1);
+        assert_eq!(again.take_due(at(2027, 3, 14, 10, 0)).len(), 1);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -858,7 +883,11 @@ mod tests {
     #[test]
     fn bubble_texts() {
         let on = date(2026, 3, 14);
-        let t = |d: &Day, before, tr| texts(d, on, before, tr);
+        let t = |d: &Day, before, tr: bool| {
+            with_lang(if tr { Lang::Tr } else { Lang::En }, || {
+                texts(d, on, before)
+            })
+        };
         let s = |a: &str, b: &str| (a.to_string(), b.to_string());
 
         let b = day("Oya", Kind::Birthday, Some(2000), "");

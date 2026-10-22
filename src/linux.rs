@@ -784,6 +784,10 @@ const XK_BACKSPACE: u32 = 0xff08;
 const XK_RETURN: u32 = 0xff0d;
 const XK_KP_ENTER: u32 = 0xff8d;
 const XK_ESCAPE: u32 = 0xff1b;
+const XK_UP: u32 = 0xff52;
+const XK_DOWN: u32 = 0xff54;
+const XK_HOME: u32 = 0xff50;
+const XK_END: u32 = 0xff57;
 
 struct Drag {
     start: (i32, i32),
@@ -810,7 +814,7 @@ struct Shell {
     tray: Option<ksni::blocking::Handle<Tray>>,
     tray_rx: Receiver<TrayMsg>,
     /// What the tray shows: (sleeping dog, unread mark, visible, sound, Turkish).
-    tray_state: (bool, bool, bool, bool, bool, u32),
+    tray_state: (bool, bool, bool, bool, &'static str, u32),
     /// Where the tray icon was last clicked, if the host told us.
     tray_anchor: Option<(i32, i32)>,
     panel: PanelWindow,
@@ -877,7 +881,7 @@ pub fn run() {
         screens_at: Instant::now(),
         tray,
         tray_rx,
-        tray_state: (false, false, true, true, false, u32::MAX),
+        tray_state: (false, false, true, true, "", u32::MAX),
         tray_anchor: None,
         panel: PanelWindow::default(),
         settings: SettingsWindow::default(),
@@ -954,7 +958,8 @@ struct Tray {
     icon: Vec<ksni::Icon>,
     visible: bool,
     sound: bool,
-    turkish: bool,
+    /// The code of the app's language ("en", "tr"); set by the main loop.
+    lang: &'static str,
 }
 
 impl Tray {
@@ -998,19 +1003,8 @@ impl ksni::Tray for Tray {
     /// Right-click menu: only the essentials; everything else lives in the settings panel.
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         // Translated by the main loop (the language is set there); see `App::sync_tray`.
-        let tr = |en: &'static str| {
-            if self.turkish {
-                dost::i18n::turkish(en)
-            } else {
-                en
-            }
-        };
-        let mute = match (self.sound, self.turkish) {
-            (true, false) => "Mute",
-            (false, false) => "Unmute",
-            (true, true) => "Sesi kapat",
-            (false, true) => "Sesi aç",
-        };
+        let tr = |en: &'static str| dost::i18n::translate(self.lang, en);
+        let mute = if self.sound { tr("Mute") } else { tr("Unmute") };
         vec![
             Self::item(tr("All settings…"), || TrayMsg::Settings),
             ksni::MenuItem::Separator,
@@ -1019,14 +1013,7 @@ impl ksni::Tray for Tray {
             }),
             Self::item(mute, || TrayMsg::Mute),
             ksni::MenuItem::Separator,
-            Self::item(
-                if self.turkish {
-                    "Dost'tan çık"
-                } else {
-                    "Quit Dost"
-                },
-                || TrayMsg::Quit,
-            ),
+            Self::item(tr("Quit Dost"), || TrayMsg::Quit),
         ]
     }
 }
@@ -1057,7 +1044,7 @@ fn spawn_tray(tx: Sender<TrayMsg>, r: &Renderer) -> Option<ksni::blocking::Handl
         icon: tray_icon(r, false, false),
         visible: true,
         sound: true,
-        turkish: false,
+        lang: "en",
     };
     // A host that starts later (or restarts) still gets the icon.
     match tray.assume_sni_available(true).spawn() {
@@ -1366,7 +1353,7 @@ impl App {
             self.core.missed > 0,
             self.core.visible,
             self.core.settings.sound,
-            dost::i18n::is_turkish(),
+            dost::i18n::code(),
             self.core.renderer.look_gen(),
         );
         if state == self.shell.tray_state {
@@ -1383,7 +1370,7 @@ impl App {
                 }
                 t.visible = state.2;
                 t.sound = state.3;
-                t.turkish = state.4;
+                t.lang = state.4;
             });
         }
     }
@@ -1892,6 +1879,10 @@ impl App {
             XK_ESCAPE => self.close_panel(),
             XK_BACKSPACE => self.panel_key(panel::Key::Backspace),
             XK_RETURN | XK_KP_ENTER => self.panel_key(panel::Key::Enter),
+            XK_UP => self.panel_key(panel::Key::Up),
+            XK_DOWN => self.panel_key(panel::Key::Down),
+            XK_HOME => self.panel_key(panel::Key::Home),
+            XK_END => self.panel_key(panel::Key::End),
             0x76 | 0x56 if ctrl => {
                 if let Some(t) = paste_text() {
                     self.panel_key(panel::Key::Text(t));
@@ -2046,6 +2037,10 @@ impl App {
             XK_ESCAPE => panel::Key::Escape,
             XK_BACKSPACE => panel::Key::Backspace,
             XK_RETURN | XK_KP_ENTER => panel::Key::Enter,
+            XK_UP => panel::Key::Up,
+            XK_DOWN => panel::Key::Down,
+            XK_HOME => panel::Key::Home,
+            XK_END => panel::Key::End,
             0x76 | 0x56 if ctrl => match paste_text() {
                 Some(t) => panel::Key::Text(t),
                 None => return,
@@ -2095,11 +2090,7 @@ impl SettingsWindow {
             return;
         }
         let ui = screens.ui;
-        let title = if dost::i18n::is_turkish() {
-            "Dost Ayarları"
-        } else {
-            "Dost Settings"
-        };
+        let title = dost::i18n::t("Dost Settings");
         let Ok(mut surface) = Surface::new(x, Style::Window, title) else {
             return;
         };

@@ -19,6 +19,7 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
+      - run: python3 scripts/i18n-keys.py all
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 

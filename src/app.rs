@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::dog::{Anim, Bounds, Dog};
-use crate::i18n::{self, t};
+use crate::i18n::{self, t, tf};
 use crate::look::{self, Outfit};
 use crate::mcp::{self, DogStatus, HISTORY_LEN, HistoryEntry, Mcp};
 use crate::notify::{self, Event, Mood, Notification, Notifier, ProgressState, Reaction};
@@ -150,7 +150,7 @@ pub struct Core {
     /// The user asked (Check now): say so even when there is nothing new.
     update_asked: bool,
     /// The "Restart" question's answer.
-    restart_answer: Option<Receiver<String>>,
+    restart_answer: Option<(Receiver<String>, String)>,
     /// Important notifications that arrived while locked: (title, body), for the system
     /// notification after unlocking.
     while_locked: Vec<(String, String)>,
@@ -201,40 +201,30 @@ impl Core {
         // Hidden or asleep from last time: no hello bark.
         let quiet_start = !core.visible || core.dog.is_put_to_sleep();
         let name = core.settings.name.clone();
-        let tr = i18n::is_turkish();
+        let age = core.age_text();
+        let name = &[("name", name.as_str()), ("age", age.as_str())];
         let hello = match &core.mcp_error {
             None if quiet_start => None,
             None => Some(
                 match look::Season::on(look::today(), core.settings.birthday()) {
-                    Some(look::Season::Birthday) if tr => Notification::new(
-                        "Hav! Bugün doğum günüm!",
-                        format!("{name} bugün {} oldu. Bana baktığın için teşekkürler.", core.age_text()),
-                    )
-                    .mood(Some(Mood::Good)),
                     Some(look::Season::Birthday) => Notification::new(
-                        "Woof! It's my birthday!",
-                        format!("{name} is {} today. Thanks for having me.", core.age_text()),
+                        t("Woof! It's my birthday!"),
+                        tf("{name} is {age} today. Thanks for having me.", name),
                     )
                     .mood(Some(Mood::Good)),
-                    _ if first_start && tr => Notification::new(
-                        "Hav!",
-                        format!(
-                            "Merhaba, ben {name}. Beni sürükleyebilir, kemiğimi fırlatabilir ya da bana bir ad vermek için simgeme tıklayabilirsin."
-                        ),
-                    ),
                     _ if first_start => Notification::new(
-                        "Woof!",
-                        format!(
-                            "Hi, I'm {name}. Drag me around, throw my bone, or click my tray icon to give me a name."
+                        t("Woof!"),
+                        tf(
+                            "Hi, I'm {name}. Drag me around, throw my bone, or click my tray icon to give me a name.",
+                            name,
                         ),
-                    ),
-                    _ if tr => Notification::new(
-                        "Hav!",
-                        format!("{name} burada. Beni sürükleyebilir ya da ayarlar için simgeme tıklayabilirsin."),
                     ),
                     _ => Notification::new(
-                        "Woof!",
-                        format!("{name} is here. Drag me around, or click my tray icon for settings."),
+                        t("Woof!"),
+                        tf(
+                            "{name} is here. Drag me around, or click my tray icon for settings.",
+                            name,
+                        ),
                     ),
                 }
                 .local()
@@ -252,24 +242,9 @@ impl Core {
         core
     }
 
-    /// "2 years" / "1 year" / "3 days" since the birthday.
+    /// "2 years" / "1 year" / "3 days" since the birthday, in the app's language.
     pub fn age_text(&self) -> String {
-        let a = age_text(self.settings.birthday(), look::today());
-        if !i18n::is_turkish() {
-            return a;
-        }
-        match a.split_once(' ') {
-            Some(("0", _)) => "bugün geldi".into(),
-            Some((n, unit)) => {
-                let unit = match unit.trim_end_matches('s') {
-                    "year" => "yaşında",
-                    "month" => "aylık",
-                    _ => "günlük",
-                };
-                format!("{n} {unit}")
-            }
-            None => t(&a).to_string(),
-        }
+        age_text(self.settings.birthday(), look::today())
     }
 
     fn build(
@@ -1026,12 +1001,11 @@ impl Core {
         if self.special_shown == Some(today) {
             return;
         }
-        let tr = i18n::is_turkish();
         let national = self.mcp.days.builtin_on(crate::days::Builtin::National);
         let text = if special::remembrance_due(now) {
-            remembrance.then(|| special::remembrance_text(tr))
+            remembrance.then(special::remembrance_text)
         } else if now.time() >= chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap() {
-            special::holiday_text(today, tr).filter(|_| national)
+            special::holiday_text(today).filter(|_| national)
         } else {
             None
         };
@@ -1050,7 +1024,7 @@ impl Core {
 
     /// The user's own days: their bubble at its time, and the reminders before.
     fn user_days(&mut self, now: chrono::NaiveDateTime) {
-        let due = self.mcp.days.take_due(now, i18n::is_turkish());
+        let due = self.mcp.days.take_due(now);
         if due.is_empty() {
             return;
         }
@@ -1348,13 +1322,11 @@ impl Core {
         let Some(summary) = self.summary_since(since, after) else {
             return;
         };
-        let n = Notification::new("While you were away", summary).sticky();
+        let title = t("While you were away").to_string();
+        let n = Notification::new(title.clone(), summary).sticky();
         self.push(n);
         // It goes first, ahead of what it sums up.
-        if let Some(i) = self
-            .queue
-            .iter()
-            .position(|n| n.title == "While you were away")
+        if let Some(i) = self.queue.iter().position(|n| n.title == title)
             && let Some(n) = self.queue.remove(i)
         {
             self.queue.push_front(n);
@@ -1368,7 +1340,7 @@ impl Core {
         let news: Vec<&HistoryEntry> = s
             .history
             .iter()
-            .filter(|h| h.id > after && h.at >= since && h.title != "While you were away")
+            .filter(|h| h.id > after && h.at >= since && h.title != t("While you were away"))
             .collect();
         if news.len() < 2 {
             // One item is shown (or in History) by itself already.
@@ -1386,12 +1358,15 @@ impl Core {
             .iter()
             .filter(|h| h.outcome.starts_with("expired") || h.outcome == "answered elsewhere")
             .count();
-        let mut parts = vec![format!("{} notifications", news.len())];
+        let mut parts = vec![i18n::tf(
+            "{n} notifications",
+            &[("n", &news.len().to_string())],
+        )];
         if failed > 0 {
-            parts.push(format!("{failed} failed"));
+            parts.push(i18n::tf("{n} failed", &[("n", &failed.to_string())]));
         }
         if asked > 0 {
-            parts.push(format!("{asked} unanswered"));
+            parts.push(i18n::tf("{n} unanswered", &[("n", &asked.to_string())]));
         }
         let mut sources: Vec<&str> = news.iter().filter_map(|h| h.source.as_deref()).collect();
         sources.sort_unstable();
@@ -1412,7 +1387,8 @@ impl Core {
                 }
             })
             .collect();
-        text.push_str(&format!("\nLatest: {}", last.join("; ")));
+        text.push('\n');
+        text.push_str(&i18n::tf("Latest: {name}", &[("name", &last.join("; "))]));
         Some(text)
     }
 
@@ -1420,11 +1396,11 @@ impl Core {
     /// allowed and announces it.
     /// "Restart" on the "update installed" bubble: starts the new version and quits.
     fn restart_if_asked(&mut self, p: &mut dyn Platform) {
-        let Some(rx) = &self.restart_answer else {
+        let Some((rx, restart)) = &self.restart_answer else {
             return;
         };
         match rx.try_recv() {
-            Ok(a) if a == "Restart" => {
+            Ok(a) if a == *restart => {
                 self.restart_answer = None;
                 self.shutdown();
                 update::restart();
@@ -1466,8 +1442,8 @@ impl Core {
                 if asked {
                     self.push(
                         Notification::new(
-                            "Dost is up to date",
-                            format!("Version {}", env!("CARGO_PKG_VERSION")),
+                            t("Dost is up to date"),
+                            i18n::tf("Version {n}", &[("n", env!("CARGO_PKG_VERSION"))]),
                         )
                         .timeout(Duration::from_secs(5)),
                     );
@@ -1475,7 +1451,7 @@ impl Core {
             }
             update::Found::Failed(e) => {
                 if asked {
-                    self.push(Notification::new("Could not check for updates", e));
+                    self.push(Notification::new(t("Could not check for updates"), e));
                 }
             }
             update::Found::Newer {
@@ -1493,20 +1469,22 @@ impl Core {
                 }
                 if ready {
                     let (mut n, rx) = Notification::new(
-                        format!("Dost {version} is installed"),
-                        "Restart to use it.",
+                        i18n::tf("Dost {n} is installed", &[("n", &version)]),
+                        t("Restart to use it."),
                     )
                     .ask(
-                        vec!["Restart".into(), "Later".into()],
+                        vec![t("Restart").into(), t("Later").into()],
                         Duration::from_secs(3600),
                     );
                     n.timeout = notify::Timeout::Sticky;
-                    self.restart_answer = Some(rx);
+                    // Keep the label shown in the question: the language may change before
+                    // the user answers it.
+                    self.restart_answer = Some((rx, t("Restart").into()));
                     self.push(n);
                 } else {
                     let mut n = Notification::new(
-                        format!("Dost {version} is out"),
-                        "Click to open the download page.",
+                        i18n::tf("Dost {n} is out", &[("n", &version)]),
+                        t("Click to open the download page."),
                     );
                     n.url = Some(url).filter(|u| u.starts_with("https://"));
                     self.push(n.timeout(Duration::from_secs(30)));
@@ -1792,17 +1770,17 @@ impl Core {
             Action::ToggleAutostart => {
                 let on = !p.autostart_enabled();
                 if let Err(e) = p.set_autostart(on) {
-                    self.push(Notification::new("Could not change autostart", e));
+                    self.push(Notification::new(t("Could not change autostart"), e));
                 }
             }
             Action::CopyMcpUrl => {
                 let url = self.mcp_url();
                 let msg = if p.copy_text(&url) {
-                    format!("{url} copied to the clipboard.")
+                    i18n::tf("{name} copied to the clipboard.", &[("name", &url)])
                 } else {
                     url
                 };
-                self.push(Notification::new("MCP address", msg).timeout(Duration::from_secs(5)));
+                self.push(Notification::new(t("MCP address"), msg).timeout(Duration::from_secs(5)));
             }
             Action::OpenConfigDir => {
                 if let Some(path) = self.store.path().map(|p| p.to_path_buf()) {
@@ -2076,19 +2054,22 @@ fn local_minute() -> u32 {
 pub fn age_text(birthday: Option<chrono::NaiveDate>, today: chrono::NaiveDate) -> String {
     use chrono::Datelike;
     let Some(b) = birthday.filter(|b| *b <= today) else {
-        return "new here".into();
+        return t("new here").into();
     };
     let mut months = (today.year() - b.year()) * 12 + today.month() as i32 - b.month() as i32;
     if today.day() < b.day() {
         months -= 1;
     }
-    let plural = |n: i64, w: &str| format!("{n} {w}{}", if n == 1 { "" } else { "s" });
-    if months >= 12 {
-        plural((months / 12) as i64, "year")
-    } else if months >= 1 {
-        plural(months as i64, "month")
-    } else {
-        plural((today - b).num_days(), "day")
+    let (years, days) = ((months / 12) as i64, (today - b).num_days());
+    let n = |n: i64| n.to_string();
+    match (years, months, days) {
+        (1, ..) => tf("{n} year", &[("n", "1")]),
+        (2.., ..) => tf("{n} years", &[("n", &n(years))]),
+        (_, 1, _) => tf("{n} month", &[("n", "1")]),
+        (_, 2.., _) => tf("{n} months", &[("n", &n(months as i64))]),
+        (.., 0) => t("0 days").into(),
+        (.., 1) => tf("{n} day", &[("n", "1")]),
+        _ => tf("{n} days", &[("n", &n(days))]),
     }
 }
 
@@ -2969,6 +2950,13 @@ mod tests {
         );
         assert_eq!(age_text(Some(d("2026-10-20")), d("2026-10-21")), "1 day");
         assert_eq!(age_text(None, d("2026-10-21")), "new here");
+        assert_eq!(age_text(Some(d("2026-10-21")), d("2026-10-21")), "0 days");
+        let turkish =
+            |b| i18n::with_lang(settings::Lang::Tr, || age_text(Some(d(b)), d("2026-10-21")));
+        assert_eq!(turkish("2024-10-21"), "2 yaşında");
+        assert_eq!(turkish("2025-10-22"), "11 aylık");
+        assert_eq!(turkish("2026-10-20"), "1 günlük");
+        assert_eq!(turkish("2026-10-21"), "bugün geldi");
     }
 
     #[test]

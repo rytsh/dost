@@ -381,6 +381,25 @@ fn main() {
             ),
             (dost::settings::Lang::En, Page::Days, "window-days"),
             (dost::settings::Lang::Tr, Page::Days, "window-days-tr"),
+            (dost::settings::Lang::De, Page::General, "window-general-de"),
+            (dost::settings::Lang::Ja, Page::Days, "window-days-ja"),
+            (
+                dost::settings::Lang::ZhTw,
+                Page::Connect,
+                "window-connect-zh-tw",
+            ),
+            (dost::settings::Lang::Ar, Page::Dog, "window-dog-ar"),
+            (
+                dost::settings::Lang::Ru,
+                Page::Schedule,
+                "window-schedule-ru",
+            ),
+            (dost::settings::Lang::Ko, Page::Phone, "window-phone-ko"),
+            (
+                dost::settings::Lang::Fr,
+                Page::General,
+                "window-general-dropdown",
+            ),
         ] {
             dost::i18n::set(lang);
             let scale = 2.0;
@@ -423,6 +442,12 @@ fn main() {
             );
             let mut pm = Pixmap::new(w, h).unwrap();
             panel.draw(&mut pm, &mut r, &view);
+            if name.ends_with("dropdown") {
+                // Click the language box: its list opens over the page.
+                let (bx, by) = (1300.0, 170.0);
+                panel.pointer_up(bx, by, &view);
+                panel.draw(&mut pm, &mut r, &view);
+            }
             pm.save_png(out.replace(".png", &format!("-{name}.png")))
                 .unwrap();
         }

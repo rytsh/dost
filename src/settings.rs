@@ -106,23 +106,47 @@ pub struct Settings {
     pub local_mcp: crate::local::LocalSettings,
 }
 
-/// The language of the app's own text.
+/// The language of the app's own text (see [`crate::i18n::LANGS`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum Lang {
-    /// The system's language (Turkish when it is Turkish, otherwise English).
+    /// The system's language (English when it is not one of these).
     #[default]
+    #[serde(rename = "auto")]
     Auto,
+    #[serde(rename = "en")]
     En,
+    #[serde(rename = "tr")]
     Tr,
-}
-
-impl Lang {
-    pub const ALL: [(Lang, &str); 3] = [
-        (Lang::Auto, "System"),
-        (Lang::En, "English"),
-        (Lang::Tr, "Türkçe"),
-    ];
+    #[serde(rename = "de")]
+    De,
+    #[serde(rename = "fr")]
+    Fr,
+    #[serde(rename = "es")]
+    Es,
+    #[serde(rename = "it")]
+    It,
+    #[serde(rename = "pt-BR")]
+    PtBr,
+    #[serde(rename = "nl")]
+    Nl,
+    #[serde(rename = "pl")]
+    Pl,
+    #[serde(rename = "ru")]
+    Ru,
+    #[serde(rename = "uk")]
+    Uk,
+    #[serde(rename = "ar")]
+    Ar,
+    #[serde(rename = "id")]
+    Id,
+    #[serde(rename = "ja")]
+    Ja,
+    #[serde(rename = "ko")]
+    Ko,
+    #[serde(rename = "zh-TW")]
+    ZhTw,
+    #[serde(rename = "zh-CN")]
+    ZhCn,
 }
 
 impl Default for Settings {

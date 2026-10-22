@@ -7,7 +7,7 @@ use tiny_skia::{
     Transform,
 };
 
-use crate::i18n::{self, t};
+use crate::i18n::{t, tf};
 use crate::look::{Collar, Fur, Item, Outfit, SOURCE_PALETTE, Theme, Wear, parse_hex};
 use crate::remote::PhoneWhen;
 use crate::render::{Renderer, TextStyle};
@@ -333,6 +333,9 @@ pub struct HistoryItem {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Hit {
     Tab(Page),
+    /// A drop-down's box (opens its list), and the rest of its open list.
+    Dropdown(Field),
+    DropdownList,
     /// A special day's ✕ (its id).
     DayRemove(u64),
     /// A scheduled job's switch, Run now and ✕ (job id).
@@ -503,6 +506,20 @@ pub enum Key {
     Enter,
     /// Esc: cancel.
     Escape,
+    /// Navigate an open drop-down list.
+    Up,
+    Down,
+    Home,
+    End,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Dropdown {
+    field: Field,
+    anchor: Rect,
+    scroll: f32,
+    focused: usize,
+    reveal_focus: bool,
 }
 
 /// The text field being edited.
@@ -520,6 +537,11 @@ pub struct Panel {
     hits: Vec<(Rect, Hit)>,
     slider: Option<Rect>,
     hover: Option<Hit>,
+    /// An open drop-down list: which field, where its box is (physical, on the panel), and
+    /// how far its list is scrolled.
+    dropdown: Option<Dropdown>,
+    /// The options and selection of each drop-down drawn last, for its list.
+    dropdown_items: Vec<(Field, Vec<String>, Option<usize>)>,
     dragging: bool,
     /// How far the tab's body is scrolled (physical).
     scroll: f32,
@@ -568,6 +590,8 @@ impl Panel {
             reply: None,
             job: JobDraft::default(),
             day: DayDraft::default(),
+            dropdown: None,
+            dropdown_items: Vec::new(),
             arrow: None,
             missed: 0,
             editing: None,
@@ -618,14 +642,49 @@ impl Panel {
         }
     }
 
-    /// A text field takes the keyboard (the shell sends keys to [`Panel::key`]).
+    /// Keys go to the panel ([`Panel::key`]): a text field is being edited, or a drop-down list is open (so
+    /// Escape closes it rather than the panel).
     pub fn is_editing(&self) -> bool {
-        self.editing.is_some()
+        self.editing.is_some() || self.dropdown.is_some()
     }
 
     /// A key while editing a field. Returns the new settings when it is saved, and whether
     /// the panel needs a redraw.
     pub fn key(&mut self, key: Key, v: &View) -> (bool, Option<Action>) {
+        if let Some(mut menu) = self.dropdown {
+            let len = self
+                .dropdown_items
+                .iter()
+                .find(|(f, ..)| *f == menu.field)
+                .map_or(0, |(_, options, _)| options.len());
+            match key {
+                Key::Escape => self.dropdown = None,
+                Key::Enter => {
+                    // Use the same action path as a mouse selection, once its row is visible.
+                    if let Some((rect, _)) = self
+                        .hits
+                        .iter()
+                        .find(|(_, h)| *h == Hit::Choice(menu.field, menu.focused))
+                    {
+                        let (x, y) = (
+                            rect.left() + rect.width() / 2.0,
+                            rect.top() + rect.height() / 2.0,
+                        );
+                        return (true, self.pointer_up(x, y, v));
+                    }
+                }
+                Key::Up => menu.focused = menu.focused.saturating_sub(1),
+                Key::Down => menu.focused = (menu.focused + 1).min(len.saturating_sub(1)),
+                Key::Home => menu.focused = 0,
+                Key::End => menu.focused = len.saturating_sub(1),
+                _ => return (false, None),
+            }
+            if self.dropdown.is_some() {
+                menu.reveal_focus = true;
+                self.dropdown = Some(menu);
+            }
+            return (true, None);
+        }
         let Some(e) = self.editing.as_mut() else {
             return (false, None);
         };
@@ -648,6 +707,7 @@ impl Panel {
             Key::Escape if e.field == TextField::Reply => self.end_reply(),
             Key::Escape => self.editing = None,
             Key::Enter => return (true, self.finish_editing(v)),
+            Key::Up | Key::Down | Key::Home | Key::End => return (false, None),
         }
         if let Some(e) = self.editing.as_mut() {
             e.since = std::time::Instant::now();
@@ -839,6 +899,7 @@ impl Panel {
     }
 
     pub fn set_page(&mut self, page: Page) {
+        self.dropdown = None;
         if self.page == Page::Reply && page != Page::Reply {
             self.end_reply();
         }
@@ -898,6 +959,12 @@ impl Panel {
 
     /// Mouse wheel over the panel; `delta` in lines (positive = up). Scrolls the tab's body.
     pub fn scroll_by(&mut self, delta: f32, _view_height: u32) {
+        // The open list scrolls, not the page under it.
+        if let Some(menu) = self.dropdown.as_mut() {
+            menu.scroll = (menu.scroll - delta * 26.0 * self.ui).max(0.0);
+            menu.reveal_focus = false;
+            return;
+        }
         let view = if self.view_h > 0.0 {
             self.view_h
         } else {
@@ -908,6 +975,7 @@ impl Panel {
     }
 
     pub fn draw(&mut self, pm: &mut Pixmap, r: &mut Renderer, v: &View) {
+        self.dropdown_items.clear();
         if self.window {
             return self.draw_window(pm, r, v);
         }
@@ -951,6 +1019,7 @@ impl Panel {
         // On a short screen the body is cut to what fits; the footer stays right under it.
         y += view_h + GAP * u;
         self.footer(pm, r, y, x, inner, v);
+        self.dropdown_list(pm, r);
     }
 
     /// The settings window: a sidebar of pages on the left, the page on the right.
@@ -1097,6 +1166,7 @@ impl Panel {
         self.cw = pw;
         let view_h = (h - by - 12.0 * u).max(1.0);
         self.body(pm, r, v, px, by, pw, view_h);
+        self.dropdown_list(pm, r);
     }
 
     /// The page's body: drawn on its own canvas, scrolled, then copied into its place.
@@ -1291,7 +1361,11 @@ impl Panel {
                 color,
             );
             let name = t(page.title());
-            let st = sys(if i18n::is_turkish() { 9.0 } else { 10.0 } * u, on, color);
+            // Long names get a size smaller before they are shortened.
+            let mut st = sys(10.0 * u, on, color);
+            if r.measure(name, st).0 > cell.width() - 2.0 * u {
+                st = sys(9.0 * u, on, color);
+            }
             let shown = fit(r, name, st, cell.width() - 2.0 * u);
             let (lw, _) = r.measure(&shown, st);
             r.draw_text(
@@ -1435,10 +1509,10 @@ impl Panel {
         let u = self.ui;
         let s = &v.settings;
         let mut cy = self.card(pm, y, 7);
-        let age = if v.age == "new here" || i18n::is_turkish() {
-            t(&v.age).to_string()
+        let age = if v.age == t("new here") {
+            v.age.clone()
         } else {
-            format!("{} old", v.age)
+            tf("{age} old", &[("age", &v.age)])
         };
         cy = self.text_row(
             pm,
@@ -1837,8 +1911,8 @@ impl Panel {
         }
         for l in &v.todos {
             // Title: name and open count on the left, Clear done and ✕ on the right.
-            let open = if i18n::is_turkish() { "açık" } else { "open" };
-            let title = format!("{} · {} {open}", l.name.to_uppercase(), l.open_count());
+            let open = tf("{n} open", &[("n", &l.open_count().to_string())]);
+            let title = format!("{} · {open}", l.name.to_uppercase());
             let st = sys(11.0 * u, true, MUTED);
             let shown = fit(r, &title, st, inner - 120.0 * u);
             r.draw_text(pm, x + 4.0 * u, cy + 5.0 * u, &shown, st);
@@ -2018,7 +2092,8 @@ impl Panel {
         let u = self.ui;
         let s = &v.settings;
         let mut cy = self.card(pm, y, 3);
-        cy = self.choice_row(
+        let (langs, lang) = Self::dropdown_options(Field::Language, v);
+        cy = self.dropdown_row(
             pm,
             r,
             cy,
@@ -2026,8 +2101,8 @@ impl Panel {
             inner,
             "Language",
             Field::Language,
-            &Lang::ALL.map(|(_, l)| l),
-            Lang::ALL.iter().position(|(l, _)| *l == s.language),
+            &langs,
+            lang,
         );
         let screens: Vec<String> = std::iter::once(t("Any").to_string())
             .chain((1..=v.screens.clamp(1, 4)).map(|i| {
@@ -2065,11 +2140,7 @@ impl Panel {
             r,
             cy,
             x,
-            if i18n::is_turkish() {
-                "Ekran: köpeğin yaşadığı ekran; Herhangi: nereye bırakırsan."
-            } else {
-                "Screen: where the dog lives; Any: wherever you put it."
-            },
+            "Screen: where the dog lives; Any: wherever you put it.",
         );
         cy += GAP * u;
         // The details have their own page in the settings window.
@@ -2113,7 +2184,7 @@ impl Panel {
             );
             let st = sys(13.0 * u, false, INK);
             r.draw_text(pm, x + 12.0 * u, cy + 8.0 * u, t("Settings file"), st);
-            let open = if i18n::is_turkish() { "Aç" } else { "Open" };
+            let open = "Open";
             let b = Rect::from_xywh(x + inner - 70.0 * u, cy + 4.0 * u, 62.0 * u, 24.0 * u);
             self.button(pm, r, b, open, Button::OpenDir, true);
             cy += ROW * u;
@@ -2133,7 +2204,6 @@ impl Panel {
     ) -> f32 {
         let u = self.ui;
         let s = &v.settings;
-        let tr = i18n::is_turkish();
         let mut cy = self.card(pm, y, 1);
         cy = self.choice_row(
             pm,
@@ -2151,11 +2221,7 @@ impl Panel {
             r,
             cy,
             x,
-            if tr {
-                "Uzaktayken: 5 dk boşta ya da ekran kilitliyken."
-            } else {
-                "Away: idle for 5 minutes, or the screen is locked."
-            },
+            "Away: idle for 5 minutes, or the screen is locked.",
         );
         cy += GAP * u / 2.0;
 
@@ -2169,11 +2235,7 @@ impl Panel {
             start,
             x,
             inner,
-            if tr {
-                "ntfy ile gönder"
-            } else {
-                "Send with ntfy"
-            },
+            "Send with ntfy",
             n.enabled,
             Toggle::Ntfy,
         );
@@ -2212,19 +2274,12 @@ impl Panel {
                 TextField::NtfyToken,
                 s,
                 None,
-                if tr { "isteğe bağlı" } else { "optional" },
+                "optional",
             );
             let bw = (inner - 3.0 * 8.0 * u) / 3.0;
             for (i, (b, label)) in [
-                (
-                    Button::CopyTopic,
-                    if tr {
-                        "Bağlantıyı kopyala"
-                    } else {
-                        "Copy link"
-                    },
-                ),
-                (Button::NewTopic, if tr { "Yeni konu" } else { "New topic" }),
+                (Button::CopyTopic, "Copy link"),
+                (Button::NewTopic, "New topic"),
                 (Button::PhoneTest, "Send a test"),
             ]
             .into_iter()
@@ -2244,11 +2299,7 @@ impl Panel {
                 r,
                 cy,
                 x,
-                if tr {
-                    "ntfy uygulamasında bu konuya abone ol; sorular buton olarak gelir."
-                } else {
-                    "Subscribe to the topic in the ntfy app; questions come with buttons."
-                },
+                "Subscribe to the topic in the ntfy app; questions come with buttons.",
             );
         }
         cy += GAP * u / 2.0;
@@ -2263,11 +2314,7 @@ impl Panel {
             start,
             x,
             inner,
-            if tr {
-                "Telegram botu ile gönder"
-            } else {
-                "Send with a Telegram bot"
-            },
+            "Send with a Telegram bot",
             tg.enabled,
             Toggle::Telegram,
         );
@@ -2287,18 +2334,9 @@ impl Panel {
             let (state, c) = if tg.token.is_empty() {
                 (t("A bot token from @BotFather.").to_string(), MUTED)
             } else if tg.chat_id.is_empty() {
-                (
-                    if tr {
-                        "Eşleştirmek için bota /start yaz.".to_string()
-                    } else {
-                        "Send /start to the bot to pair.".to_string()
-                    },
-                    ACCENT_INK,
-                )
-            } else if tr {
-                (format!("Eşleşti · sohbet {}", tg.chat_id), AWAKE)
+                (t("Send /start to the bot to pair.").to_string(), ACCENT_INK)
             } else {
-                (format!("Paired · chat {}", tg.chat_id), AWAKE)
+                (tf("Paired · chat {n}", &[("n", &tg.chat_id)]), AWAKE)
             };
             let st = sys(11.5 * u, false, c);
             let shown = fit(r, &state, st, inner - 140.0 * u);
@@ -2311,11 +2349,7 @@ impl Panel {
                 r,
                 cy,
                 x,
-                if tr {
-                    "Sorulara butonla ya da mesaja yanıt yazarak cevap ver."
-                } else {
-                    "Answer questions with the buttons, or reply to the message."
-                },
+                "Answer questions with the buttons, or reply to the message.",
             );
         }
         if let Some(e) = &v.phone_status {
@@ -2338,7 +2372,6 @@ impl Panel {
         v: &View,
     ) -> f32 {
         let u = self.ui;
-        let tr = i18n::is_turkish();
         if v.sessions.is_empty() {
             let mut cy = self.note(
                 pm,
@@ -2352,23 +2385,9 @@ impl Panel {
                 r,
                 cy,
                 x,
-                if tr {
-                    "OpenCode eklentisi, Claude Code ve Codex kancaları"
-                } else {
-                    "The OpenCode plugin, the Claude Code and Codex hooks"
-                },
+                "The OpenCode plugin, the Claude Code and Codex hooks",
             );
-            return self.note(
-                pm,
-                r,
-                cy,
-                x,
-                if tr {
-                    "ve MCP `session` aracı oturumları bildirir."
-                } else {
-                    "and the MCP `session` tool report sessions."
-                },
-            );
+            return self.note(pm, r, cy, x, "and the MCP `session` tool report sessions.");
         }
         let rows = v.sessions.len();
         let h = rows as f32 * SESSION_ROW * u;
@@ -2423,7 +2442,7 @@ impl Panel {
             let state = format!(
                 "{} · {}",
                 t(sess.state.label()),
-                crate::watch::human_secs(secs)
+                crate::watch::human_secs_t(secs)
             );
             let st_state = sys(11.0 * u, sess.state == SessionState::Waiting, c);
             let (sw, _) = r.measure(&state, st_state);
@@ -2486,7 +2505,6 @@ impl Panel {
     ) -> f32 {
         use crate::days::Builtin;
         let u = self.ui;
-        let tr = i18n::is_turkish();
         let s = &v.settings;
         let start = self.card(pm, y, 2);
         let mut cy = self.toggle_row(
@@ -2514,67 +2532,31 @@ impl Panel {
             r,
             cy,
             x,
-            if tr {
-                "Her dilde aynı çalışır; yalnızca yazılar dile göre değişir."
-            } else {
-                "Works the same in every language; only the text follows it."
-            },
+            "Works the same in every language; only the text follows it.",
         );
         cy += GAP * u / 2.0;
 
         // The built-in days.
         cy = self.section(pm, r, cy, x, "Built in");
-        let rows: [(Builtin, &str, &str); 5] = [
-            (
-                Builtin::Remembrance,
-                "10 Kasım · Atatürk'ü anma",
-                "10 November · Remembering Atatürk",
-            ),
-            (
-                Builtin::National,
-                "Ulusal bayramlar",
-                "National holidays (Türkiye)",
-            ),
-            (
-                Builtin::DogBirthday,
-                "Köpeğin doğum günü",
-                "The dog's birthday",
-            ),
-            (Builtin::Halloween, "Cadılar Bayramı", "Halloween"),
-            (Builtin::Christmas, "Yılbaşı", "Christmas and New Year"),
+        let rows: [(Builtin, &str); 5] = [
+            (Builtin::Remembrance, "10 November · Remembering Atatürk"),
+            (Builtin::National, "National holidays (Türkiye)"),
+            (Builtin::DogBirthday, "The dog's birthday"),
+            (Builtin::Halloween, "Halloween"),
+            (Builtin::Christmas, "Christmas and New Year"),
         ];
         let start = self.card(pm, cy, rows.len() + 1);
         cy = start;
-        for (b, label_tr, label_en) in rows {
+        for (b, label) in rows {
             let on = !v.builtins_off.contains(&b);
-            cy = self.toggle_row(
-                pm,
-                r,
-                cy,
-                x,
-                inner,
-                if tr { label_tr } else { label_en },
-                on,
-                Toggle::Builtin(b),
-            );
+            cy = self.toggle_row(pm, r, cy, x, inner, label, on, Toggle::Builtin(b));
         }
-        let siren = if tr {
-            "09:05'te siren (10 Kasım)"
-        } else {
-            "Siren at 09:05 (10 November)"
-        };
+        let siren = "Siren at 09:05 (10 November)";
         cy = self.toggle_row(pm, r, cy, x, inner, siren, s.siren, Toggle::Siren);
-        let lines: &[&str] = if tr {
-            &[
-                "10 Kasım: gün boyu siyah kurdele; 09:05'te bir dakika saygı duruşu.",
-                "Bayramlar (23 Nisan, 19 Mayıs, 30 Ağustos, 29 Ekim): tasmada bayrak.",
-            ]
-        } else {
-            &[
-                "10 November: a black ribbon all day; a minute of silence at 09:05.",
-                "23 April, 19 May, 30 August, 29 October: a flag on the collar.",
-            ]
-        };
+        let lines = [
+            "10 November: a black ribbon all day; a minute of silence at 09:05.",
+            "23 April, 19 May, 30 August, 29 October: a flag on the collar.",
+        ];
         for l in lines {
             cy = self.note(pm, r, cy, x, l) - 6.0 * u;
         }
@@ -2588,11 +2570,7 @@ impl Panel {
                 r,
                 cy,
                 x,
-                if tr {
-                    "Doğum günleri, yıl dönümleri… Aşağıdan ekle ya da bir ajana söyle."
-                } else {
-                    "Birthdays, anniversaries… Add one below, or tell an agent."
-                },
+                "Birthdays, anniversaries… Add one below, or tell an agent.",
             );
         } else {
             let row_h = SESSION_ROW * u;
@@ -2617,37 +2595,33 @@ impl Panel {
                 let st = sys(12.5 * u, true, INK);
                 let shown = fit(r, &format!("{icon} {}", d.name), st, right - tx);
                 r.draw_text(pm, tx, ry + 5.0 * u, &shown, st);
-                let mut line = day_date_text(d, tr);
+                let mut line = day_date_text(d);
                 if let Some(n) = next {
                     let left = (*n - today).num_days();
-                    line += &match (left, tr) {
-                        (0, true) => " · bugün!".to_string(),
-                        (0, false) => " · today!".to_string(),
-                        (1, true) => " · yarın".to_string(),
-                        (1, false) => " · tomorrow".to_string(),
-                        (n, true) => format!(" · {n} gün sonra"),
-                        (n, false) => format!(" · in {n} days"),
+                    line += " · ";
+                    line += &match left {
+                        0 => t("today!").to_string(),
+                        1 => t("tomorrow").to_string(),
+                        n => tf("in {n} days", &[("n", &n.to_string())]),
                     };
                     if let Some(y) = d.year.filter(|_| !d.once) {
                         let years = chrono::Datelike::year(n) - y;
                         if years > 0 {
-                            line += &if tr {
-                                format!(" ({years}. yıl)")
-                            } else {
-                                format!(" ({years} years)")
-                            };
+                            line += " ";
+                            line += &tf("({years} years)", &[("years", &years.to_string())]);
                         }
                     }
                 }
                 if d.remind_days_before > 0 {
-                    line += &if tr {
-                        format!(" · {} gün önce hatırlat", d.remind_days_before)
-                    } else {
-                        format!(" · reminds {} days before", d.remind_days_before)
-                    };
+                    line += " · ";
+                    line += &tf(
+                        "reminds {n} days before",
+                        &[("n", &d.remind_days_before.to_string())],
+                    );
                 }
                 if d.phone {
-                    line += if tr { " · telefon" } else { " · phone" };
+                    line += " · ";
+                    line += t("phone");
                 }
                 let st = sys(11.0 * u, false, MUTED);
                 let shown = fit(r, &line, st, right - tx);
@@ -2690,7 +2664,7 @@ impl Panel {
             TextField::DayName,
             s,
             None,
-            if tr { "Ayşe" } else { "Alex" },
+            "Alex",
         );
         cy = self.text_row(
             pm,
@@ -2702,11 +2676,7 @@ impl Panel {
             TextField::DayDate,
             s,
             None,
-            if tr {
-                "14.03 ya da 14.03.1990"
-            } else {
-                "14.03 or 14.03.1990"
-            },
+            "14.03 or 14.03.1990",
         );
         cy = self.choice_row(
             pm,
@@ -2736,11 +2706,7 @@ impl Panel {
             cy,
             x,
             inner,
-            if tr {
-                "Yalnızca bir kez (yıl gerekir)"
-            } else {
-                "Only once (needs the year)"
-            },
+            "Only once (needs the year)",
             self.day.once,
             Toggle::DayOnce,
         );
@@ -2750,21 +2716,12 @@ impl Panel {
             cy,
             x,
             inner,
-            if tr {
-                "Telefona da gönder"
-            } else {
-                "Also to the phone"
-            },
+            "Also to the phone",
             self.day.phone,
             Toggle::DayPhone,
         );
         let msg = self.day.error.clone().unwrap_or_else(|| {
-            if tr {
-                "O gün 09:00'da balon; yıl yazılırsa kaçıncı yıl olduğunu söyler."
-            } else {
-                "A bubble at 09:00 on the day; with the year it says how many."
-            }
-            .to_string()
+            t("A bubble at 09:00 on the day; with the year it says how many.").to_string()
         });
         let c = if self.day.error.is_some() {
             DANGER
@@ -2790,31 +2747,10 @@ impl Panel {
         v: &View,
     ) -> f32 {
         let u = self.ui;
-        let tr = i18n::is_turkish();
         let mut cy = y;
         if v.jobs.is_empty() {
-            cy = self.note(
-                pm,
-                r,
-                cy,
-                x,
-                if tr {
-                    "Henüz iş yok. Aşağıdan ekle ya da bir ajana sor:"
-                } else {
-                    "No jobs yet. Add one below, or ask an agent:"
-                },
-            );
-            cy = self.note(
-                pm,
-                r,
-                cy,
-                x,
-                if tr {
-                    "“hafta içi her sabah 9'da standup'ı hatırlat”."
-                } else {
-                    "“remind me of the standup on weekdays at 9”."
-                },
-            );
+            cy = self.note(pm, r, cy, x, "No jobs yet. Add one below, or ask an agent:");
+            cy = self.note(pm, r, cy, x, "“remind me of the standup on weekdays at 9”.");
             cy += GAP * u / 2.0;
         } else {
             let row_h = SESSION_ROW * u;
@@ -2877,7 +2813,7 @@ impl Panel {
                         self.hits.push((hit_r, Hit::JobToggle(job.id)));
                     }
                 }
-                let run_label = if tr { "Çalıştır" } else { "Run" };
+                let run_label = t("Run");
                 let st = sys(11.0 * u, false, MUTED);
                 let (rw, _) = r.measure(run_label, st);
                 let run_x = sw_x - rw - 22.0 * u;
@@ -2923,25 +2859,19 @@ impl Panel {
                 let shown = fit(r, &format!("{kind} {}", job.name), st, text_w);
                 r.draw_text(pm, tx, ry + 5.0 * u, &shown, st);
                 let when = crate::cron::Schedule::parse(&job.schedule)
-                    .map(|sc| sc.describe(tr))
+                    .map(|sc| sc.describe())
                     .unwrap_or_else(|_| job.schedule.clone());
                 let mut line = when;
                 if let Some(t) = next.filter(|_| job.enabled) {
-                    let left = crate::watch::human_secs(t.saturating_sub(now));
-                    line += &if tr {
-                        format!(" · {left} sonra")
-                    } else {
-                        format!(" · in {left}")
-                    };
+                    let left = crate::watch::human_secs_t(t.saturating_sub(now));
+                    line += " · ";
+                    line += &tf("in {left}", &[("left", &left)]);
                 }
                 if let Some(l) = &job.last {
-                    let ago = crate::watch::human_secs(now.saturating_sub(l.at));
+                    let ago = crate::watch::human_secs_t(now.saturating_sub(l.at));
                     let res = if l.ok { "✓" } else { "✗" };
-                    line += &if tr {
-                        format!(" · son {res} {ago} önce")
-                    } else {
-                        format!(" · last {res} {ago} ago")
-                    };
+                    line += " · ";
+                    line += &tf("last {res} {left} ago", &[("res", res), ("left", &ago)]);
                 }
                 let st = sys(11.0 * u, false, MUTED);
                 let shown = fit(r, &line, st, text_w);
@@ -2967,14 +2897,7 @@ impl Panel {
             Some(self.job.kind),
         );
         let (label, hint) = match self.job.kind {
-            0 => (
-                "Text",
-                if tr {
-                    "Standup'a katıl"
-                } else {
-                    "Join the standup"
-                },
-            ),
+            0 => ("Text", "Join the standup"),
             1 => ("URL", "https://example.com/health"),
             _ => ("Command", "./backup.sh"),
         };
@@ -3022,11 +2945,7 @@ impl Panel {
                 cy,
                 x,
                 inner,
-                if tr {
-                    "Her çalışmada haber ver"
-                } else {
-                    "Tell me every run"
-                },
+                "Tell me every run",
                 self.job.notify_always,
                 Toggle::JobNotifyAlways,
             );
@@ -3037,16 +2956,9 @@ impl Panel {
             crate::cron::Schedule::parse(&self.job.schedule),
         ) {
             (Some(e), _) => (e.clone(), DANGER),
-            (None, Ok(sc)) if !self.job.schedule.is_empty() => (sc.describe(tr), MUTED),
+            (None, Ok(sc)) if !self.job.schedule.is_empty() => (sc.describe(), MUTED),
             (None, Err(e)) if !self.job.schedule.is_empty() => (e, DANGER),
-            _ => (
-                if tr {
-                    "dakika saat gün ay haftanın günü".to_string()
-                } else {
-                    "minute hour day month weekday".to_string()
-                },
-                MUTED,
-            ),
+            _ => (t("minute hour day month weekday").to_string(), MUTED),
         };
         let st = sys(11.5 * u, false, c);
         let shown = fit(r, &msg, st, inner - 130.0 * u);
@@ -3113,11 +3025,7 @@ impl Panel {
             TextField::Reply,
             &v.settings,
             None,
-            if i18n::is_turkish() {
-                "kendi sözlerinle…"
-            } else {
-                "in your own words…"
-            },
+            "in your own words…",
         );
         cy += GAP * u;
         let bw = 96.0 * u;
@@ -3392,11 +3300,7 @@ impl Panel {
                 r,
                 cy,
                 x,
-                if i18n::is_turkish() {
-                    "Geçici klasör de her zaman açık. Kabuk komutları senin yetkinle çalışır."
-                } else {
-                    "The temp folder is always allowed. Shell commands run as you."
-                },
+                "The temp folder is always allowed. Shell commands run as you.",
             );
         } else {
             cy = self.note(
@@ -3404,11 +3308,7 @@ impl Panel {
                 r,
                 cy,
                 x,
-                if i18n::is_turkish() {
-                    "Ajanlara dosya okuma, düzenleme ve kabuk araçları verir."
-                } else {
-                    "Gives agents tools to read and edit files and run commands."
-                },
+                "Gives agents tools to read and edit files and run commands.",
             );
         }
         cy += GAP * u;
@@ -3464,13 +3364,9 @@ impl Panel {
         hint: &str,
     ) -> f32 {
         let u = self.ui;
-        r.draw_text(
-            pm,
-            x + 12.0 * u,
-            y + 8.0 * u,
-            t(label),
-            sys(13.0 * u, false, INK),
-        );
+        let st_label = sys(13.0 * u, false, INK);
+        let label = fit(r, t(label), st_label, self.label_w() - 20.0 * u);
+        r.draw_text(pm, x + 12.0 * u, y + 8.0 * u, &label, st_label);
         let st_suffix = sys(11.0 * u, false, MUTED);
         let sw = suffix.map_or(0.0, |t| r.measure(t, st_suffix).0 + 10.0 * u);
         if let Some(t) = suffix {
@@ -3612,13 +3508,9 @@ impl Panel {
         field: Field,
     ) -> f32 {
         let u = self.ui;
-        r.draw_text(
-            pm,
-            x + 12.0 * u,
-            y + 8.0 * u,
-            t(label),
-            sys(13.0 * u, false, INK),
-        );
+        let st_label = sys(13.0 * u, false, INK);
+        let label = fit(r, t(label), st_label, self.label_w() - 20.0 * u);
+        r.draw_text(pm, x + 12.0 * u, y + 8.0 * u, &label, st_label);
         let seg_x = x + self.label_w();
         let seg_w = inner - self.label_w() - 6.0 * u;
         let seg = Rect::from_xywh(seg_x, y + 5.0 * u, seg_w, 22.0 * u);
@@ -3674,13 +3566,9 @@ impl Panel {
         hit: fn(usize) -> Hit,
     ) -> f32 {
         let u = self.ui;
-        r.draw_text(
-            pm,
-            x + 12.0 * u,
-            y + 8.0 * u,
-            t(label),
-            sys(13.0 * u, false, INK),
-        );
+        let st_label = sys(13.0 * u, false, INK);
+        let label = fit(r, t(label), st_label, self.label_w() - 20.0 * u);
+        r.draw_text(pm, x + 12.0 * u, y + 8.0 * u, &label, st_label);
         let d = 18.0 * u;
         let gap = if colors.len() > 6 { 7.0 * u } else { 10.0 * u };
         for (i, c) in colors.iter().enumerate() {
@@ -3775,12 +3663,9 @@ impl Panel {
         let u = self.ui;
         let (x, inner) = (right, 0.0);
         let hover = self.hover == Some(Hit::Button(Button::Version));
-        let tr = i18n::is_turkish();
         let (version, color) = match &v.update {
-            Some((nv, true)) if tr => (format!("v{nv} hazır · Yeniden başlat"), ACCENT_INK),
-            Some((nv, false)) if tr => (format!("v{nv} çıktı"), ACCENT_INK),
-            Some((nv, true)) => (format!("v{nv} ready · Restart"), ACCENT_INK),
-            Some((nv, false)) => (format!("v{nv} is out"), ACCENT_INK),
+            Some((nv, true)) => (tf("v{n} ready · Restart", &[("n", nv)]), ACCENT_INK),
+            Some((nv, false)) => (tf("v{n} is out", &[("n", nv)]), ACCENT_INK),
             None if hover => (t("Check for updates").to_string(), INK),
             None => (format!("v{}", v.version), MUTED),
         };
@@ -3835,6 +3720,12 @@ impl Panel {
 
     pub fn pointer_down(&mut self, x: f32, y: f32) -> Option<Action> {
         let hit = self.hit(x, y);
+        if !matches!(
+            hit,
+            Some(Hit::Dropdown(_) | Hit::DropdownList | Hit::Choice(_, _))
+        ) {
+            self.dropdown = None;
+        }
         self.toy_press = (hit == Some(Hit::ToyTile)).then_some((x, y));
         if hit == Some(Hit::Slider) {
             self.dragging = true;
@@ -3854,6 +3745,8 @@ impl Panel {
                 .map(|volume| Action::Volume { volume, done: true });
         }
         let hit = self.hit(x, y);
+        // Close before handling an outside text field or slider too: those return early.
+        let was_open = self.dropdown.take();
         if let Some(Hit::Text(f)) = hit {
             if self.editing.as_ref().is_some_and(|e| e.field == f) {
                 return None;
@@ -3887,8 +3780,33 @@ impl Panel {
         {
             return Some(a);
         }
+        // An open list closes on any click that is not on one of its rows.
         let mut s = v.settings.clone();
         match hit? {
+            Hit::Dropdown(f) => {
+                if was_open.is_none_or(|menu| menu.field != f)
+                    && let Some((rect, _)) = self.hits.iter().find(|(_, h)| *h == Hit::Dropdown(f))
+                {
+                    let focused = self
+                        .dropdown_items
+                        .iter()
+                        .find(|(field, ..)| *field == f)
+                        .and_then(|(_, _, selected)| *selected)
+                        .unwrap_or(0);
+                    self.dropdown = Some(Dropdown {
+                        field: f,
+                        anchor: *rect,
+                        scroll: 0.0,
+                        focused,
+                        reveal_focus: true,
+                    });
+                }
+                return None;
+            }
+            Hit::DropdownList => {
+                self.dropdown = was_open;
+                return None;
+            }
             Hit::Tab(page) => {
                 if self.page != page {
                     self.set_page(page);
@@ -3992,7 +3910,13 @@ impl Panel {
                     }
                 }
                 Field::Wear => s.wear = Wear::ALL[i].0,
-                Field::Language => s.language = Lang::ALL[i].0,
+                Field::Language => {
+                    self.dropdown = None;
+                    s.language = match i {
+                        0 => Lang::Auto,
+                        i => crate::i18n::LANGS[(i - 1).min(crate::i18n::LANGS.len() - 1)].0,
+                    };
+                }
                 Field::PhoneWhen => s.phone.when = PHONE_WHEN[i].0,
                 Field::Screen => s.screen = i as u32,
                 Field::LocalApprove => s.local_mcp.approve = crate::local::Approve::ALL[i].0,
@@ -4115,22 +4039,15 @@ impl Panel {
 
     /// The Add button of the Special days page: the draft as a new day, or why it cannot be.
     fn add_day(&mut self) -> Option<Action> {
-        let tr = i18n::is_turkish();
         let d = &mut self.day;
         let name = d.name.trim().to_string();
         if name.is_empty() {
-            d.error = Some(if tr { "Bir ad yaz." } else { "Type a name." }.into());
+            d.error = Some(t("Type a name.").into());
             return None;
         }
         let Some((day, month, year)) = parse_day_month(&d.date) else {
-            d.error = Some(
-                if tr {
-                    "Tarih GG.AA ya da GG.AA.YYYY olmalı (ör. 14.03 ya da 14.03.1990)."
-                } else {
-                    "The date must be DD.MM or DD.MM.YYYY (e.g. 14.03 or 14.03.1990)."
-                }
-                .into(),
-            );
+            d.error =
+                Some(t("The date must be DD.MM or DD.MM.YYYY (e.g. 14.03 or 14.03.1990).").into());
             return None;
         };
         let new = crate::days::NewDay {
@@ -4155,20 +4072,20 @@ impl Panel {
     fn add_job(&mut self) -> Option<Action> {
         let d = &mut self.job;
         let what = d.what.trim().to_string();
-        let err = |d: &mut JobDraft, en: &str, tr: &str| {
-            d.error = Some(if i18n::is_turkish() { tr } else { en }.to_string());
+        let err = |d: &mut JobDraft, text: &str| {
+            d.error = Some(text.to_string());
             None
         };
         if let Err(e) = crate::cron::Schedule::parse(d.schedule.trim()) {
             return if d.schedule.trim().is_empty() {
-                err(d, "Pick when it repeats.", "Ne zaman tekrarlanacağını seç.")
+                err(d, t("Pick when it repeats."))
             } else {
                 d.error = Some(e);
                 None
             };
         }
         if what.is_empty() {
-            return err(d, "Fill in what it does.", "Ne yapacağını yaz.");
+            return err(d, t("Fill in what it does."));
         }
         let action = match d.kind {
             0 => crate::cron::Action::Notify {
@@ -4178,11 +4095,7 @@ impl Panel {
             },
             1 => {
                 if !(what.starts_with("http://") || what.starts_with("https://")) {
-                    return err(
-                        d,
-                        "The URL must start with http:// or https://.",
-                        "Adres http:// ya da https:// ile başlamalı.",
-                    );
+                    return err(d, t("The URL must start with http:// or https://."));
                 }
                 crate::cron::Action::Http {
                     method: "GET".into(),
@@ -4243,23 +4156,27 @@ impl Panel {
         selected: Option<usize>,
     ) -> f32 {
         let u = self.ui;
-        r.draw_text(
-            pm,
-            x + 12.0 * u,
-            y + 8.0 * u,
-            t(label),
-            sys(13.0 * u, false, INK),
-        );
         // Segmented control on the right; options share the space by text width.
         let seg_x = x + self.label_w();
         let seg_w = inner - self.label_w() - 6.0 * u;
-        let seg = Rect::from_xywh(seg_x, y + 5.0 * u, seg_w, 22.0 * u);
-        fill_round(pm, seg, 8.0 * u, TRACK);
         let widths: Vec<f32> = options
             .iter()
-            .map(|o| r.measure(t(o), sys(11.5 * u, false, INK)).0 + 10.0 * u)
+            .map(|o| {
+                let normal = r.measure(t(o), sys(11.5 * u, false, INK)).0;
+                let bold = r.measure(t(o), sys(11.5 * u, true, INK)).0;
+                normal.max(bold) + 14.0 * u
+            })
             .collect();
         let total: f32 = widths.iter().sum();
+        // Too long for one row (a long language, many options): a drop-down instead.
+        if total > seg_w {
+            return self.dropdown_row(pm, r, y, x, inner, label, field, options, selected);
+        }
+        let label_style = sys(13.0 * u, false, INK);
+        let label = fit(r, t(label), label_style, self.label_w() - 20.0 * u);
+        r.draw_text(pm, x + 12.0 * u, y + 8.0 * u, &label, label_style);
+        let seg = Rect::from_xywh(seg_x, y + 5.0 * u, seg_w, 22.0 * u);
+        fill_round(pm, seg, 8.0 * u, TRACK);
         let mut ox = seg_x;
         for (i, (o, ow)) in options.iter().zip(&widths).enumerate() {
             let w = ow / total * seg_w;
@@ -4290,6 +4207,226 @@ impl Panel {
         y + ROW * u
     }
 
+    /// A row with a drop-down box on the right: shows `options[selected]`; a click opens the
+    /// list (drawn over the page by [`Panel::dropdown_list`]).
+    #[allow(clippy::too_many_arguments)]
+    fn dropdown_row(
+        &mut self,
+        pm: &mut Pixmap,
+        r: &mut Renderer,
+        y: f32,
+        x: f32,
+        inner: f32,
+        label: &str,
+        field: Field,
+        options: &[&str],
+        selected: Option<usize>,
+    ) -> f32 {
+        let u = self.ui;
+        let label_style = sys(13.0 * u, false, INK);
+        let label = fit(r, t(label), label_style, self.label_w() - 20.0 * u);
+        r.draw_text(pm, x + 12.0 * u, y + 8.0 * u, &label, label_style);
+        let bx = x + self.label_w();
+        let bw = inner - self.label_w() - 6.0 * u;
+        let Some(rect) = Rect::from_xywh(bx, y + 4.0 * u, bw, 24.0 * u) else {
+            return y + ROW * u;
+        };
+        let hit = Hit::Dropdown(field);
+        let open = self.dropdown.is_some_and(|menu| menu.field == field);
+        self.dropdown_items.retain(|(f, ..)| *f != field);
+        self.dropdown_items.push((
+            field,
+            options.iter().map(|o| o.to_string()).collect(),
+            selected,
+        ));
+        fill_round(
+            pm,
+            Some(rect),
+            7.0 * u,
+            if self.hover == Some(hit) || open {
+                HOVER
+            } else {
+                CARD
+            },
+        );
+        stroke_round(pm, Some(rect), 7.0 * u, BORDER, 1.0);
+        let text = selected.and_then(|i| options.get(i)).map_or("", |o| t(o));
+        let st = sys(12.5 * u, false, INK);
+        let shown = fit(r, text, st, bw - 34.0 * u);
+        let (_, th) = r.measure(&shown, st);
+        r.draw_text(
+            pm,
+            rect.left() + 10.0 * u,
+            (rect.top() + (rect.height() - th) / 2.0).round(),
+            &shown,
+            st,
+        );
+        // A small chevron.
+        let (cx, cy) = (rect.right() - 14.0 * u, rect.top() + rect.height() / 2.0);
+        let mut pb = PathBuilder::new();
+        pb.move_to(cx - 4.0 * u, cy - 2.0 * u);
+        pb.line_to(cx, cy + 2.0 * u);
+        pb.line_to(cx + 4.0 * u, cy - 2.0 * u);
+        if let Some(path) = pb.finish() {
+            let st = Stroke {
+                width: 1.6 * u,
+                line_cap: tiny_skia::LineCap::Round,
+                ..Stroke::default()
+            };
+            pm.stroke_path(&path, &paint(MUTED), &st, Transform::identity(), None);
+        }
+        self.hits.push((rect, hit));
+        y + ROW * u
+    }
+
+    /// The options of a drop-down field and the selected one.
+    fn dropdown_options(field: Field, v: &View) -> (Vec<&'static str>, Option<usize>) {
+        match field {
+            Field::Language => {
+                let mut o = vec!["System"];
+                o.extend(crate::i18n::LANGS.iter().map(|(_, _, name)| *name));
+                let sel = if v.settings.language == Lang::Auto {
+                    Some(0)
+                } else {
+                    crate::i18n::LANGS
+                        .iter()
+                        .position(|(l, ..)| *l == v.settings.language)
+                        .map(|i| i + 1)
+                };
+                (o, sel)
+            }
+            _ => (Vec::new(), None),
+        }
+    }
+
+    /// The open drop-down's list, over everything else. Its rows are hit first.
+    fn dropdown_list(&mut self, pm: &mut Pixmap, r: &mut Renderer) {
+        let Some(mut menu) = self.dropdown else {
+            return;
+        };
+        let field = menu.field;
+        // Resolve the anchor after body clipping/translation, also after a window resize.
+        let Some((b, _)) = self.hits.iter().find(|(_, h)| *h == Hit::Dropdown(field)) else {
+            self.dropdown = None;
+            return;
+        };
+        let b = *b;
+        menu.anchor = b;
+        let u = self.ui;
+        let Some((_, options, selected)) = self
+            .dropdown_items
+            .iter()
+            .find(|(f, ..)| *f == field)
+            .cloned()
+        else {
+            return;
+        };
+        let row = 26.0 * u;
+        let (pw, ph) = (pm.width() as f32, pm.height() as f32);
+        // Below the box when it fits, else above it; at most what the panel can show.
+        let below = (ph - b.bottom() - 10.0 * u).max(0.0);
+        let above = (b.top() - 10.0 * u).max(0.0);
+        let want = options.len() as f32 * row + 8.0 * u;
+        let shown_h = want.min(9.0 * row + 8.0 * u);
+        let (top, h) = if shown_h <= below || below >= above {
+            (b.bottom() + 2.0 * u, shown_h.min(below))
+        } else {
+            let h = shown_h.min(above);
+            (b.top() - 2.0 * u - h, h)
+        };
+        let Some(list) = Rect::from_xywh(b.left(), top, b.width().min(pw - b.left()), h) else {
+            return;
+        };
+        // A shadow, then the card.
+        fill_round(
+            pm,
+            list.inset(-3.0 * u)
+                .and_then(|r| Rect::from_xywh(r.left(), r.top() + 2.0 * u, r.width(), r.height())),
+            10.0 * u,
+            rgba(0, 0, 0, 30),
+        );
+        fill_round(pm, Some(list), 8.0 * u, CARD);
+        stroke_round(pm, Some(list), 8.0 * u, BORDER, 1.0);
+        let max_scroll = (want - h).max(0.0);
+        if menu.reveal_focus {
+            let focus_top = menu.focused as f32 * row;
+            let focus_bottom = focus_top + row;
+            let visible = h - 8.0 * u;
+            if focus_top < menu.scroll {
+                menu.scroll = focus_top;
+            } else if focus_bottom > menu.scroll + visible {
+                menu.scroll = focus_bottom - visible;
+            }
+        }
+        let scroll = menu.scroll.clamp(0.0, max_scroll);
+        menu.scroll = scroll;
+        menu.reveal_focus = false;
+        self.dropdown = Some(menu);
+        let Some(mut canvas) = Pixmap::new(list.width() as u32, (h - 8.0 * u).max(1.0) as u32)
+        else {
+            return;
+        };
+        let mut hits = Vec::new();
+        for (i, o) in options.iter().enumerate() {
+            let ry = i as f32 * row - scroll;
+            if ry + row < 0.0 || ry > canvas.height() as f32 {
+                continue;
+            }
+            let Some(cell) = Rect::from_xywh(4.0 * u, ry, list.width() - 8.0 * u, row) else {
+                continue;
+            };
+            let hit = Hit::Choice(field, i);
+            if selected == Some(i) {
+                fill_round(&mut canvas, Some(cell), 6.0 * u, ACCENT_SOFT);
+            } else if self.hover == Some(hit) || menu.focused == i {
+                fill_round(&mut canvas, Some(cell), 6.0 * u, HOVER);
+            }
+            let on = selected == Some(i);
+            let st = sys(12.5 * u, on, if on { ACCENT_INK } else { INK });
+            let label = fit(r, t(o.as_str()), st, cell.width() - 22.0 * u);
+            let (_, th) = r.measure(&label, st);
+            r.draw_text(
+                &mut canvas,
+                cell.left() + 8.0 * u,
+                (cell.top() + (cell.height() - th) / 2.0).round(),
+                &label,
+                st,
+            );
+            if let Some(on_panel) = Rect::from_ltrb(
+                list.left() + cell.left(),
+                (list.top() + 4.0 * u + cell.top()).max(list.top() + 4.0 * u),
+                list.left() + cell.right(),
+                (list.top() + 4.0 * u + cell.bottom()).min(list.bottom() - 4.0 * u),
+            ) {
+                hits.push((on_panel, hit));
+            }
+        }
+        pm.draw_pixmap(
+            list.left() as i32,
+            (list.top() + 4.0 * u) as i32,
+            canvas.as_ref(),
+            &PixmapPaint::default(),
+            Transform::identity(),
+            None,
+        );
+        if max_scroll > 0.0 {
+            let track_h = h - 8.0 * u;
+            let thumb_h = (track_h * track_h / (want - 8.0 * u)).max(16.0 * u);
+            let thumb_y = list.top() + 4.0 * u + (track_h - thumb_h) * scroll / max_scroll;
+            fill_round(
+                pm,
+                Rect::from_xywh(list.right() - 5.0 * u, thumb_y, 3.0 * u, thumb_h),
+                1.5 * u,
+                TRACK,
+            );
+        }
+        // The list covers the page: everything under it is out of reach, the list's rows first.
+        self.hits.retain(|(rect, _)| !overlaps(*rect, list));
+        hits.extend(std::mem::take(&mut self.hits));
+        self.hits = hits;
+        self.hits.push((list, Hit::DropdownList));
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn toggle_row(
         &mut self,
@@ -4309,13 +4446,9 @@ impl Panel {
         if self.hover == Some(Hit::Toggle(tg)) {
             fill_round(pm, row.inset(2.0 * u), 10.0 * u, HOVER);
         }
-        r.draw_text(
-            pm,
-            x + 12.0 * u,
-            y + 8.0 * u,
-            t(label),
-            sys(13.0 * u, false, INK),
-        );
+        let st_label = sys(13.0 * u, false, INK);
+        let label = fit(r, t(label), st_label, inner - 68.0 * u);
+        r.draw_text(pm, x + 12.0 * u, y + 8.0 * u, &label, st_label);
         let sw = Rect::from_xywh(x + inner - 44.0 * u, y + 7.0 * u, 34.0 * u, 18.0 * u);
         fill_round(pm, sw, 9.0 * u, if on { ACCENT } else { TRACK });
         let knob_x = if on {
@@ -4425,13 +4558,13 @@ impl Panel {
                 fg
             },
         );
-        let label = t(label);
-        let (tw, th) = r.measure(label, st);
+        let label = fit(r, t(label), st, rect.width() - 12.0 * u);
+        let (tw, th) = r.measure(&label, st);
         r.draw_text(
             pm,
             (rect.left() + (rect.width() - tw) / 2.0).round(),
             (rect.top() + (rect.height() - th) / 2.0).round(),
-            label,
+            &label,
             st,
         );
         self.hits.push((rect, Hit::Button(b)));
@@ -4935,15 +5068,19 @@ const PHONE_WHEN: [(PhoneWhen, &str); 3] = [
     (PhoneWhen::Never, "Never"),
 ];
 
+fn rgba(r: u8, g: u8, b: u8, a: u8) -> ColorU8 {
+    ColorU8::from_rgba(r, g, b, a)
+}
+
+fn overlaps(a: Rect, b: Rect) -> bool {
+    a.left() < b.right() && b.left() < a.right() && a.top() < b.bottom() && b.top() < a.bottom()
+}
+
 /// The Special days switch, with what today is.
 fn special_label(v: &View) -> &'static str {
-    let tr = i18n::is_turkish();
     match (v.silence, v.special) {
-        (true, _) if tr => "Özel günler · saygı duruşu",
         (true, _) => "Special days · minute of silence",
-        (_, Some(crate::special::Day::Remembrance)) if tr => "Özel günler · bugün 10 Kasım",
         (_, Some(crate::special::Day::Remembrance)) => "Special days · 10 November today",
-        (_, Some(crate::special::Day::National)) if tr => "Özel günler · bayram",
         (_, Some(crate::special::Day::National)) => "Special days · a holiday today",
         _ => "Special days",
     }
@@ -4965,30 +5102,11 @@ fn parse_day_month(s: &str) -> Option<(u32, u32, Option<i32>)> {
 }
 
 /// "14 March" / "14 Mart", with the year for one-off days.
-fn day_date_text(d: &crate::days::Day, tr: bool) -> String {
-    const EN: [&str; 12] = [
-        "January",
-        "February",
-        "March",
-        "April",
-        "May",
-        "June",
-        "July",
-        "August",
-        "September",
-        "October",
-        "November",
-        "December",
-    ];
-    const TR: [&str; 12] = [
-        "Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", "Temmuz", "Ağustos", "Eylül", "Ekim",
-        "Kasım", "Aralık",
-    ];
-    let m = (d.month as usize).clamp(1, 12) - 1;
-    let month = if tr { TR[m] } else { EN[m] };
+fn day_date_text(d: &crate::days::Day) -> String {
+    let date = crate::days::day_month(d.day, d.month);
     match d.year.filter(|_| d.once) {
-        Some(y) => format!("{} {month} {y}", d.day),
-        None => format!("{} {month}", d.day),
+        Some(y) => format!("{date} {y}"),
+        None => date,
     }
 }
 
@@ -5054,6 +5172,152 @@ mod tests {
             version: "test",
             ..View::default()
         }
+    }
+
+    #[test]
+    fn language_dropdown_scrolls_selects_and_cancels() {
+        let mut r = Renderer::new(false, Vec::new());
+        let mut p = Panel::new_window(1.0);
+        // Small enough to need a scrollbar and to exercise popup placement.
+        let mut pm = Pixmap::new(640, 460).unwrap();
+        let mut v = view();
+        v.settings.language = Lang::En;
+        p.draw(&mut pm, &mut r, &v);
+        let (x, y) = find(&p, Hit::Dropdown(Field::Language));
+        assert_eq!(p.pointer_up(x, y, &v), None);
+        p.draw(&mut pm, &mut r, &v);
+        assert!(p.is_editing());
+        let page_scroll = p.scroll;
+        p.scroll_by(-100.0, pm.height());
+        p.draw(&mut pm, &mut r, &v);
+        assert_eq!(
+            p.scroll, page_scroll,
+            "wheel scrolls the list, not the page"
+        );
+        let last = crate::i18n::LANGS.len();
+        let (x, y) = find(&p, Hit::Choice(Field::Language, last));
+        let selected = p.pointer_up(x, y, &v);
+        assert!(matches!(selected, Some(Action::Settings(s)) if s.language == Lang::ZhCn));
+        assert!(!p.is_editing());
+
+        // Opening on a language near the bottom reveals its selected row.
+        v.settings.language = Lang::ZhTw;
+        p.draw(&mut pm, &mut r, &v);
+        let (x, y) = find(&p, Hit::Dropdown(Field::Language));
+        p.pointer_up(x, y, &v);
+        p.draw(&mut pm, &mut r, &v);
+        assert!(
+            p.hits
+                .iter()
+                .any(|(_, h)| *h == Hit::Choice(Field::Language, last - 1))
+        );
+        p.key(Key::Text("x".into()), &v);
+        assert!(p.is_editing(), "typing doesn't close the list");
+        assert_eq!(p.key(Key::Escape, &v), (true, None));
+        assert!(!p.is_editing());
+        assert_eq!(
+            v.settings.language,
+            Lang::ZhTw,
+            "Escape leaves settings unchanged"
+        );
+    }
+
+    #[test]
+    fn dropdown_keyboard_and_outside_click() {
+        let mut r = Renderer::new(false, Vec::new());
+        let mut p = Panel::new_window(1.0);
+        let mut pm = Pixmap::new(640, 460).unwrap();
+        let mut v = view();
+        v.settings.language = Lang::Auto;
+        p.draw(&mut pm, &mut r, &v);
+        let (x, y) = find(&p, Hit::Dropdown(Field::Language));
+        p.pointer_up(x, y, &v);
+        p.draw(&mut pm, &mut r, &v);
+        for key in [Key::End, Key::Up, Key::Home, Key::Down] {
+            assert_eq!(p.key(key, &v), (true, None));
+            p.draw(&mut pm, &mut r, &v);
+        }
+        let (_, selected) = p.key(Key::Enter, &v);
+        assert!(matches!(selected, Some(Action::Settings(s)) if s.language == Lang::En));
+        assert!(p.dropdown.is_none());
+        p.draw(&mut pm, &mut r, &v);
+        let (x, y) = find(&p, Hit::Dropdown(Field::Language));
+        p.pointer_up(x, y, &v);
+        p.draw(&mut pm, &mut r, &v);
+        p.pointer_up(0.0, 0.0, &v);
+        assert!(p.dropdown.is_none());
+        p.draw(&mut pm, &mut r, &v);
+        let (x, y) = find(&p, Hit::Dropdown(Field::Language));
+        p.pointer_up(x, y, &v);
+        p.set_page(Page::Dog);
+        assert!(p.dropdown.is_none(), "changing pages closes its popup");
+    }
+
+    #[test]
+    fn all_languages_draw_in_a_small_settings_window() {
+        let mut r = Renderer::new(false, Vec::new());
+        for (lang, _, _) in crate::i18n::LANGS {
+            crate::i18n::with_lang(lang, || {
+                let mut p = Panel::new_window(1.0);
+                let mut v = view();
+                v.settings.language = lang;
+                let mut pm = Pixmap::new(640, 460).unwrap();
+                for (_, pages) in SIDEBAR {
+                    for page in pages {
+                        p.set_page(*page);
+                        p.draw(&mut pm, &mut r, &v);
+                        assert!(
+                            p.hits.iter().all(|(rect, _)| {
+                                rect.left() >= 0.0
+                                    && rect.top() >= 0.0
+                                    && rect.right() <= pm.width() as f32
+                                    && rect.bottom() <= pm.height() as f32
+                            }),
+                            "{lang:?}: {page:?} has a hit outside the window"
+                        );
+                    }
+                }
+                p.set_page(Page::General);
+                p.draw(&mut pm, &mut r, &v);
+                let (x, y) = find(&p, Hit::Dropdown(Field::Language));
+                p.pointer_up(x, y, &v);
+                // Resize while the list is open: its anchor is updated, its selection visible.
+                let mut pm = Pixmap::new(780, 580).unwrap();
+                p.draw(&mut pm, &mut r, &v);
+                let selected = crate::i18n::LANGS
+                    .iter()
+                    .position(|(l, ..)| *l == lang)
+                    .unwrap()
+                    + 1;
+                let (_, hit) = p
+                    .hits
+                    .iter()
+                    .find(|(_, h)| *h == Hit::Choice(Field::Language, selected))
+                    .expect("selected language visible");
+                assert_eq!(*hit, Hit::Choice(Field::Language, selected));
+                p.key(Key::Escape, &v);
+                assert_eq!(v.settings.language, lang);
+            });
+        }
+    }
+
+    #[test]
+    fn long_choices_use_the_same_dropdown() {
+        let mut r = Renderer::new(false, Vec::new());
+        let mut p = Panel::new_window(1.0);
+        let mut pm = Pixmap::new(640, 460).unwrap();
+        let v = view();
+        p.set_page(Page::Schedule);
+        crate::i18n::with_lang(Lang::Ru, || {
+            p.draw(&mut pm, &mut r, &v);
+            let (x, y) = find(&p, Hit::Dropdown(Field::JobPreset));
+            p.pointer_up(x, y, &v);
+            p.draw(&mut pm, &mut r, &v);
+            let (x, y) = find(&p, Hit::Choice(Field::JobPreset, 2));
+            assert_eq!(p.pointer_up(x, y, &v), None);
+            assert_eq!(p.job.schedule, JOB_PRESETS[2].1);
+            assert!(p.dropdown.is_none());
+        });
     }
 
     fn center(r: Rect) -> (f32, f32) {

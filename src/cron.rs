@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use chrono::{Local, TimeZone};
 use serde::{Deserialize, Serialize};
 
+use crate::i18n::tf_in;
 use crate::notify::{Mood, Notification, Notifier};
 
 /// What a job does when it is due.
@@ -174,9 +175,15 @@ impl Schedule {
         self.cron.find_next_occurrence(&t, false).ok()
     }
 
-    /// The schedule in words ("every day at 09:00", "every 15 minutes, 9-17, Mon-Fri").
-    pub fn describe(&self, turkish: bool) -> String {
-        if let Some(s) = self.describe_short(turkish) {
+    /// The schedule in words ("every day at 09:00", "every 15 minutes, 9-17, Mon-Fri"), in the
+    /// app's language.
+    pub fn describe(&self) -> String {
+        self.describe_in(crate::i18n::code())
+    }
+
+    /// [`Schedule::describe`] in the language with `code`.
+    pub fn describe_in(&self, code: &str) -> String {
+        if let Some(s) = self.describe_short(code) {
             return s;
         }
         let s = self.cron.describe();
@@ -189,7 +196,7 @@ impl Schedule {
     }
 
     /// The common shapes in a few words; `None` for the rest.
-    fn describe_short(&self, turkish: bool) -> Option<String> {
+    fn describe_short(&self, code: &str) -> Option<String> {
         let f: Vec<&str> = self.expr.split_whitespace().collect();
         let [min, hour, dom, month, dow] = f[..] else {
             return None;
@@ -197,80 +204,59 @@ impl Schedule {
         if month != "*" {
             return None;
         }
+        // Turkish puts "at" and "on the" on the number as a suffix: 09:00'da, ayın 6'sında.
+        let turkish = code == "tr";
         let num = |s: &str| s.parse::<u32>().ok();
         if hour == "*" && dom == "*" && dow == "*" {
             if min == "*" {
-                return Some(
-                    if turkish {
-                        "her dakika"
-                    } else {
-                        "every minute"
-                    }
-                    .into(),
-                );
+                return Some(tf_in(code, "every minute", &[]));
             }
             if let Some(n) = min.strip_prefix("*/").and_then(num) {
-                return Some(if turkish {
-                    format!("her {n} dakikada")
-                } else {
-                    format!("every {n} minutes")
-                });
+                return Some(tf_in(code, "every {n} minutes", &[("n", &n.to_string())]));
             }
             let m = num(min)?;
-            return Some(if turkish {
-                format!("her saat :{m:02}'{}", locative(m))
-            } else {
-                format!("every hour at :{m:02}")
-            });
+            let mut at = format!("{m:02}");
+            if turkish {
+                at = format!("{at}'{}", locative(m));
+            }
+            return Some(tf_in(code, "every hour at :{m}", &[("m", &at)]));
         }
         let (m, h) = (num(min)?, num(hour)?);
-        if !turkish {
-            let at = format!("{h:02}:{m:02}");
-            return match (dom, dow) {
-                ("*", "*") => Some(format!("every day at {at}")),
-                ("*", d) if d == "1-5" || d.eq_ignore_ascii_case("MON-FRI") => {
-                    Some(format!("weekdays at {at}"))
-                }
-                ("*", d) => Some(format!("{}s at {at}", EN_DAYS[weekday(d)? as usize % 7])),
-                (d, "*") => Some(format!("on day {} of every month at {at}", num(d)?)),
-                _ => None,
-            };
+        let mut at = format!("{h:02}:{m:02}");
+        if turkish {
+            at = format!("{at}'{}", locative(if m == 0 { h } else { m }));
         }
-        let at = format!("{h:02}:{m:02}'{}", locative(if m == 0 { h } else { m }));
+        let at = [("at", at.as_str())];
         match (dom, dow) {
-            ("*", "*") => Some(format!("her gün {at}")),
+            ("*", "*") => Some(tf_in(code, "every day at {at}", &at)),
             ("*", d) if d == "1-5" || d.eq_ignore_ascii_case("MON-FRI") => {
-                Some(format!("hafta içi {at}"))
+                Some(tf_in(code, "weekdays at {at}", &at))
             }
-            ("*", d) => Some(format!("{} {at}", TR_DAYS[weekday(d)? as usize % 7])),
+            ("*", d) => Some(match weekday(d)? % 7 {
+                0 => tf_in(code, "Sundays at {at}", &at),
+                1 => tf_in(code, "Mondays at {at}", &at),
+                2 => tf_in(code, "Tuesdays at {at}", &at),
+                3 => tf_in(code, "Wednesdays at {at}", &at),
+                4 => tf_in(code, "Thursdays at {at}", &at),
+                5 => tf_in(code, "Fridays at {at}", &at),
+                _ => tf_in(code, "Saturdays at {at}", &at),
+            }),
             (d, "*") => {
                 let d = num(d)?;
-                Some(format!("her ayın {d}'{} {at}", ordinal_locative(d)))
+                let mut n = d.to_string();
+                if turkish {
+                    n = format!("{n}'{}", ordinal_locative(d));
+                }
+                Some(tf_in(
+                    code,
+                    "on day {n} of every month at {at}",
+                    &[("n", n.as_str()), at[0]],
+                ))
             }
             _ => None,
         }
     }
 }
-
-const EN_DAYS: [&str; 7] = [
-    "Sunday",
-    "Monday",
-    "Tuesday",
-    "Wednesday",
-    "Thursday",
-    "Friday",
-    "Saturday",
-];
-
-const TR_DAYS: [&str; 7] = [
-    "pazar",
-    "pazartesi",
-    "salı",
-    "çarşamba",
-    "perşembe",
-    "cuma",
-    "cumartesi",
-];
 
 /// `@daily` and friends as five fields.
 fn shortcut(name: &str) -> Option<&'static str> {
@@ -402,7 +388,7 @@ impl Cron {
         let schedule = Schedule::parse(&n.schedule)?;
         validate(&n.action)?;
         let name = match n.name.trim() {
-            "" => schedule.describe(false),
+            "" => schedule.describe_in("en"),
             s => s.to_string(),
         };
         let mut st = self.inner.state.lock().unwrap();
@@ -971,7 +957,11 @@ mod tests {
 
     #[test]
     fn descriptions() {
-        let d = |e: &str, tr: bool| Schedule::parse(e).unwrap().describe(tr);
+        let d = |e: &str, tr: bool| {
+            Schedule::parse(e)
+                .unwrap()
+                .describe_in(if tr { "tr" } else { "en" })
+        };
         assert_eq!(d("* * * * *", false), "every minute");
         assert_eq!(d("0 9 * * *", false), "every day at 09:00");
         assert_eq!(d("0 9 * * 1-5", false), "weekdays at 09:00");

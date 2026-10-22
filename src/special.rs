@@ -8,6 +8,8 @@
 
 use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike};
 
+use crate::i18n::t;
+
 /// What a day brings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Day {
@@ -50,48 +52,29 @@ pub fn remembrance_due(now: NaiveDateTime) -> bool {
 }
 
 /// The remembrance bubble: (title, text).
-pub fn remembrance_text(turkish: bool) -> (&'static str, &'static str) {
-    if turkish {
-        (
-            "10 Kasım",
-            "Cumhuriyetimizin kurucusu Ulu Önder Mustafa Kemal Atatürk'ü, ebediyete intikalinin yıl dönümünde saygı, sevgi ve özlemle anıyoruz.",
-        )
-    } else {
-        (
-            "10 November",
-            "Remembering Mustafa Kemal Atatürk, founder of the Republic of Türkiye, who died on this day in 1938 at 09:05.",
-        )
-    }
+pub fn remembrance_text() -> (String, String) {
+    (
+        t("10 November").into(),
+        t("Remembering Mustafa Kemal Atatürk, founder of the Republic of Türkiye, who died on this day in 1938 at 09:05.").into(),
+    )
 }
 
 /// The text of the first holiday bubble of a national holiday, if it has one.
-pub fn holiday_text(d: NaiveDate, turkish: bool) -> Option<(&'static str, &'static str)> {
-    let (tr, en) = match (d.month(), d.day()) {
+pub fn holiday_text(d: NaiveDate) -> Option<(String, String)> {
+    let (title, body) = match (d.month(), d.day()) {
         (4, 23) => (
-            ("23 Nisan", "Ulusal Egemenlik ve Çocuk Bayramı kutlu olsun!"),
-            ("23 April", "Happy National Sovereignty and Children's Day!"),
+            t("23 April"),
+            t("Happy National Sovereignty and Children's Day!"),
         ),
         (5, 19) => (
-            (
-                "19 Mayıs",
-                "Atatürk'ü Anma, Gençlik ve Spor Bayramı kutlu olsun!",
-            ),
-            (
-                "19 May",
-                "Happy Commemoration of Atatürk, Youth and Sports Day!",
-            ),
+            t("19 May"),
+            t("Happy Commemoration of Atatürk, Youth and Sports Day!"),
         ),
-        (8, 30) => (
-            ("30 Ağustos", "Zafer Bayramı kutlu olsun!"),
-            ("30 August", "Happy Victory Day!"),
-        ),
-        (10, 29) => (
-            ("29 Ekim", "Cumhuriyet Bayramı kutlu olsun!"),
-            ("29 October", "Happy Republic Day!"),
-        ),
+        (8, 30) => (t("30 August"), t("Happy Victory Day!")),
+        (10, 29) => (t("29 October"), t("Happy Republic Day!")),
         _ => return None,
     };
-    Some(if turkish { tr } else { en })
+    Some((title.into(), body.into()))
 }
 
 /// A remembrance siren: a slow rise, a long steady tone and a fall (16-bit mono WAV).
@@ -256,7 +239,15 @@ mod tests {
         assert_eq!(Day::on(d("2026-10-29")), Some(Day::National));
         assert_eq!(Day::on(d("2026-10-28")), None);
         assert_eq!(Pin::on(d("2026-11-10")), Some(Pin::Ribbon));
-        assert!(holiday_text(d("2026-04-23"), true).is_some());
+        assert!(holiday_text(d("2026-04-23")).is_some());
+        let tr = crate::i18n::with_lang(crate::settings::Lang::Tr, || {
+            (holiday_text(d("2026-10-29")), remembrance_text().0)
+        });
+        assert_eq!(
+            tr.0,
+            Some(("29 Ekim".into(), "Cumhuriyet Bayramı kutlu olsun!".into()))
+        );
+        assert_eq!(tr.1, "10 Kasım");
     }
 
     #[test]

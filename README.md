@@ -239,7 +239,16 @@ Click the tray (menu bar) icon for the quick panel; its ⚙ (or *All settings…
 menu) opens the **settings window**, with a sidebar of pages: General (language, which screen the
 dog lives on), Dog, Look, Play, Special days, Sound, Phone, Agents, Todo, Schedule, History and
 Connect.
-The app speaks English and Turkish (*Language*: the system's, or either one).
+**Language** is a drop-down in General: follow the system or choose English, Türkçe, Deutsch,
+Français, Español, Italiano, Português (Brasil), Nederlands, Polski, Русский, Українська,
+العربية, Bahasa Indonesia, 日本語, 한국어, 繁體中文 (Taiwan) or 简体中文. The list scrolls;
+arrow keys and Enter select, Esc cancels. Long choices elsewhere also become drop-downs when
+they cannot fit in one row.
+
+Translations are built into the app. See [locales/README.md](locales/README.md) to review or
+improve one. The new translations are AI-assisted and welcome native-speaker review. Arabic
+text is shaped right to left, but the settings layout is not mirrored yet. CJK and Arabic need
+appropriate system fonts; on Linux, install the matching Noto font packages if glyphs are missing.
 
 Click the tray (menu bar) icon for settings. Everything in `settings.json` can be changed there:
 size and text, the dog's name, birthday and look, source colours, the toy (**Play**), walking and
