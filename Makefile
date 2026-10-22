@@ -5,7 +5,8 @@ WIN_EXE    := target/$(WIN_TARGET)/release/dost.exe
 # and can lock the file.
 WIN_DIR     = $(shell wslpath "$$(cmd.exe /c 'echo %LOCALAPPDATA%' 2>/dev/null | tr -d '\r')")/dost
 
-MAC_TARGETS := aarch64-apple-darwin x86_64-apple-darwin
+# Apple silicon only by default; releases (CI) add x86_64-apple-darwin for a universal app.
+MAC_TARGETS ?= aarch64-apple-darwin
 APP         := target/Dost.app
 VERSION     := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 # codesign identity: "-" (ad hoc) or "Developer ID Application: ..." for a release.
@@ -28,7 +29,7 @@ help:
 	@echo "make build-windows           Release build for Windows from WSL ($(WIN_EXE))"
 	@echo "make run-windows             Build, copy to Windows and start it"
 	@echo "make stop-windows            Stop a running dost.exe"
-	@echo "make app                     (on a Mac) Universal Dost.app in target/"
+	@echo "make app                     (on a Mac) Dost.app in target/ (Apple silicon)"
 	@echo "make dmg                     (on a Mac) Dost-$(VERSION).dmg in target/"
 	@echo "make notarize SIGN_ID=...     (on a Mac) Signed, notarized and stapled dmg"
 	@echo "make install-opencode-plugin Install the OpenCode plugin from this checkout"

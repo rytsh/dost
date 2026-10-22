@@ -358,7 +358,6 @@ enum Button {
     OpenDir,
     Version,
     Quit,
-    Close,
     AllSettings,
     PhoneTest,
     NewTopic,
@@ -933,8 +932,6 @@ impl Panel {
             (p, _) => t(p.title()).to_string(),
         };
         r.draw_text(pm, px, title_y, &title, sys(22.0 * u, true, INK));
-        let close = Rect::from_xywh(w - 40.0 * u, 16.0 * u, 26.0 * u, 26.0 * u);
-        self.button_icon(pm, close, Glyph::Close, Button::Close);
         let by = title_y + 46.0 * u;
         self.cx = px;
         self.cw = pw;
@@ -1031,7 +1028,7 @@ impl Panel {
         fill_round(pm, Rect::from_xywh(x, by, 3.0 * u, bar_h), 1.5 * u, TRACK);
     }
 
-    /// Name, the dog's state as a colored pill, a gear (the settings window), close button.
+    /// Name, the dog's state as a colored pill and a gear (the settings window).
     fn header(
         &mut self,
         pm: &mut Pixmap,
@@ -1078,19 +1075,12 @@ impl Panel {
         }
 
         let gear = Rect::from_xywh(
-            x + inner - 56.0 * u,
-            y + (HEADER * u - 26.0 * u) / 2.0,
-            26.0 * u,
-            26.0 * u,
-        );
-        self.button_icon(pm, gear, Glyph::Gear, Button::AllSettings);
-        let close = Rect::from_xywh(
             x + inner - 26.0 * u,
             y + (HEADER * u - 26.0 * u) / 2.0,
             26.0 * u,
             26.0 * u,
         );
-        self.button_icon(pm, close, Glyph::Close, Button::Close);
+        self.button_icon(pm, gear, Glyph::Gear, Button::AllSettings);
         y + HEADER * u + GAP * u
     }
 
@@ -3215,7 +3205,6 @@ impl Panel {
                     Button::OpenDir => Action::OpenConfigDir,
                     Button::Version => Action::CheckUpdate,
                     Button::Quit => Action::Quit,
-                    Button::Close => Action::Close,
                     Button::AllSettings => Action::OpenSettings,
                     Button::PhoneTest => Action::PhoneTest,
                     Button::NewTopic => Action::NewTopic,
