@@ -252,6 +252,8 @@ pub enum Event {
     AllowAlways(String),
     /// A workspace tool did something worth keeping in History.
     Record(crate::mcp::HistoryEntry),
+    /// The special days changed: the dog's look may too.
+    DaysChanged,
 }
 
 impl Event {
@@ -274,6 +276,10 @@ impl Notifier {
 
     pub fn allow_always(&self, rule: String) -> bool {
         self.0.send(Event::AllowAlways(rule)).is_ok()
+    }
+
+    pub fn days_changed(&self) -> bool {
+        self.0.send(Event::DaysChanged).is_ok()
     }
 
     pub fn record(&self, entry: crate::mcp::HistoryEntry) -> bool {

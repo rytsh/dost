@@ -3,13 +3,13 @@
 //  - A permission request shows Allow / Always / Reject buttons in the dog's bubble; the
 //    click is sent back to OpenCode. Answering in the terminal withdraws the bubble.
 //  - A question (form) barks and shows its text; answer it in OpenCode.
-//  - Long tasks show a progress bar while they run; it turns green when done (the dog is
-//    happy) and red on errors, with how long it took.
+//  - When a task finishes the dog is happy and says how long it took; errors bark.
+//    The Agents list shows what each session is doing (a progress bar is optional).
 //
 // Install:  opencode plugin add 'github:rytsh/dost#main::path:integrations/opencode'
 // Options (opencode.json "plugins" entry, all optional):
 //   url ("http://127.0.0.1:7777/mcp"), question (true), permissions (true), done (true),
-//   error (true), progress (true), minWorkSeconds (10), lang ("en" | "tr")
+//   error (true), progress (false), minWorkSeconds (10), lang ("en" | "tr")
 // Debug:    start the OpenCode service with DOST_DEBUG=1; events go to <tmp>/dost-opencode.log
 
 import { execFile } from "node:child_process"
@@ -167,7 +167,8 @@ export default {
       permissions: opts.permissions !== false && opts.question !== false,
       done: opts.done !== false,
       error: opts.error !== false,
-      progress: opts.progress !== false,
+      // Off by default: the Agents list already shows what each session is doing.
+      progress: opts.progress === true,
     }
     const t = TEXT[opts.lang] ?? TEXT[(process.env.LANG ?? "").slice(0, 2)] ?? TEXT.en
     const minWorkMs = (typeof opts.minWorkSeconds === "number" ? opts.minWorkSeconds : 10) * 1000

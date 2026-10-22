@@ -267,6 +267,64 @@ fn main() {
             };
             (j, Some(now + 3 * 3600))
         };
+        let today = dost::look::today();
+        #[allow(clippy::too_many_arguments)]
+        fn day(
+            today: chrono::NaiveDate,
+            id: u64,
+            name: &str,
+            kind: dost::days::Kind,
+            (month, d): (u32, u32),
+            year: Option<i32>,
+            before: u32,
+            phone: bool,
+            next: i64,
+        ) -> (dost::days::Day, Option<chrono::NaiveDate>) {
+            (
+                dost::days::Day {
+                    id,
+                    name: name.into(),
+                    kind,
+                    month,
+                    day: d,
+                    year,
+                    once: false,
+                    message: String::new(),
+                    at: "09:00".into(),
+                    remind_days_before: before,
+                    look: dost::days::Look::Auto,
+                    phone,
+                    source: None,
+                },
+                Some(today + chrono::Duration::days(next)),
+            )
+        }
+        use dost::days::Kind;
+        let days = vec![
+            day(
+                today,
+                1,
+                "Ayşe",
+                Kind::Birthday,
+                (3, 14),
+                Some(1990),
+                1,
+                true,
+                3,
+            ),
+            day(
+                today,
+                2,
+                "Our wedding",
+                Kind::Anniversary,
+                (6, 2),
+                Some(2018),
+                7,
+                false,
+                40,
+            ),
+            day(today, 3, "Pi day", Kind::Other, (3, 14), None, 0, false, 3),
+        ];
         let jobs = vec![
             job(
                 1,
@@ -321,6 +379,8 @@ fn main() {
                 Page::Schedule,
                 "window-schedule-tr",
             ),
+            (dost::settings::Lang::En, Page::Days, "window-days"),
+            (dost::settings::Lang::Tr, Page::Days, "window-days-tr"),
         ] {
             dost::i18n::set(lang);
             let scale = 2.0;
@@ -351,6 +411,8 @@ fn main() {
                 todos: todo_lists(),
                 sessions: sessions.clone(),
                 jobs: jobs.clone(),
+                days: days.clone(),
+                builtins_off: vec![dost::days::Builtin::Halloween],
                 screens: 2,
                 special: Some(dost::special::Day::Remembrance),
                 ..Default::default()

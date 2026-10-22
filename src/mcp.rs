@@ -66,6 +66,8 @@ pub struct Mcp {
     sessions: Arc<crate::sessions::Sessions>,
     /// Scheduled jobs (`cron_*`).
     pub cron: Arc<crate::cron::Cron>,
+    /// The user's special days (`day_*`).
+    pub days: Arc<crate::days::Days>,
     /// The workspace tools at `/mcp/local`.
     pub local: crate::local::Local,
     /// The dog's name (settings), used in the tool descriptions.
@@ -146,6 +148,7 @@ impl Mcp {
         status: Arc<Mutex<DogStatus>>,
         sessions: Arc<crate::sessions::Sessions>,
         cron: Arc<crate::cron::Cron>,
+        days: Arc<crate::days::Days>,
     ) -> Self {
         Mcp {
             notifier,
@@ -154,6 +157,7 @@ impl Mcp {
             status,
             sessions,
             cron,
+            days,
             local: crate::local::Local::new(Default::default()),
             name: Mutex::new(crate::settings::DEFAULT_NAME.into()),
             cors: Mutex::new(Cors::default()),
@@ -638,6 +642,9 @@ impl Mcp {
             "cron_remove" => self.tool_cron_id(&args, "remove"),
             "cron_run" => self.tool_cron_id(&args, "run"),
             "cron_enable" => self.tool_cron_id(&args, "enable"),
+            "day_add" => self.tool_day_add(&args),
+            "day_list" => Ok(self.tool_day_list()),
+            "day_remove" => self.tool_day_remove(&args),
             "status" => Ok(self.tool_status()),
             "session" => self.tool_session(&args),
             "sessions" => Ok(self.tool_sessions()),
@@ -974,6 +981,101 @@ impl Mcp {
             "Job #{} \"{}\" scheduled ({}).{next} The user sees it in Schedule; cron_remove deletes it.",
             job.id, job.name, job.schedule
         ))
+    }
+
+    fn tool_day_add(&self, a: &Value) -> Result<String, String> {
+        use crate::days::{Kind, Look, NewDay};
+        let date = str_arg(a, "date").ok_or("`date` is required (MM-DD or YYYY-MM-DD)")?;
+        let parts: Vec<&str> = date.trim().split('-').collect();
+        let num = |s: &str| s.parse::<i64>().ok();
+        let (year, month, day) = match parts[..] {
+            [m, d] => (None, num(m), num(d)),
+            [y, m, d] => (num(y), num(m), num(d)),
+            _ => (None, None, None),
+        };
+        let (Some(month), Some(day)) = (month, day) else {
+            return Err(format!("`date` {date:?} must be MM-DD or YYYY-MM-DD"));
+        };
+        let kind = match str_arg(a, "kind").as_deref() {
+            None | Some("birthday") => Kind::Birthday,
+            Some("anniversary") => Kind::Anniversary,
+            Some("holiday") => Kind::Holiday,
+            Some("other") => Kind::Other,
+            Some(k) => return Err(format!("unknown kind `{k}`")),
+        };
+        let look = match str_arg(a, "look").as_deref() {
+            None | Some("auto") => Look::Auto,
+            Some("none") => Look::None,
+            Some("party_hat") => Look::PartyHat,
+            Some("heart") => Look::Heart,
+            Some("star") => Look::Star,
+            Some("ribbon") => Look::Ribbon,
+            Some("flag") => Look::Flag,
+            Some(l) => return Err(format!("unknown look `{l}`")),
+        };
+        let d = self.days.add(NewDay {
+            name: str_arg(a, "name").unwrap_or_default(),
+            kind,
+            month: month as u32,
+            day: day as u32,
+            year: year.map(|y| y as i32),
+            once: a.get("once").and_then(Value::as_bool).unwrap_or(false),
+            message: str_arg(a, "message").unwrap_or_default(),
+            at: str_arg(a, "at").unwrap_or_default(),
+            remind_days_before: a
+                .get("remind_days_before")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32,
+            look,
+            phone: a.get("phone").and_then(Value::as_bool).unwrap_or(false),
+            source: str_arg(a, "source"),
+        })?;
+        self.notifier.days_changed();
+        let next = self
+            .days
+            .next_date(&d, crate::look::today())
+            .map(|n| format!(" Next: {n}."))
+            .unwrap_or_default();
+        Ok(format!(
+            "Special day #{} \"{}\" added ({:02}-{:02}{}), the dog says so at {}.{next}",
+            d.id,
+            d.name,
+            d.month,
+            d.day,
+            if d.once { ", once" } else { ", every year" },
+            d.at
+        ))
+    }
+
+    fn tool_day_list(&self) -> String {
+        let days = self.days.list();
+        if days.is_empty() {
+            return "No special days of the user's own.".into();
+        }
+        let today = crate::look::today();
+        let list: Vec<Value> = days
+            .iter()
+            .map(|d| {
+                let mut v = serde_json::to_value(d).unwrap_or_default();
+                if let Some(n) = self.days.next_date(d, today) {
+                    v["next"] = json!(n.to_string());
+                }
+                v
+            })
+            .collect();
+        serde_json::to_string_pretty(&list).unwrap_or_default()
+    }
+
+    fn tool_day_remove(&self, a: &Value) -> Result<String, String> {
+        let id = a
+            .get("id")
+            .and_then(Value::as_u64)
+            .ok_or("`id` is required")?;
+        if !self.days.remove(id) {
+            return Err(format!("no special day #{id}"));
+        }
+        self.notifier.days_changed();
+        Ok(format!("Special day #{id} removed."))
     }
 
     fn tool_cron_list(&self) -> String {
@@ -1318,6 +1420,41 @@ fn cron_tools(name: &str) -> Value {
                 },
                 "required": ["schedule"]
             }
+        },
+        {
+            "name": "day_add",
+            "title": "Add a special day",
+            "description": format!("Adds a day {dog} remembers every year (or once): a birthday, an anniversary, a holiday. On the day {dog} shows a bubble at `at` (default 09:00), with how many years when the year is known, and can wear a party hat (birthdays) or a pin on its collar. It can remind days before, and go to the phone. The user sees them in Special days."),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Whose day or what it is (\"Ayşe\", \"Our wedding\")." },
+                    "date": { "type": "string", "description": "MM-DD, or YYYY-MM-DD when the year is known (the bubble then says how many years)." },
+                    "kind": { "type": "string", "enum": ["birthday", "anniversary", "holiday", "other"], "description": "Default birthday." },
+                    "once": { "type": "boolean", "description": "Only once (needs the year), not every year." },
+                    "message": { "type": "string", "description": "The bubble's text; default depends on the kind." },
+                    "at": { "type": "string", "description": "Local time of the bubble, HH:MM (default 09:00)." },
+                    "remind_days_before": { "type": "integer", "description": "Also remind this many days before (0-30)." },
+                    "look": { "type": "string", "enum": ["auto", "none", "party_hat", "heart", "star", "ribbon", "flag"], "description": "What the dog wears on the day; auto: party hat for birthdays, a heart for anniversaries, a star for holidays." },
+                    "phone": { "type": "boolean", "description": "Also send it to the user's phone (if set up)." },
+                    "source": source
+                },
+                "required": ["name", "date"]
+            }
+        },
+        {
+            "name": "day_list",
+            "title": "Special days",
+            "description": "Lists the user's own special days with the next date of each.",
+            "inputSchema": { "type": "object", "properties": {} },
+            "annotations": { "readOnlyHint": true }
+        },
+        {
+            "name": "day_remove",
+            "title": "Remove a special day",
+            "description": "Removes one of the user's special days by id.",
+            "inputSchema": { "type": "object", "properties": { "id": { "type": "integer" } }, "required": ["id"] },
+            "annotations": { "destructiveHint": true }
         },
         {
             "name": "cron_list",
@@ -1868,6 +2005,7 @@ mod tests {
                 Arc::default(),
                 Arc::default(),
                 crate::cron::Cron::new(tx, None),
+                Arc::new(crate::days::Days::new(None)),
             ),
             rx,
         )
@@ -1931,6 +2069,9 @@ mod tests {
                 "list_watches",
                 "remove_watch",
                 "cron_add",
+                "day_add",
+                "day_list",
+                "day_remove",
                 "cron_list",
                 "cron_remove",
                 "cron_run",

@@ -142,6 +142,10 @@ pub enum Pin {
     Ribbon,
     /// A small Turkish flag.
     Flag,
+    /// A small red heart (the user's anniversaries).
+    Heart,
+    /// A small gold star (the user's holidays).
+    Star,
 }
 
 impl Pin {
@@ -198,6 +202,41 @@ impl Pin {
                     ('o', [0x5a, 0x3b, 0x22, 255]),
                 ],
             ),
+            Pin::Heart => (
+                &[
+                    ".ooo.ooo.", //
+                    "orrrorrro", //
+                    "orhrrrrro", //
+                    "orrrrrrro", //
+                    ".orrrrro.", //
+                    "..orrro..", //
+                    "...oro...", //
+                    "....o....", //
+                ],
+                &[
+                    ('r', [0xe0, 0x2a, 0x3c, 255]),
+                    ('h', [0xff, 0x9a, 0xa8, 255]),
+                    ('o', [0x7a, 0x10, 0x1e, 255]),
+                ],
+            ),
+            Pin::Star => (
+                &[
+                    "....o....", //
+                    "...oyo...", //
+                    "oooyhyooo", //
+                    "oyyyyyyyo", //
+                    ".oyyyyyo.", //
+                    "..oyyyo..", //
+                    ".oyyoyyo.", //
+                    ".oyo.oyo.", //
+                    ".oo...oo.", //
+                ],
+                &[
+                    ('y', [0xf5, 0xc5, 0x18, 255]),
+                    ('h', [0xff, 0xf0, 0xa0, 255]),
+                    ('o', [0x8a, 0x5a, 0x08, 255]),
+                ],
+            ),
         }
     }
 }
@@ -242,7 +281,7 @@ mod tests {
 
     #[test]
     fn pins_are_rectangular() {
-        for p in [Pin::Ribbon, Pin::Flag] {
+        for p in [Pin::Ribbon, Pin::Flag, Pin::Heart, Pin::Star] {
             let (rows, colors) = p.pixels();
             assert!(rows.iter().all(|r| r.len() == rows[0].len()));
             assert!(

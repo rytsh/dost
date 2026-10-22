@@ -73,6 +73,8 @@ pub enum Page {
     Todo,
     /// Scheduled jobs (cron).
     Schedule,
+    /// Built-in and the user's own special days.
+    Days,
     History,
     Connect,
     /// Answering a question in words (opened from the bubble's "Reply…").
@@ -91,6 +93,7 @@ impl Page {
             Page::Agents => "Agents",
             Page::Todo => "Todo",
             Page::Schedule => "Schedule",
+            Page::Days => "Special days",
             Page::History => "History",
             Page::Connect => "Connect",
             Page::Reply => "Reply",
@@ -108,6 +111,7 @@ impl Page {
             Page::Agents => Glyph::Agents,
             Page::Todo => Glyph::Check,
             Page::Schedule => Glyph::Calendar,
+            Page::Days => Glyph::Star,
             Page::History => Glyph::Clock,
             Page::Connect => Glyph::Plug,
             Page::Reply => Glyph::Agents,
@@ -127,6 +131,37 @@ pub enum CronEdit {
     Remove(u64),
     Enable(u64, bool),
     Run(u64),
+}
+
+/// A change to the special days, from their page.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DaysEdit {
+    Add(crate::days::NewDay),
+    Remove(u64),
+    Builtin(crate::days::Builtin, bool),
+}
+
+/// The kinds of day, as the Special days page offers them.
+const DAY_KINDS: [(crate::days::Kind, &str); 4] = [
+    (crate::days::Kind::Birthday, "Birthday"),
+    (crate::days::Kind::Anniversary, "Anniversary"),
+    (crate::days::Kind::Holiday, "Holiday"),
+    (crate::days::Kind::Other, "Other"),
+];
+/// How many days before to remind.
+const DAY_BEFORE: [(u32, &str); 4] = [(0, "No"), (1, "1 day"), (3, "3 days"), (7, "1 week")];
+
+/// The day being put together on the Special days page.
+#[derive(Clone, Debug, Default)]
+struct DayDraft {
+    name: String,
+    /// "DD.MM" or "DD.MM.YYYY" as typed.
+    date: String,
+    kind: usize,
+    before: usize,
+    once: bool,
+    phone: bool,
+    error: Option<String>,
 }
 
 /// The kinds of job, as the Schedule page offers them.
@@ -163,7 +198,7 @@ const TABS_POPOVER: [Page; 7] = [
 const SIDEBAR: [(&str, &[Page]); 4] = [
     (
         "Basics",
-        &[Page::General, Page::Dog, Page::Look, Page::Play],
+        &[Page::General, Page::Dog, Page::Look, Page::Play, Page::Days],
     ),
     ("Notifications", &[Page::Sound, Page::Phone]),
     (
@@ -233,6 +268,8 @@ pub enum Action {
     ClearSessions,
     /// A change to the scheduled jobs.
     Cron(CronEdit),
+    /// A change to the special days.
+    Days(DaysEdit),
     RemoveSession(String),
     /// The version in the footer: checks for updates (or restarts into an installed one).
     CheckUpdate,
@@ -268,6 +305,10 @@ pub struct View {
     pub todos: Vec<crate::todo::List>,
     /// Scheduled jobs, each with its next run (Unix seconds).
     pub jobs: Vec<(crate::cron::Job, Option<u64>)>,
+    /// The user's special days, each with its next date.
+    pub days: Vec<(crate::days::Day, Option<chrono::NaiveDate>)>,
+    /// Which built-in days are off.
+    pub builtins_off: Vec<crate::days::Builtin>,
     /// What agents are doing.
     pub sessions: Vec<Session>,
     /// A phone channel's last problem.
@@ -292,6 +333,8 @@ pub struct HistoryItem {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Hit {
     Tab(Page),
+    /// A special day's ✕ (its id).
+    DayRemove(u64),
     /// A scheduled job's switch, Run now and ✕ (job id).
     JobToggle(u64),
     JobRun(u64),
@@ -340,6 +383,9 @@ enum TextField {
     NewList,
     NtfyServer,
     NtfyTopic,
+    /// A new special day: whose, and when.
+    DayName,
+    DayDate,
     /// A new scheduled job: its schedule and what it does (text, URL or command).
     JobSchedule,
     JobWhat,
@@ -391,6 +437,9 @@ enum Field {
     /// A new job: its kind, and a quick schedule.
     JobKind,
     JobPreset,
+    /// A new special day: its kind, and the reminder before.
+    DayKind,
+    DayBefore,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -416,6 +465,11 @@ enum Toggle {
     LocalReadOnly,
     /// A new job tells about every run, not only failures.
     JobNotifyAlways,
+    /// A built-in special day.
+    Builtin(crate::days::Builtin),
+    /// A new special day: only once; also to the phone.
+    DayOnce,
+    DayPhone,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -436,6 +490,7 @@ enum Button {
     ReplyCancel,
     ClearSessions,
     AddJob,
+    AddDay,
 }
 
 /// A key typed while a text field is being edited.
@@ -482,6 +537,8 @@ pub struct Panel {
     reply: Option<(u64, String, String, Page)>,
     /// The new job being put together on the Schedule page.
     job: JobDraft,
+    /// The new special day being put together.
+    day: DayDraft,
     /// Draws an arrow at the top pointing at this x (physical, panel-relative).
     arrow: Option<f32>,
     /// Missed while hidden; shown as a badge on History.
@@ -510,6 +567,7 @@ impl Panel {
             cw: 0.0,
             reply: None,
             job: JobDraft::default(),
+            day: DayDraft::default(),
             arrow: None,
             missed: 0,
             editing: None,
@@ -633,6 +691,16 @@ impl Panel {
                     s.mcp_addr = t.to_string();
                 }
             }
+            TextField::DayName => {
+                self.day.name = t.to_string();
+                self.day.error = None;
+                return None;
+            }
+            TextField::DayDate => {
+                self.day.date = t.to_string();
+                self.day.error = None;
+                return None;
+            }
             TextField::JobSchedule => {
                 self.job.schedule = t.to_string();
                 self.job.error = None;
@@ -744,6 +812,8 @@ impl Panel {
             TextField::McpAddr => s.mcp_addr.clone(),
             TextField::NtfyServer => s.phone.ntfy.server.clone(),
             TextField::LocalRoot => s.local_mcp.root.clone(),
+            TextField::DayName => self.day.name.clone(),
+            TextField::DayDate => self.day.date.clone(),
             TextField::JobSchedule => self.job.schedule.clone(),
             TextField::JobWhat => self.job.what.clone(),
             TextField::AddLocalDir => String::new(),
@@ -1059,6 +1129,7 @@ impl Panel {
                 Page::Agents => self.page_agents(c, r, cy, x, inner, v),
                 Page::Todo => self.tab_todo(c, r, cy, x, inner, v),
                 Page::Schedule => self.page_schedule(c, r, cy, x, inner, v),
+                Page::Days => self.page_days(c, r, cy, x, inner, v),
                 Page::History => self.tab_history(c, r, cy, x, inner, v),
                 Page::Connect => self.tab_connect(c, r, cy, x, inner, v),
                 Page::Reply => self.page_reply(c, r, cy, x, inner, v),
@@ -2001,67 +2072,22 @@ impl Panel {
             },
         );
         cy += GAP * u;
-        cy = self.section(pm, r, cy, x, "Special days");
-        let start = self.card(pm, cy, 2);
-        let label = match (v.silence, v.special) {
-            (true, _) => {
-                if i18n::is_turkish() {
-                    "Özel günler · saygı duruşu"
-                } else {
-                    "Special days · minute of silence"
-                }
-            }
-            (_, Some(crate::special::Day::Remembrance)) => {
-                if i18n::is_turkish() {
-                    "Özel günler · bugün 10 Kasım"
-                } else {
-                    "Special days · 10 November today"
-                }
-            }
-            (_, Some(crate::special::Day::National)) => {
-                if i18n::is_turkish() {
-                    "Özel günler · bayram"
-                } else {
-                    "Special days · a holiday today"
-                }
-            }
-            _ => "Special days",
-        };
-        cy = self.toggle_row(
-            pm,
-            r,
-            start,
-            x,
-            inner,
-            label,
-            s.special_days,
-            Toggle::SpecialDays,
-        );
-        let siren = if i18n::is_turkish() {
-            "09:05'te siren"
-        } else {
-            "Siren at 09:05"
-        };
-        cy = self.toggle_row(pm, r, cy, x, inner, siren, s.siren, Toggle::Siren);
-        let lines: &[&str] = if i18n::is_turkish() {
-            &[
-                "10 Kasım: gün boyu siyah kurdele; 09:05'te köpek durur,",
-                "bir dakika sessiz kalır, sonra Atatürk'ü anan bir balon.",
-                "Bayramlarda (23 Nisan, 19 Mayıs, 30 Ağustos, 29 Ekim)",
-                "tasmada küçük bir bayrak.",
-            ]
-        } else {
-            &[
-                "10 November: a black ribbon all day; at 09:05 the dog",
-                "stands still for a minute of silence, then remembers Atatürk.",
-                "National holidays (23 April, 19 May, 30 August,",
-                "29 October): a little flag on the collar.",
-            ]
-        };
-        for l in lines {
-            cy = self.note(pm, r, cy, x, l) - 6.0 * u;
+        // The details have their own page in the settings window.
+        if !self.window {
+            cy = self.section(pm, r, cy, x, "Special days");
+            let start = self.card(pm, cy, 1);
+            cy = self.toggle_row(
+                pm,
+                r,
+                start,
+                x,
+                inner,
+                special_label(v),
+                s.special_days,
+                Toggle::SpecialDays,
+            );
         }
-        cy += 6.0 * u + GAP * u;
+        cy += GAP * u;
         if self.window {
             cy = self.section(pm, r, cy, x, "App");
             let start = self.card(pm, cy, 3);
@@ -2446,6 +2472,311 @@ impl Panel {
             cy += 34.0 * u;
         }
         cy
+    }
+
+    /// Special days: the built-in ones with a switch each, the user's own, and a form to add one.
+    fn page_days(
+        &mut self,
+        pm: &mut Pixmap,
+        r: &mut Renderer,
+        y: f32,
+        x: f32,
+        inner: f32,
+        v: &View,
+    ) -> f32 {
+        use crate::days::Builtin;
+        let u = self.ui;
+        let tr = i18n::is_turkish();
+        let s = &v.settings;
+        let start = self.card(pm, y, 2);
+        let mut cy = self.toggle_row(
+            pm,
+            r,
+            start,
+            x,
+            inner,
+            special_label(v),
+            s.special_days,
+            Toggle::SpecialDays,
+        );
+        cy = self.toggle_row(
+            pm,
+            r,
+            cy,
+            x,
+            inner,
+            "Holiday outfits",
+            s.seasonal,
+            Toggle::Seasonal,
+        );
+        cy = self.note(
+            pm,
+            r,
+            cy,
+            x,
+            if tr {
+                "Her dilde aynı çalışır; yalnızca yazılar dile göre değişir."
+            } else {
+                "Works the same in every language; only the text follows it."
+            },
+        );
+        cy += GAP * u / 2.0;
+
+        // The built-in days.
+        cy = self.section(pm, r, cy, x, "Built in");
+        let rows: [(Builtin, &str, &str); 5] = [
+            (
+                Builtin::Remembrance,
+                "10 Kasım · Atatürk'ü anma",
+                "10 November · Remembering Atatürk",
+            ),
+            (
+                Builtin::National,
+                "Ulusal bayramlar",
+                "National holidays (Türkiye)",
+            ),
+            (
+                Builtin::DogBirthday,
+                "Köpeğin doğum günü",
+                "The dog's birthday",
+            ),
+            (Builtin::Halloween, "Cadılar Bayramı", "Halloween"),
+            (Builtin::Christmas, "Yılbaşı", "Christmas and New Year"),
+        ];
+        let start = self.card(pm, cy, rows.len() + 1);
+        cy = start;
+        for (b, label_tr, label_en) in rows {
+            let on = !v.builtins_off.contains(&b);
+            cy = self.toggle_row(
+                pm,
+                r,
+                cy,
+                x,
+                inner,
+                if tr { label_tr } else { label_en },
+                on,
+                Toggle::Builtin(b),
+            );
+        }
+        let siren = if tr {
+            "09:05'te siren (10 Kasım)"
+        } else {
+            "Siren at 09:05 (10 November)"
+        };
+        cy = self.toggle_row(pm, r, cy, x, inner, siren, s.siren, Toggle::Siren);
+        let lines: &[&str] = if tr {
+            &[
+                "10 Kasım: gün boyu siyah kurdele; 09:05'te bir dakika saygı duruşu.",
+                "Bayramlar (23 Nisan, 19 Mayıs, 30 Ağustos, 29 Ekim): tasmada bayrak.",
+            ]
+        } else {
+            &[
+                "10 November: a black ribbon all day; a minute of silence at 09:05.",
+                "23 April, 19 May, 30 August, 29 October: a flag on the collar.",
+            ]
+        };
+        for l in lines {
+            cy = self.note(pm, r, cy, x, l) - 6.0 * u;
+        }
+        cy += 6.0 * u + GAP * u / 2.0;
+
+        // The user's own days.
+        cy = self.section(pm, r, cy, x, "Your days");
+        if v.days.is_empty() {
+            cy = self.note(
+                pm,
+                r,
+                cy,
+                x,
+                if tr {
+                    "Doğum günleri, yıl dönümleri… Aşağıdan ekle ya da bir ajana söyle."
+                } else {
+                    "Birthdays, anniversaries… Add one below, or tell an agent."
+                },
+            );
+        } else {
+            let row_h = SESSION_ROW * u;
+            if let Some(card) = Rect::from_xywh(self.cx, cy, self.cw, v.days.len() as f32 * row_h) {
+                fill_card(pm, Some(card), u);
+            }
+            let today = crate::look::today();
+            for (i, (d, next)) in v.days.iter().enumerate() {
+                let ry = cy + i as f32 * row_h;
+                if i > 0
+                    && let Some(rule) = Rect::from_xywh(x + 12.0 * u, ry, inner - 24.0 * u, 1.0)
+                {
+                    fill_round(pm, Some(rule), 0.0, TRACK);
+                }
+                let icon = match d.kind {
+                    crate::days::Kind::Birthday => "🎂",
+                    crate::days::Kind::Anniversary => "💞",
+                    _ => "⭐",
+                };
+                let tx = x + 14.0 * u;
+                let right = x + inner - 40.0 * u;
+                let st = sys(12.5 * u, true, INK);
+                let shown = fit(r, &format!("{icon} {}", d.name), st, right - tx);
+                r.draw_text(pm, tx, ry + 5.0 * u, &shown, st);
+                let mut line = day_date_text(d, tr);
+                if let Some(n) = next {
+                    let left = (*n - today).num_days();
+                    line += &match (left, tr) {
+                        (0, true) => " · bugün!".to_string(),
+                        (0, false) => " · today!".to_string(),
+                        (1, true) => " · yarın".to_string(),
+                        (1, false) => " · tomorrow".to_string(),
+                        (n, true) => format!(" · {n} gün sonra"),
+                        (n, false) => format!(" · in {n} days"),
+                    };
+                    if let Some(y) = d.year.filter(|_| !d.once) {
+                        let years = chrono::Datelike::year(n) - y;
+                        if years > 0 {
+                            line += &if tr {
+                                format!(" ({years}. yıl)")
+                            } else {
+                                format!(" ({years} years)")
+                            };
+                        }
+                    }
+                }
+                if d.remind_days_before > 0 {
+                    line += &if tr {
+                        format!(" · {} gün önce hatırlat", d.remind_days_before)
+                    } else {
+                        format!(" · reminds {} days before", d.remind_days_before)
+                    };
+                }
+                if d.phone {
+                    line += if tr { " · telefon" } else { " · phone" };
+                }
+                let st = sys(11.0 * u, false, MUTED);
+                let shown = fit(r, &line, st, right - tx);
+                r.draw_text(pm, tx, ry + 25.0 * u, &shown, st);
+                let hit = Hit::DayRemove(d.id);
+                if let Some(rect) =
+                    Rect::from_xywh(x + inner - 32.0 * u, ry + 11.0 * u, 24.0 * u, 24.0 * u)
+                {
+                    if self.hover == Some(hit) {
+                        fill_round(pm, Some(rect), 7.0 * u, HOVER);
+                    }
+                    draw_glyph(
+                        pm,
+                        Glyph::Close,
+                        rect.left() + rect.width() / 2.0,
+                        rect.top() + rect.height() / 2.0,
+                        u * 0.8,
+                        if self.hover == Some(hit) {
+                            DANGER
+                        } else {
+                            MUTED
+                        },
+                    );
+                    self.hits.push((rect, hit));
+                }
+            }
+            cy += v.days.len() as f32 * row_h + GAP * u;
+        }
+
+        // A new day.
+        cy = self.section(pm, r, cy, x, "Add a day");
+        let start = self.card(pm, cy, 6);
+        cy = self.text_row(
+            pm,
+            r,
+            start,
+            x,
+            inner,
+            "Name",
+            TextField::DayName,
+            s,
+            None,
+            if tr { "Ayşe" } else { "Alex" },
+        );
+        cy = self.text_row(
+            pm,
+            r,
+            cy,
+            x,
+            inner,
+            "Date",
+            TextField::DayDate,
+            s,
+            None,
+            if tr {
+                "14.03 ya da 14.03.1990"
+            } else {
+                "14.03 or 14.03.1990"
+            },
+        );
+        cy = self.choice_row(
+            pm,
+            r,
+            cy,
+            x,
+            inner,
+            "Kind",
+            Field::DayKind,
+            &DAY_KINDS.map(|(_, l)| l),
+            Some(self.day.kind),
+        );
+        cy = self.choice_row(
+            pm,
+            r,
+            cy,
+            x,
+            inner,
+            "Remind before",
+            Field::DayBefore,
+            &DAY_BEFORE.map(|(_, l)| l),
+            Some(self.day.before),
+        );
+        cy = self.toggle_row(
+            pm,
+            r,
+            cy,
+            x,
+            inner,
+            if tr {
+                "Yalnızca bir kez (yıl gerekir)"
+            } else {
+                "Only once (needs the year)"
+            },
+            self.day.once,
+            Toggle::DayOnce,
+        );
+        cy = self.toggle_row(
+            pm,
+            r,
+            cy,
+            x,
+            inner,
+            if tr {
+                "Telefona da gönder"
+            } else {
+                "Also to the phone"
+            },
+            self.day.phone,
+            Toggle::DayPhone,
+        );
+        let msg = self.day.error.clone().unwrap_or_else(|| {
+            if tr {
+                "O gün 09:00'da balon; yıl yazılırsa kaçıncı yıl olduğunu söyler."
+            } else {
+                "A bubble at 09:00 on the day; with the year it says how many."
+            }
+            .to_string()
+        });
+        let c = if self.day.error.is_some() {
+            DANGER
+        } else {
+            MUTED
+        };
+        let st = sys(11.5 * u, false, c);
+        let shown = fit(r, &msg, st, inner - 130.0 * u);
+        r.draw_text(pm, x + 4.0 * u, cy + 12.0 * u, &shown, st);
+        let add = Rect::from_xywh(x + inner - 110.0 * u, cy + 6.0 * u, 110.0 * u, 28.0 * u);
+        self.button(pm, r, add, "Add", Button::AddDay, false);
+        cy + 44.0 * u
     }
 
     /// Scheduled jobs: each with its schedule, next run and last result; a form to add one.
@@ -3579,6 +3910,7 @@ impl Panel {
                 return Some(Action::Cron(CronEdit::Enable(id, !on)));
             }
             Hit::JobRun(id) => return Some(Action::Cron(CronEdit::Run(id))),
+            Hit::DayRemove(id) => return Some(Action::Days(DaysEdit::Remove(id))),
             Hit::JobRemove(id) => return Some(Action::Cron(CronEdit::Remove(id))),
             Hit::RemoveSession(i) => {
                 return v
@@ -3675,6 +4007,14 @@ impl Panel {
                     }
                     return None;
                 }
+                Field::DayKind => {
+                    self.day.kind = i;
+                    return None;
+                }
+                Field::DayBefore => {
+                    self.day.before = i;
+                    return None;
+                }
                 Field::JobPreset => {
                     self.job.schedule = JOB_PRESETS[i].1.into();
                     self.job.error = None;
@@ -3726,6 +4066,18 @@ impl Panel {
                 Toggle::Telegram => s.phone.telegram.enabled = !s.phone.telegram.enabled,
                 Toggle::LocalMcp => s.local_mcp.enabled = !s.local_mcp.enabled,
                 Toggle::LocalReadOnly => s.local_mcp.read_only = !s.local_mcp.read_only,
+                Toggle::Builtin(b) => {
+                    let on = !v.builtins_off.contains(&b);
+                    return Some(Action::Days(DaysEdit::Builtin(b, !on)));
+                }
+                Toggle::DayOnce => {
+                    self.day.once = !self.day.once;
+                    return None;
+                }
+                Toggle::DayPhone => {
+                    self.day.phone = !self.day.phone;
+                    return None;
+                }
                 Toggle::JobNotifyAlways => {
                     self.job.notify_always = !self.job.notify_always;
                     return None;
@@ -3749,6 +4101,7 @@ impl Panel {
                     Button::CopyLocalMcp => Action::CopyText(local_mcp_url(&s)),
                     Button::ClearSessions => Action::ClearSessions,
                     Button::AddJob => return self.add_job(),
+                    Button::AddDay => return self.add_day(),
                     Button::ReplyCancel => {
                         self.end_reply();
                         return None;
@@ -3758,6 +4111,44 @@ impl Panel {
             }
         }
         (s != v.settings).then(|| Action::Settings(Box::new(s)))
+    }
+
+    /// The Add button of the Special days page: the draft as a new day, or why it cannot be.
+    fn add_day(&mut self) -> Option<Action> {
+        let tr = i18n::is_turkish();
+        let d = &mut self.day;
+        let name = d.name.trim().to_string();
+        if name.is_empty() {
+            d.error = Some(if tr { "Bir ad yaz." } else { "Type a name." }.into());
+            return None;
+        }
+        let Some((day, month, year)) = parse_day_month(&d.date) else {
+            d.error = Some(
+                if tr {
+                    "Tarih GG.AA ya da GG.AA.YYYY olmalı (ör. 14.03 ya da 14.03.1990)."
+                } else {
+                    "The date must be DD.MM or DD.MM.YYYY (e.g. 14.03 or 14.03.1990)."
+                }
+                .into(),
+            );
+            return None;
+        };
+        let new = crate::days::NewDay {
+            name,
+            kind: DAY_KINDS[d.kind].0,
+            month,
+            day,
+            year,
+            once: d.once,
+            message: String::new(),
+            at: "09:00".into(),
+            remind_days_before: DAY_BEFORE[d.before].0,
+            look: crate::days::Look::Auto,
+            phone: d.phone,
+            source: None,
+        };
+        *d = DayDraft::default();
+        Some(Action::Days(DaysEdit::Add(new)))
     }
 
     /// The Add button of the Schedule page: the draft as a new job, or why it cannot be one.
@@ -4086,6 +4477,8 @@ enum Glyph {
     Agents,
     /// A calendar page: Schedule.
     Calendar,
+    /// A star: Special days.
+    Star,
 }
 
 fn draw_glyph(pm: &mut Pixmap, g: Glyph, cx: f32, cy: f32, u: f32, c: ColorU8) {
@@ -4287,6 +4680,21 @@ fn draw_glyph(pm: &mut Pixmap, g: Glyph, cx: f32, cy: f32, u: f32, c: ColorU8) {
             pb.move_to(x0, y0);
             pb.quad_to(xm, ym, x1, y1);
             stroke(pm, pb, 1.8);
+        }
+        Glyph::Star => {
+            let mut pb = PathBuilder::new();
+            for k in 0..10 {
+                let a = -std::f32::consts::FRAC_PI_2 + k as f32 * std::f32::consts::PI / 5.0;
+                let rr = if k % 2 == 0 { 7.0 } else { 3.0 };
+                let (px, py) = p(rr * a.cos(), rr * a.sin() + 0.5);
+                if k == 0 {
+                    pb.move_to(px, py);
+                } else {
+                    pb.line_to(px, py);
+                }
+            }
+            pb.close();
+            stroke(pm, pb, 1.6);
         }
         Glyph::Calendar => {
             let (bx, by) = p(-6.5, -5.5);
@@ -4526,6 +4934,63 @@ const PHONE_WHEN: [(PhoneWhen, &str); 3] = [
     (PhoneWhen::Always, "Always"),
     (PhoneWhen::Never, "Never"),
 ];
+
+/// The Special days switch, with what today is.
+fn special_label(v: &View) -> &'static str {
+    let tr = i18n::is_turkish();
+    match (v.silence, v.special) {
+        (true, _) if tr => "Özel günler · saygı duruşu",
+        (true, _) => "Special days · minute of silence",
+        (_, Some(crate::special::Day::Remembrance)) if tr => "Özel günler · bugün 10 Kasım",
+        (_, Some(crate::special::Day::Remembrance)) => "Special days · 10 November today",
+        (_, Some(crate::special::Day::National)) if tr => "Özel günler · bayram",
+        (_, Some(crate::special::Day::National)) => "Special days · a holiday today",
+        _ => "Special days",
+    }
+}
+
+/// "DD.MM" or "DD.MM.YYYY" (also with / or -): (day, month, year).
+fn parse_day_month(s: &str) -> Option<(u32, u32, Option<i32>)> {
+    let parts: Vec<&str> = s
+        .trim()
+        .split(['.', '/', '-'])
+        .filter(|p| !p.is_empty())
+        .collect();
+    let num = |p: &str| p.parse::<u32>().ok();
+    match parts[..] {
+        [d, m] => Some((num(d)?, num(m)?, None)),
+        [d, m, y] => Some((num(d)?, num(m)?, Some(y.parse().ok()?))),
+        _ => None,
+    }
+}
+
+/// "14 March" / "14 Mart", with the year for one-off days.
+fn day_date_text(d: &crate::days::Day, tr: bool) -> String {
+    const EN: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    const TR: [&str; 12] = [
+        "Ocak", "Şubat", "Mart", "Nisan", "Mayıs", "Haziran", "Temmuz", "Ağustos", "Eylül", "Ekim",
+        "Kasım", "Aralık",
+    ];
+    let m = (d.month as usize).clamp(1, 12) - 1;
+    let month = if tr { TR[m] } else { EN[m] };
+    match d.year.filter(|_| d.once) {
+        Some(y) => format!("{} {month} {y}", d.day),
+        None => format!("{} {month}", d.day),
+    }
+}
 
 /// The address of the workspace tools.
 fn local_mcp_url(s: &Settings) -> String {

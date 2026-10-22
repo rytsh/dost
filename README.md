@@ -25,7 +25,7 @@ bubble to dismiss it.
 
 ## OpenCode
 
-Bark when OpenCode asks a question or needs permission (answer it from the bubble), show progress of long tasks, and tell when they finish or fail:
+Bark when OpenCode asks a question or needs permission (answer it from the bubble), and tell when a task finishes or fails; the **Agents** list shows what each session is doing:
 
 ```sh
 opencode plugin add 'github:rytsh/dost#main::path:integrations/opencode'
@@ -107,6 +107,7 @@ watches that run shell commands, so only allow pages you trust.
 | `react` | Happy, sad, bark, fetch (throws the bone), sleep, wake or zoomies. |
 | `copy` | Puts text on the clipboard and says so. |
 | `status` · `history` | What the dog is doing, how long you have been idle, and what you may have missed. |
+| `day_add` · `day_list` · `day_remove` | The user's special days: birthdays, anniversaries (see Special days). |
 | `cron_add` · `cron_list` · `cron_remove` · `cron_run` · `cron_enable` | Repeating jobs on a cron schedule: reminders, HTTP requests and commands (see Schedule). |
 | `session` · `sessions` | An agent says what its session is doing (working, waiting, done, failed); you follow them all in **Agents**. `notify`, `ask` and `progress` take a `session` too. |
 | `check_now` · `list_watches` · `remove_watch` | Manage watches and reminders. |
@@ -190,12 +191,21 @@ command from the couch. Nothing listens on a port: Dost only makes outgoing HTTP
 
 ## Special days
 
-On by default; settings → General → *Special days* turns them off.
+Settings → **Special days** (a page of its own in the settings window). They work the same in
+every language; only the text follows it.
 
-- **10 November**: the dog wears a black ribbon all day in memory of Atatürk. At **09:05** it stops,
-  sits still and stays silent for a minute (no barking, notifications wait), then a quiet bubble
-  remembers him. *Siren at 09:05* adds the siren (off by default).
-- **23 April, 19 May, 30 August, 29 October**: a little Turkish flag on the collar and a greeting.
+- **Built in**, each with its own switch:
+  - **10 November**: the dog wears a black ribbon all day in memory of Atatürk. At **09:05** it
+    stops, sits still and stays silent for a minute (no barking, notifications wait), then a quiet
+    bubble remembers him. *Siren at 09:05* adds the siren (off by default).
+  - **23 April, 19 May, 30 August, 29 October**: a little Turkish flag on the collar and a greeting.
+  - **The dog's birthday** (party hat), **Halloween** (witch hat, pumpkin), **Christmas and New
+    Year** (Santa hat).
+- **Your days**: birthdays, anniversaries, holidays of your own. On the day the dog shows a bubble
+  at 09:00 (*"🎂 Ayşe is 36 today!"* when you give the year), wears a party hat on birthdays, a
+  heart on anniversaries or a star on other days, and can remind you days before and send it to
+  your phone. Every year, or only once. Agents add them with `day_add` (`day_list`,
+  `day_remove`): *"add Ayşe's birthday, 14 March 1990, remind me a day before"*.
 
 ## Make it yours
 
@@ -227,7 +237,8 @@ a short "wuf?" for questions.
 
 Click the tray (menu bar) icon for the quick panel; its ⚙ (or *All settings…* in the right-click
 menu) opens the **settings window**, with a sidebar of pages: General (language, which screen the
-dog lives on, special days), Dog, Look, Play, Sound, Phone, Agents, Todo, History and Connect.
+dog lives on), Dog, Look, Play, Special days, Sound, Phone, Agents, Todo, Schedule, History and
+Connect.
 The app speaks English and Turkish (*Language*: the system's, or either one).
 
 Click the tray (menu bar) icon for settings. Everything in `settings.json` can be changed there:

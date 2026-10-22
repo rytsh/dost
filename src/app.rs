@@ -298,6 +298,12 @@ impl Core {
                 .and_then(|p| Some(p.parent()?.join("cron.json"))),
         );
         cron.start();
+        // The user's special days too (none in tests).
+        let days = Arc::new(crate::days::Days::new(
+            watches_path
+                .as_ref()
+                .and_then(|p| Some(p.parent()?.join("days.json"))),
+        ));
         let mcp = Arc::new(Mcp::new(
             notifier.clone(),
             watches,
@@ -305,6 +311,7 @@ impl Core {
             Arc::clone(&status),
             Arc::clone(&sessions),
             cron,
+            days,
         ));
         let remote = Remote::new(notifier.remote_sender());
         Core {
@@ -463,6 +470,10 @@ impl Core {
                     }
                 }
                 Event::Record(entry) => self.record_entry(entry),
+                Event::DaysChanged => {
+                    self.apply_look();
+                    self.panel_dirty = true;
+                }
             }
         }
         if now - self.last_special_check >= Duration::from_secs(1) {
@@ -716,12 +727,34 @@ impl Core {
         let today = look::today();
         self.look_day = Some(today);
         let s = &self.settings;
+        let days = &self.mcp.days;
+        use crate::days::Builtin;
+        // Each built-in day has its own switch; Special days and Holiday outfits are the
+        // switches for all of them.
         let season = s
             .seasonal
             .then(|| look::Season::on(today, s.birthday()))
-            .flatten();
+            .flatten()
+            .filter(|season| {
+                days.builtin_on(match season {
+                    look::Season::Birthday => Builtin::DogBirthday,
+                    look::Season::Halloween => Builtin::Halloween,
+                    look::Season::Christmas => Builtin::Christmas,
+                })
+            });
+        let party = s.special_days && days.party_hat(today);
+        let season = season.or(party.then_some(look::Season::Birthday));
         let outfit = Outfit::new(s.wear, season);
-        let pin = s.special_days.then(|| special::Pin::on(today)).flatten();
+        let builtin_pin = special::Pin::on(today).filter(|p| {
+            days.builtin_on(match p {
+                special::Pin::Ribbon => Builtin::Remembrance,
+                _ => Builtin::National,
+            })
+        });
+        let pin = s
+            .special_days
+            .then(|| builtin_pin.or_else(|| days.pin(today)))
+            .flatten();
         self.renderer
             .set_look(s.fur, s.collar, outfit, s.theme, s.source_colors());
         self.renderer.set_pin(pin);
@@ -963,7 +996,9 @@ impl Core {
         }
         let now = chrono::Local::now().naive_local();
         let today = now.date();
-        if let Some(left) = special::silence_left(now) {
+        self.user_days(now);
+        let remembrance = self.mcp.days.builtin_on(crate::days::Builtin::Remembrance);
+        if let Some(left) = special::silence_left(now).filter(|_| remembrance) {
             if self.silence_until.is_none() {
                 self.silence_until = Some(Instant::now() + Duration::from_secs(left as u64));
                 // The bubble on screen steps aside; it comes back after.
@@ -992,10 +1027,11 @@ impl Core {
             return;
         }
         let tr = i18n::is_turkish();
+        let national = self.mcp.days.builtin_on(crate::days::Builtin::National);
         let text = if special::remembrance_due(now) {
-            Some(special::remembrance_text(tr))
+            remembrance.then(|| special::remembrance_text(tr))
         } else if now.time() >= chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap() {
-            special::holiday_text(today, tr)
+            special::holiday_text(today, tr).filter(|_| national)
         } else {
             None
         };
@@ -1010,6 +1046,26 @@ impl Core {
             n.mood = Mood::Good;
         }
         self.push(n);
+    }
+
+    /// The user's own days: their bubble at its time, and the reminders before.
+    fn user_days(&mut self, now: chrono::NaiveDateTime) {
+        let due = self.mcp.days.take_due(now, i18n::is_turkish());
+        if due.is_empty() {
+            return;
+        }
+        for d in due {
+            let mut n = Notification::new(d.title, d.body)
+                .source(Some(t("Special days").to_string()))
+                .timeout(Duration::from_secs(60));
+            if d.days_before == 0 {
+                n.mood = Mood::Good;
+            }
+            // Only those that asked for it go to the phone.
+            n.local = !d.phone;
+            self.push(n);
+        }
+        self.panel_dirty = true;
     }
 
     /// Withdraws notifications with this key (e.g. a question answered in the terminal).
@@ -1788,6 +1844,24 @@ impl Core {
             }
             Action::OpenUrl(url) => p.open_url(&url),
             Action::ClearSessions => self.sessions.clear_finished(),
+            Action::Days(edit) => {
+                use panel::DaysEdit;
+                let days = &self.mcp.days;
+                match edit {
+                    DaysEdit::Add(n) => {
+                        if let Err(e) = days.add(n) {
+                            self.push(Notification::new(t("Special days"), e).local());
+                        }
+                    }
+                    DaysEdit::Remove(id) => {
+                        days.remove(id);
+                    }
+                    DaysEdit::Builtin(b, on) => days.set_builtin(b, on),
+                }
+                // A hat or a pin may come or go.
+                self.apply_look();
+                self.panel_dirty = true;
+            }
             Action::Cron(edit) => {
                 use crate::cron::NotifyWhen;
                 use panel::CronEdit;
@@ -1877,6 +1951,22 @@ impl Core {
             quiet: self.settings.is_quiet(local_minute()) || self.fullscreen,
             missed: self.missed,
             todos: self.mcp.todo_lists(),
+            days: {
+                let today = look::today();
+                self.mcp
+                    .days
+                    .list()
+                    .into_iter()
+                    .map(|d| {
+                        let next = self.mcp.days.next_date(&d, today);
+                        (d, next)
+                    })
+                    .collect()
+            },
+            builtins_off: crate::days::Builtin::ALL
+                .into_iter()
+                .filter(|b| !self.mcp.days.builtin_on(*b))
+                .collect(),
             jobs: self
                 .mcp
                 .cron

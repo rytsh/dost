@@ -7,9 +7,9 @@ bark when OpenCode needs you:
 |---|---|
 | A tool needs your permission | Barks and shows **Allow / Always / Reject** buttons; your click goes back to OpenCode. Answer in the terminal instead and the bubble goes away. |
 | OpenCode asks you a question | Barks and shows the question until you click it; answer it in OpenCode. |
-| A task runs longer than 10 s | Shows a progress bar with the current tool and step count. |
-| The task finishes | The bar turns green with how long it took, and the dog is happy. |
-| A session fails | The bar turns red (or a bubble shows the error) and the dog barks. |
+| A task is running | Nothing on screen; the dog's **Agents** list shows the session working, with the current tool and step count. |
+| The task finishes (after 10 s or more) | A bubble says how long it took, and the dog is happy. |
+| A session fails | A bubble shows the error and the dog barks. |
 
 Bubbles are labelled **OPENCODE** and carry the session title and folder. Sub-agent sessions stay
 quiet; only the session you are looking at reports back.
@@ -38,7 +38,7 @@ All optional, in `opencode.json`:
         "url": "http://127.0.0.1:7777/mcp",
         "question": true,
         "permissions": true,
-        "progress": true,
+        "progress": false,
         "done": true,
         "error": true,
         "minWorkSeconds": 10,
@@ -54,10 +54,10 @@ All optional, in `opencode.json`:
 | `url` | `http://127.0.0.1:7777/mcp` | Dost's MCP address (Settings → Connect in the dog's menu) |
 | `question` | `true` | Bark on questions |
 | `permissions` | `true` | Permission requests with answer buttons (`false`: no bubble) |
-| `progress` | `true` | Progress bar for long tasks |
+| `progress` | `false` | Also show a progress bar in the bubble while a task runs |
 | `done` | `true` | Tell when a task finishes |
 | `error` | `true` | Tell when a session fails |
-| `minWorkSeconds` | `10` | Tasks shorter than this get no progress bar and no "done" bubble |
+| `minWorkSeconds` | `10` | Tasks shorter than this get no "done" bubble (and no progress bar) |
 | `lang` | from `$LANG`, else `en` | `en` or `tr` |
 
 ## OpenCode in WSL, Dost on Windows
