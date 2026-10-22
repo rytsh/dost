@@ -2,6 +2,7 @@ pub mod app;
 pub mod cli;
 pub mod dog;
 pub mod i18n;
+pub mod local;
 pub mod look;
 pub mod mcp;
 pub mod notify;

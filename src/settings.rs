@@ -102,6 +102,8 @@ pub struct Settings {
     pub screen: u32,
     /// Notifications on the phone (ntfy, Telegram).
     pub phone: crate::remote::PhoneSettings,
+    /// File and shell tools for agents at `/mcp/local` (off by default).
+    pub local_mcp: crate::local::LocalSettings,
 }
 
 /// The language of the app's own text.
@@ -163,6 +165,7 @@ impl Default for Settings {
             siren: false,
             screen: 0,
             phone: Default::default(),
+            local_mcp: Default::default(),
         }
     }
 }

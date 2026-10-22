@@ -123,6 +123,37 @@ does not bark and only shows questions, progress and sticky messages; the rest g
 > [!WARNING]
 > Watches can run shell commands on your computer. Only connect clients you trust.
 
+## Workspace tools
+
+Off by default. Settings → Connect → *Workspace tools* serves file and shell tools for agents at
+`http://127.0.0.1:7777/mcp/local`, separately from the dog's own `/mcp`: `read`, `glob`, `grep`,
+`edit`, `write`, `patch`, `shell` and `shell_job`, adapted from
+[local-mcp](https://github.com/rakunlabs/local-mcp). They work in the chosen *Folder* (your home
+folder when empty), the folders listed under it, and the system's temp folder; *Read only* leaves
+only `read`, `glob` and `grep`. `glob` and `grep` use ripgrep when it is installed.
+
+- **The dog asks first.** Before a command runs or a file changes, the dog barks with
+  *Allow / Always / Deny* (on your phone too, while you are away). *Always* remembers the command
+  (`cargo test*`) or the folder; the rules are listed in the settings, with ✕ to forget one.
+  A command that chains others (`;`, `&&`, `|`) always asks. *Ask first* can be set to only
+  commands, or never.
+- **Time limit.** Commands stop after the chosen time (2 minutes by default, or none); an agent may
+  ask for less, not more.
+- **Live output.** Clients that accept an event stream (`Accept: text/event-stream`) get a
+  command's output as `notifications/progress` while it runs. A command that takes longer than a
+  few seconds also shows in the bubble as a progress bar with its latest line.
+- **History.** Every command and change goes to History with who asked, how it ended and how long
+  it took (also `history` over MCP).
+
+```jsonc
+// OpenCode (opencode.json)
+{ "mcp": { "dost-local": { "type": "remote", "url": "http://127.0.0.1:7777/mcp/local" } } }
+```
+
+> [!WARNING]
+> `shell` runs commands as you, and there is no token: while this is on, any program on this
+> computer, and any web page the *Browsers* setting allows, can use it.
+
 ## Agents
 
 Settings → **Agents** lists every agent session the dog knows about: what it works on, what it is

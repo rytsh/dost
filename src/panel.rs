@@ -291,6 +291,9 @@ enum TextField {
     NewList,
     NtfyServer,
     NtfyTopic,
+    /// The workspace tools' root folder, and a folder to allow.
+    LocalRoot,
+    AddLocalDir,
     NtfyToken,
     TelegramToken,
     /// The answer to a question, in words.
@@ -310,6 +313,10 @@ enum List {
     Origins,
     Barks,
     Sources,
+    /// Folders the workspace tools may use besides the root.
+    LocalDirs,
+    /// What the user allowed for good ("Always").
+    LocalAllowed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -326,6 +333,9 @@ enum Field {
     Language,
     PhoneWhen,
     Screen,
+    /// The workspace tools: what to ask about, and the commands' time limit.
+    LocalApprove,
+    LocalTimeLimit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -347,6 +357,8 @@ enum Toggle {
     Siren,
     Ntfy,
     Telegram,
+    LocalMcp,
+    LocalReadOnly,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -355,6 +367,7 @@ enum Button {
     Sleep,
     Hide,
     CopyMcp,
+    CopyLocalMcp,
     OpenDir,
     Version,
     Quit,
@@ -559,6 +572,12 @@ impl Panel {
                     s.mcp_addr = t.to_string();
                 }
             }
+            TextField::LocalRoot => s.local_mcp.root = t.to_string(),
+            TextField::AddLocalDir => {
+                if !t.is_empty() && !s.local_mcp.allowed_dirs.iter().any(|d| d == t) {
+                    s.local_mcp.allowed_dirs.push(t.to_string());
+                }
+            }
             TextField::AddOrigin => {
                 let o = t.trim_end_matches('/');
                 if !o.is_empty() {
@@ -653,6 +672,8 @@ impl Panel {
             TextField::Lift => s.lift.to_string(),
             TextField::McpAddr => s.mcp_addr.clone(),
             TextField::NtfyServer => s.phone.ntfy.server.clone(),
+            TextField::LocalRoot => s.local_mcp.root.clone(),
+            TextField::AddLocalDir => String::new(),
             TextField::NtfyTopic => s.phone.ntfy.topic.clone(),
             TextField::NtfyToken => s.phone.ntfy.token.clone(),
             TextField::TelegramToken => s.phone.telegram.token.clone(),
@@ -2584,6 +2605,130 @@ impl Panel {
         cy = self.note(pm, r, cy, x, "Pages on localhost can always connect.");
         cy += GAP * u;
 
+        // File and shell tools for agents, on their own address.
+        cy = self.section(pm, r, cy, x, "Workspace tools");
+        let l = &s.local_mcp;
+        let rows = if l.enabled {
+            7 + l.allowed_dirs.len() + l.always_allow.len()
+        } else {
+            1
+        };
+        let start = self.card(pm, cy, rows);
+        cy = self.toggle_row(
+            pm,
+            r,
+            start,
+            x,
+            inner,
+            "Files and shell at /mcp/local",
+            l.enabled,
+            Toggle::LocalMcp,
+        );
+        if l.enabled {
+            cy = self.text_row(
+                pm,
+                r,
+                cy,
+                x,
+                inner,
+                "Folder",
+                TextField::LocalRoot,
+                s,
+                None,
+                "~",
+            );
+            for (i, d) in l.allowed_dirs.iter().enumerate() {
+                cy = self.list_row(pm, r, cy, x, inner, d, None, List::LocalDirs, i);
+            }
+            cy = self.text_row(
+                pm,
+                r,
+                cy,
+                x,
+                inner,
+                "Also",
+                TextField::AddLocalDir,
+                s,
+                None,
+                "~/notes",
+            );
+            cy = self.toggle_row(
+                pm,
+                r,
+                cy,
+                x,
+                inner,
+                "Read only",
+                l.read_only,
+                Toggle::LocalReadOnly,
+            );
+            cy = self.choice_row(
+                pm,
+                r,
+                cy,
+                x,
+                inner,
+                "Ask first",
+                Field::LocalApprove,
+                &crate::local::Approve::ALL.map(|(_, n)| n),
+                crate::local::Approve::ALL
+                    .iter()
+                    .position(|(a, _)| *a == l.approve),
+            );
+            for (i, rule) in l.always_allow.iter().enumerate() {
+                let shown = format!(
+                    "{} · {}",
+                    t("Always"),
+                    crate::local::Approval::describe(rule)
+                );
+                cy = self.list_row(pm, r, cy, x, inner, &shown, None, List::LocalAllowed, i);
+            }
+            cy = self.choice_row(
+                pm,
+                r,
+                cy,
+                x,
+                inner,
+                "Time limit",
+                Field::LocalTimeLimit,
+                &crate::local::TIME_LIMITS.map(|(_, n)| n),
+                crate::local::TIME_LIMITS
+                    .iter()
+                    .position(|(s, _)| *s == l.time_limit_secs),
+            );
+            let url = local_mcp_url(s);
+            let st = sys(11.5 * u, false, MUTED);
+            let shown = fit(r, &url, st, inner - 90.0 * u);
+            r.draw_text(pm, x + 12.0 * u, cy + 8.0 * u, &shown, st);
+            let copy = Rect::from_xywh(x + inner - 62.0 * u, cy + 4.0 * u, 54.0 * u, 24.0 * u);
+            self.button(pm, r, copy, "Copy", Button::CopyLocalMcp, true);
+            cy += ROW * u;
+            cy = self.note(
+                pm,
+                r,
+                cy,
+                x,
+                if i18n::is_turkish() {
+                    "Geçici klasör de her zaman açık. Kabuk komutları senin yetkinle çalışır."
+                } else {
+                    "The temp folder is always allowed. Shell commands run as you."
+                },
+            );
+        } else {
+            cy = self.note(
+                pm,
+                r,
+                cy,
+                x,
+                if i18n::is_turkish() {
+                    "Ajanlara dosya okuma, düzenleme ve kabuk araçları verir."
+                } else {
+                    "Gives agents tools to read and edit files and run commands."
+                },
+            );
+        }
+        cy += GAP * u;
+
         cy = self.section(pm, r, cy, x, "App");
         let start = self.card(pm, cy, 3);
         cy = self.toggle_row(
@@ -3102,6 +3247,16 @@ impl Panel {
                         s.source_colors.remove(&k);
                     }
                 }
+                List::LocalDirs => {
+                    if i < s.local_mcp.allowed_dirs.len() {
+                        s.local_mcp.allowed_dirs.remove(i);
+                    }
+                }
+                List::LocalAllowed => {
+                    if i < s.local_mcp.always_allow.len() {
+                        s.local_mcp.always_allow.remove(i);
+                    }
+                }
             },
             Hit::TodoCheck(id) => return Some(Action::Todo(crate::todo::Edit::Toggle(id))),
             Hit::TodoRemove(id) => return Some(Action::Todo(crate::todo::Edit::Remove(id))),
@@ -3149,6 +3304,10 @@ impl Panel {
                 Field::Language => s.language = Lang::ALL[i].0,
                 Field::PhoneWhen => s.phone.when = PHONE_WHEN[i].0,
                 Field::Screen => s.screen = i as u32,
+                Field::LocalApprove => s.local_mcp.approve = crate::local::Approve::ALL[i].0,
+                Field::LocalTimeLimit => {
+                    s.local_mcp.time_limit_secs = crate::local::TIME_LIMITS[i].0
+                }
                 Field::Theme => s.theme = Theme::ALL[i].0,
                 Field::Browsers => {
                     self.custom_origins = i == 2;
@@ -3193,6 +3352,8 @@ impl Panel {
                     }
                 }
                 Toggle::Telegram => s.phone.telegram.enabled = !s.phone.telegram.enabled,
+                Toggle::LocalMcp => s.local_mcp.enabled = !s.local_mcp.enabled,
+                Toggle::LocalReadOnly => s.local_mcp.read_only = !s.local_mcp.read_only,
                 Toggle::Autostart => return Some(Action::ToggleAutostart),
             },
             Hit::Slider => return None,
@@ -3209,6 +3370,7 @@ impl Panel {
                     Button::PhoneTest => Action::PhoneTest,
                     Button::NewTopic => Action::NewTopic,
                     Button::CopyTopic => Action::CopyText(ntfy_link(&s)),
+                    Button::CopyLocalMcp => Action::CopyText(local_mcp_url(&s)),
                     Button::ClearSessions => Action::ClearSessions,
                     Button::ReplyCancel => {
                         self.end_reply();
@@ -3905,6 +4067,11 @@ const PHONE_WHEN: [(PhoneWhen, &str); 3] = [
     (PhoneWhen::Always, "Always"),
     (PhoneWhen::Never, "Never"),
 ];
+
+/// The address of the workspace tools.
+fn local_mcp_url(s: &Settings) -> String {
+    format!("http://{}/mcp/local", s.mcp_addr)
+}
 
 /// The ntfy topic's web address (to open or subscribe to on the phone).
 fn ntfy_link(s: &Settings) -> String {

@@ -254,6 +254,7 @@ fn main() {
             (dost::settings::Lang::En, Page::Agents, "window-agents"),
             (dost::settings::Lang::Tr, Page::Dog, "window-dog-tr"),
             (dost::settings::Lang::En, Page::Look, "window-look"),
+            (dost::settings::Lang::En, Page::Connect, "window-connect"),
         ] {
             dost::i18n::set(lang);
             let scale = 2.0;
@@ -268,6 +269,10 @@ fn main() {
             settings.phone.ntfy.topic = "dost-k3x9q2m8w1p4z7r5".into();
             settings.phone.telegram.enabled = true;
             settings.phone.telegram.token = "123:abc".into();
+            settings.local_mcp.enabled = true;
+            settings.local_mcp.root = "~/repo".into();
+            settings.local_mcp.allowed_dirs = vec!["~/notes".into()];
+            settings.local_mcp.always_allow = vec!["shell:cargo test*".into()];
             let view = dost::panel::View {
                 settings,
                 age: "2 years".into(),

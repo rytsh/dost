@@ -1,6 +1,6 @@
 [package]
 name = "dost"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.88"
 repository = "https://github.com/rytsh/dost"
@@ -17,6 +17,11 @@ cosmic-text = "0.19"
 # Local time for reminders ("at 15:00") and quiet hours.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 sha2 = "0.11"
+# Workspace tools (local.rs): .gitignore-aware walking, globs, regexes and diffs.
+ignore = "0.4.33"
+globset = "0.4.20"
+regex = "1.13.1"
+similar = "3.2.0"
 
 # HTTPS for watch checks: rustls on Windows/Linux, the system TLS on macOS.
 [target.'cfg(not(target_os = "macos"))'.dependencies]

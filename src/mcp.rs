@@ -19,6 +19,9 @@ const PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 const MAX_BODY: u64 = 1 << 20;
 /// How long `ask` waits for an answer by default, and at most (seconds).
 const ASK_TIMEOUT: u64 = 300;
+/// A workspace command that runs longer than this shows a progress bar in the bubble.
+const LOCAL_BAR_AFTER: Duration = Duration::from_secs(5);
+
 const ASK_TIMEOUT_MAX: u64 = 1800;
 
 /// The dog's state, shared with the MCP server.
@@ -61,6 +64,8 @@ pub struct Mcp {
     status: Arc<Mutex<DogStatus>>,
     /// What agents are doing (`session`).
     sessions: Arc<crate::sessions::Sessions>,
+    /// The workspace tools at `/mcp/local`.
+    pub local: crate::local::Local,
     /// The dog's name (settings), used in the tool descriptions.
     name: Mutex<String>,
     /// Which web pages may call the server from a browser (settings).
@@ -145,6 +150,7 @@ impl Mcp {
             todos,
             status,
             sessions,
+            local: crate::local::Local::new(Default::default()),
             name: Mutex::new(crate::settings::DEFAULT_NAME.into()),
             cors: Mutex::new(Cors::default()),
         }
@@ -213,7 +219,10 @@ impl Mcp {
 
     fn handle(&self, mut req: tiny_http::Request) {
         let path = req.url().split('?').next().unwrap_or("").to_string();
-        if path != "/mcp" && path != "/" {
+        let path = path.trim_end_matches('/');
+        // The workspace tools only exist while they are turned on.
+        let local = path == "/mcp/local";
+        if !(path == "/mcp" || path.is_empty() || local && self.local.settings().enabled) {
             let _ = req.respond(Response::from_string("not found").with_status_code(404));
             return;
         }
@@ -265,6 +274,9 @@ impl Mcp {
                 return;
             }
         }
+        // Clients that take an event stream get a long command's output while it runs.
+        let sse = header(&req, "Accept")
+            .is_some_and(|a| a.to_ascii_lowercase().contains("text/event-stream"));
         let mut body = String::new();
         if req
             .as_reader()
@@ -278,18 +290,278 @@ impl Mcp {
             )));
             return;
         }
+        if local
+            && sse
+            && let Ok(msg) = serde_json::from_str::<Value>(&body)
+            && msg.get("method").and_then(Value::as_str) == Some("tools/call")
+            && msg.get("id").is_some()
+        {
+            return self.stream_local(req, msg, origin.as_deref());
+        }
         let reply = match serde_json::from_str::<Value>(&body) {
             Ok(Value::Array(batch)) => {
-                let out: Vec<Value> = batch.into_iter().filter_map(|m| self.dispatch(m)).collect();
+                let out: Vec<Value> = batch
+                    .into_iter()
+                    .filter_map(|m| self.route(local, m))
+                    .collect();
                 (!out.is_empty()).then_some(Value::Array(out))
             }
-            Ok(msg) => self.dispatch(msg),
+            Ok(msg) => self.route(local, msg),
             Err(_) => Some(rpc_error(Value::Null, -32700, "parse error")),
         };
         let _ = match reply {
             Some(v) => req.respond(allow(json_response(200, &v))),
             None => req.respond(allow(Response::from_data(Vec::new()).with_status_code(202))),
         };
+    }
+
+    /// A workspace tool call answered as an event stream: progress notifications with the
+    /// command's output while it runs, then the result.
+    fn stream_local(&self, req: tiny_http::Request, msg: Value, origin: Option<&str>) {
+        use std::io::Write;
+        let mut head = String::from(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n",
+        );
+        if let Some(o) = origin {
+            head += &format!(
+                "Access-Control-Allow-Origin: {o}\r\nVary: Origin\r\nAccess-Control-Expose-Headers: Mcp-Session-Id\r\n"
+            );
+        }
+        head += "\r\n";
+        let mut w = req.into_writer();
+        if w.write_all(head.as_bytes())
+            .and_then(|_| w.flush())
+            .is_err()
+        {
+            return;
+        }
+        let token = msg
+            .pointer("/params/_meta/progressToken")
+            .cloned()
+            .unwrap_or_else(|| msg.get("id").cloned().unwrap_or(Value::Null));
+        // Each event is one chunk; the empty chunk ends the response (the connection stays).
+        let chunk = |w: &mut Box<dyn Write + Send>, v: &Value| {
+            let ev = format!("event: message\ndata: {v}\n\n");
+            let _ = write!(w, "{:x}\r\n{ev}\r\n", ev.len()).and_then(|_| w.flush());
+        };
+        let mut n = 0u64;
+        let mut live = |text: String| {
+            n += 1;
+            let ev = json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/progress",
+                "params": { "progressToken": token, "progress": n, "message": text },
+            });
+            chunk(&mut w, &ev);
+        };
+        let reply = self.dispatch_local_live(msg, Some(&mut live));
+        if let Some(v) = reply {
+            chunk(&mut w, &v);
+        }
+        let _ = w.write_all(b"0\r\n\r\n").and_then(|_| w.flush());
+    }
+
+    fn route(&self, local: bool, msg: Value) -> Option<Value> {
+        if local {
+            self.dispatch_local(msg)
+        } else {
+            self.dispatch(msg)
+        }
+    }
+
+    /// A JSON-RPC message for `/mcp/local` (the workspace tools).
+    pub fn dispatch_local(&self, msg: Value) -> Option<Value> {
+        self.dispatch_local_live(msg, None)
+    }
+
+    fn dispatch_local_live(
+        &self,
+        msg: Value,
+        live: Option<&mut dyn FnMut(String)>,
+    ) -> Option<Value> {
+        let id = msg.get("id").cloned()?;
+        let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+        let params = msg.get("params").cloned().unwrap_or(Value::Null);
+        let result = match method {
+            "initialize" => {
+                let asked = params
+                    .get("protocolVersion")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let version = PROTOCOL_VERSIONS
+                    .iter()
+                    .find(|v| **v == asked)
+                    .unwrap_or(&PROTOCOL_VERSIONS[0]);
+                Ok(json!({
+                    "protocolVersion": version,
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "dost-local", "title": "Dost workspace tools", "version": env!("CARGO_PKG_VERSION") },
+                    "instructions": self.local.instructions(),
+                }))
+            }
+            "ping" => Ok(json!({})),
+            "tools/list" => Ok(json!({ "tools": self.local.tools() })),
+            "tools/call" => {
+                let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+                let args = params
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                Ok(match self.call_local(name, &args, live) {
+                    Ok(content) => json!({ "content": content, "isError": false }),
+                    Err(e) => {
+                        json!({ "content": [{ "type": "text", "text": e }], "isError": true })
+                    }
+                })
+            }
+            "resources/list" => Ok(json!({ "resources": [] })),
+            "prompts/list" => Ok(json!({ "prompts": [] })),
+            _ => Err((-32601, format!("method not found: {method}"))),
+        };
+        Some(match result {
+            Ok(r) => json!({ "jsonrpc": "2.0", "id": id, "result": r }),
+            Err((code, m)) => rpc_error(id, code, &m),
+        })
+    }
+
+    /// Runs a workspace tool: asks the user first when the settings say so, and keeps what
+    /// changed things in History.
+    fn call_local(
+        &self,
+        name: &str,
+        args: &Value,
+        live: Option<&mut dyn FnMut(String)>,
+    ) -> Result<Vec<Value>, String> {
+        let source = str_arg(args, "source").unwrap_or_else(|| "Agent".into());
+        let approval = self.local.approval(name, args);
+        if let Some(a) = &approval {
+            let tr = crate::i18n::t;
+            let choices = vec![
+                tr("Allow").to_string(),
+                tr("Always").to_string(),
+                tr("Deny").to_string(),
+            ];
+            let (n, rx) = Notification::new(tr(&a.title), a.detail.clone())
+                .source(Some(format!("{source} · {}", tr("Workspace"))))
+                .ask(choices.clone(), Duration::from_secs(ASK_TIMEOUT));
+            if !self.notifier.send(n) {
+                return Err("the dog is not running".into());
+            }
+            let answer = rx.recv_timeout(Duration::from_secs(ASK_TIMEOUT + 2)).ok();
+            let pick = answer
+                .as_deref()
+                .and_then(|x| choices.iter().position(|c| c == x));
+            match pick {
+                Some(0) => {}
+                Some(1) => {
+                    self.local.allow_always(&a.rule);
+                    self.notifier.allow_always(a.rule.clone());
+                }
+                Some(_) => {
+                    self.record_local(name, &source, a, "denied");
+                    return Err(
+                        "The user denied this. Do not retry it; ask them what to do instead."
+                            .into(),
+                    );
+                }
+                None => {
+                    self.record_local(name, &source, a, "expired (no answer)");
+                    return Err(format!(
+                        "The user did not answer within {ASK_TIMEOUT} s; nothing was done."
+                    ));
+                }
+            }
+        }
+        let started = std::time::Instant::now();
+        // A command that runs for a while shows in the dog's bubble as a progress bar with its
+        // latest output line (and goes on to the client's live stream, if any).
+        let bar_id = format!("local-{}", fastrand::u64(..));
+        let command = str_arg(args, "command").unwrap_or_default();
+        let mut shown = false;
+        let mut outer = live;
+        let mut tee = |text: String| {
+            if started.elapsed() >= LOCAL_BAR_AFTER {
+                let last = text.lines().rev().find(|l| !l.trim().is_empty());
+                if let Some(line) = last.or(if shown { None } else { Some("") }) {
+                    shown = true;
+                    self.local_bar(&bar_id, &source, &command, line, ProgressState::Running);
+                }
+            }
+            if !text.is_empty()
+                && let Some(f) = outer.as_deref_mut()
+            {
+                f(text);
+            }
+        };
+        let out = self.local.call_live(name, args, Some(&mut tee));
+        if shown {
+            let state = if out.is_ok() {
+                ProgressState::Done
+            } else {
+                ProgressState::Failed
+            };
+            let took = crate::watch::human_secs(started.elapsed().as_secs());
+            self.local_bar(&bar_id, &source, &command, &took, state);
+        }
+        if matches!(name, "shell" | "edit" | "write" | "patch") {
+            let what = approval.unwrap_or_else(|| self.local.describe_call(name, args));
+            let secs = started.elapsed().as_secs();
+            let took = if secs >= 2 {
+                format!(" · {}", crate::watch::human_secs(secs))
+            } else {
+                String::new()
+            };
+            let outcome = match &out {
+                Ok(_) => format!("done{took}"),
+                Err(e) if e.contains("Exit code:") => {
+                    let code = e
+                        .split("Exit code:")
+                        .nth(1)
+                        .and_then(|c| c.split_whitespace().next())
+                        .unwrap_or("?");
+                    format!("failed (exit {code}){took}")
+                }
+                Err(_) => format!("failed{took}"),
+            };
+            self.record_local(name, &source, &what, &outcome);
+        }
+        out
+    }
+
+    fn local_bar(&self, id: &str, source: &str, command: &str, line: &str, state: ProgressState) {
+        let title = format!("$ {}", command.lines().next().unwrap_or_default());
+        let mut n = Notification::new(
+            title.chars().take(80).collect::<String>(),
+            line.chars().take(160).collect::<String>(),
+        )
+        .source(Some(format!("{source} · shell")))
+        .sticky();
+        n.mood = match state {
+            ProgressState::Running => Mood::Neutral,
+            ProgressState::Done => Mood::Good,
+            ProgressState::Failed => Mood::Bad,
+        };
+        n.progress = Some(Progress {
+            id: id.to_string(),
+            value: None,
+            state,
+        });
+        self.notifier.send(n);
+    }
+
+    fn record_local(&self, tool: &str, source: &str, a: &crate::local::Approval, outcome: &str) {
+        let title = match tool {
+            "shell" => format!("$ {}", a.detail.lines().next().unwrap_or_default()),
+            _ => a.detail.lines().next().unwrap_or_default().to_string(),
+        };
+        self.notifier.record(HistoryEntry {
+            id: 0,
+            at: 0,
+            source: Some(format!("{source} · {tool}")),
+            title: title.chars().take(160).collect(),
+            message: a.detail.chars().take(500).collect(),
+            outcome: outcome.into(),
+        });
     }
 
     /// Handles a single JSON-RPC message. Notifications (without an id) get no reply.
@@ -1560,6 +1832,84 @@ mod tests {
     }
 
     #[test]
+    fn local_calls_ask_the_dog_and_go_to_history() {
+        let (m, rx) = mcp();
+        let m = Arc::new(m);
+        let dir = std::env::temp_dir().join(format!("dost-mcp-local-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        m.local.configure(&crate::local::LocalSettings {
+            enabled: true,
+            root: dir.display().to_string(),
+            ..Default::default()
+        });
+        let run = |cmd: &str| {
+            let m = Arc::clone(&m);
+            let msg = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "shell", "arguments": { "command": cmd, "source": "Test" } } });
+            thread::spawn(move || m.dispatch_local(msg).unwrap()["result"].clone())
+        };
+        // The next event that is a question; History entries and rules are collected.
+        let next_question = || loop {
+            match rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("nothing arrived")
+            {
+                notify::Event::Notify(n) => return *n,
+                _ => continue,
+            }
+        };
+
+        let t = run("echo hi");
+        let q = next_question();
+        // The labels follow the language (another test may switch it): pick by position.
+        assert_eq!(q.body, "echo hi");
+        assert_eq!(q.choices.len(), 3);
+        q.reply
+            .as_ref()
+            .unwrap()
+            .send(q.choices[2].clone())
+            .unwrap();
+        let r = t.join().unwrap();
+        assert_eq!(r["isError"], true);
+
+        let t = run("echo hi");
+        {
+            let q = next_question();
+            q.reply
+                .as_ref()
+                .unwrap()
+                .send(q.choices[1].clone())
+                .unwrap();
+        }
+        let r = t.join().unwrap();
+        assert_eq!(r["isError"], false, "{r}");
+        // Now it runs without asking, and History has it.
+        let r = run("echo again").join().unwrap();
+        assert!(r["content"][0]["text"].as_str().unwrap().contains("again"));
+        let mut events = Vec::new();
+        while let Ok(e) = rx.recv_timeout(Duration::from_millis(300)) {
+            events.push(e);
+        }
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, notify::Event::AllowAlways(r) if r == "shell:echo*"))
+        );
+        let outcomes: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                notify::Event::Record(h) => Some(format!("{} {}", h.title, h.outcome)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            outcomes.iter().any(|o| o == "$ echo again done"),
+            "{outcomes:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn ask_waits_for_the_answer() {
         let (m, rx) = mcp();
         let m = Arc::new(m);
@@ -1806,6 +2156,52 @@ mod tests {
         assert!(some.allows("https://chat.test"));
         assert!(!some.allows("https://example.com"));
         assert!(!some.allows("https://evil.test"));
+    }
+
+    #[test]
+    fn local_tools_only_while_turned_on() {
+        let (m, _rx) = mcp();
+        let m = Arc::new(m);
+        let server = Arc::new(Server::http("127.0.0.1:0").unwrap());
+        let port = server.server_addr().to_ip().unwrap().port();
+        let (srv, mm) = (Arc::clone(&server), Arc::clone(&m));
+        thread::spawn(move || {
+            for req in srv.incoming_requests() {
+                mm.handle(req);
+            }
+        });
+        let post = |path: &str, body: &str| {
+            use std::io::Write;
+            let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            write!(
+                s,
+                "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            let mut out = String::new();
+            s.read_to_string(&mut out).unwrap();
+            out
+        };
+        let list = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        assert!(
+            post("/mcp/local", list).starts_with("HTTP/1.1 404"),
+            "off by default"
+        );
+        m.local.configure(&crate::local::LocalSettings {
+            enabled: true,
+            read_only: true,
+            ..Default::default()
+        });
+        let out = post("/mcp/local", list);
+        assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+        assert!(
+            out.contains("\"grep\"") && !out.contains("\"shell\""),
+            "{out}"
+        );
+        // The dog's own tools stay on /mcp.
+        assert!(post("/mcp", list).contains("\"notify\""));
+        assert!(!post("/mcp/local", list).contains("\"notify\""));
     }
 
     #[test]

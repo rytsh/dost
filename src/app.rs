@@ -444,6 +444,14 @@ impl Core {
                 Event::Dismiss(key) => self.dismiss(&key),
                 Event::PanelChanged => self.panel_dirty = true,
                 Event::Remote(e) => self.on_remote(e),
+                Event::AllowAlways(rule) => {
+                    let mut s = self.settings.clone();
+                    if !s.local_mcp.always_allow.contains(&rule) {
+                        s.local_mcp.always_allow.push(rule);
+                        self.apply_settings(s, true);
+                    }
+                }
+                Event::Record(entry) => self.record_entry(entry),
             }
         }
         if now - self.last_special_check >= Duration::from_secs(1) {
@@ -1162,6 +1170,19 @@ impl Core {
         }
     }
 
+    /// Keeps something that is not a notification in History (a workspace tool's work).
+    fn record_entry(&mut self, mut e: HistoryEntry) {
+        self.panel_dirty = true;
+        self.history_dirty = true;
+        e.at = watch::now_unix();
+        if let Ok(mut s) = self.status.lock() {
+            s.history.push_back(e);
+            while s.history.len() > HISTORY_LEN {
+                s.history.pop_front();
+            }
+        }
+    }
+
     fn update_history(&mut self, id: u64, f: impl FnOnce(&mut HistoryEntry)) {
         self.panel_dirty = true;
         self.history_dirty = true;
@@ -1643,6 +1664,7 @@ impl Core {
         }
         self.mcp.set_name(&s.name);
         self.mcp.set_cors(&s.mcp_cors);
+        self.mcp.local.configure(&s.local_mcp);
         if self.phone_cfg.as_ref() != Some(&s.phone) {
             self.remote.configure(&s.phone);
             self.phone_cfg = Some(s.phone.clone());
@@ -2642,6 +2664,8 @@ mod tests {
     #[test]
     fn bone_can_be_put_away_and_dropping_is_not_a_throw() {
         let (mut c, mut p) = (core(), Fake::default());
+        // Without wandering it never goes to play with the bone by itself.
+        c.settings.wander = false;
         run(&mut c, &mut p, 1.0, |_| false);
         // Picked up and let go in place: the dog does not run after it.
         c.grab_toy();

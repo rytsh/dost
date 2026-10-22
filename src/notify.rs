@@ -248,6 +248,10 @@ pub enum Event {
     PanelChanged,
     /// Something came back from the phone.
     Remote(crate::remote::RemoteEvent),
+    /// "Always" for a workspace tool: keep the rule in the settings.
+    AllowAlways(String),
+    /// A workspace tool did something worth keeping in History.
+    Record(crate::mcp::HistoryEntry),
 }
 
 impl Event {
@@ -266,6 +270,14 @@ impl Notifier {
     /// Returns `false` if the app has shut down.
     pub fn send(&self, n: Notification) -> bool {
         self.0.send(Event::Notify(Box::new(n))).is_ok()
+    }
+
+    pub fn allow_always(&self, rule: String) -> bool {
+        self.0.send(Event::AllowAlways(rule)).is_ok()
+    }
+
+    pub fn record(&self, entry: crate::mcp::HistoryEntry) -> bool {
+        self.0.send(Event::Record(entry)).is_ok()
     }
 
     pub fn dismiss(&self, key: String) -> bool {
