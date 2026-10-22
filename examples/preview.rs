@@ -147,10 +147,11 @@ fn main() {
         (1.0, 0, false, "panel"),
         (2.0, 0, true, "panel-200"),
         (2.0, 1, true, "panel-200-look"),
-        (2.0, 2, true, "panel-200-walk"),
+        (2.0, 2, true, "panel-200-play"),
         (2.0, 3, true, "panel-200-sound"),
-        (2.0, 4, true, "panel-200-history"),
-        (2.0, 5, true, "panel-200-connect"),
+        (2.0, 4, true, "panel-200-todo"),
+        (2.0, 5, true, "panel-200-history"),
+        (2.0, 6, true, "panel-200-connect"),
     ] {
         let mut panel = dost::panel::Panel::new(scale);
         panel.set_tab(tab);
@@ -160,6 +161,13 @@ fn main() {
         let view = dost::panel::View {
             settings: dost::settings::Settings {
                 name: "Karabaş".into(),
+                birthday: "2024-10-21".into(),
+                bark_files: vec!["~/sounds/woof.wav".into()],
+                source_colors: [("ci".to_string(), "#2f6fc4".to_string())].into(),
+                mcp_cors: dost::mcp::Cors {
+                    allow_origins: vec!["https://*.example.com".into()],
+                    allow_private_network: true,
+                },
                 ..Default::default()
             },
             age: "2 years".into(),
@@ -169,26 +177,36 @@ fn main() {
             version: env!("CARGO_PKG_VERSION"),
             autostart_label: "Start with Windows",
             history: history.clone(),
+            todos: todo_lists(),
             // The Connect tab shows an update waiting for a restart.
-            update: (tab == 5).then(|| ("0.2.0".into(), true)),
+            update: (tab == 6).then(|| ("0.3.0".into(), true)),
             ..Default::default()
         };
         let (w, h) = panel.size(10_000);
         let mut pm = Pixmap::new(w, h).unwrap();
         panel.draw(&mut pm, &mut r, &view);
-        let mut canvas = Pixmap::new(w + 40, h + 40).unwrap();
-        canvas.fill(Color::from_rgba8(0x3a, 0x3f, 0x4b, 255));
-        canvas.draw_pixmap(
-            20,
-            20,
-            pm.as_ref(),
-            &Default::default(),
-            Transform::identity(),
-            None,
-        );
-        canvas
-            .save_png(out.replace(".png", &format!("-{name}.png")))
-            .unwrap();
+        let mut shots = vec![(name.to_string(), pm.clone())];
+        // Tabs longer than the panel: also scrolled to the end.
+        panel.scroll_by(-100.0, h);
+        panel.draw(&mut pm, &mut r, &view);
+        if pm.data() != shots[0].1.data() {
+            shots.push((format!("{name}-end"), pm.clone()));
+        }
+        for (name, pm) in shots {
+            let mut canvas = Pixmap::new(w + 40, h + 40).unwrap();
+            canvas.fill(Color::from_rgba8(0x3a, 0x3f, 0x4b, 255));
+            canvas.draw_pixmap(
+                20,
+                20,
+                pm.as_ref(),
+                &Default::default(),
+                Transform::identity(),
+                None,
+            );
+            canvas
+                .save_png(out.replace(".png", &format!("-{name}.png")))
+                .unwrap();
+        }
     }
 
     // Transparent dog + bubble, for the README screenshot.
@@ -219,25 +237,21 @@ fn main() {
         use dost::look::{Collar, Fur, Outfit, Season, Theme, Wear};
         let looks = [
             (Fur::Golden, Collar::Red, Wear::None, None),
-            (Fur::Cream, Collar::Blue, Wear::Bandana, None),
+            (Fur::Golden, Collar::None, Wear::None, None),
+            (Fur::Cream, Collar::None, Wear::None, None),
             (Fur::Chocolate, Collar::Green, Wear::Beanie, None),
-            (Fur::Black, Collar::Pink, Wear::Glasses, None),
+            (Fur::Black, Collar::Pink, Wear::None, None),
             (
                 Fur::Grey,
                 Collar::Purple,
                 Wear::None,
                 Some(Season::Birthday),
             ),
-            (
-                Fur::Red,
-                Collar::Black,
-                Wear::Glasses,
-                Some(Season::Halloween),
-            ),
+            (Fur::Red, Collar::Black, Wear::None, Some(Season::Halloween)),
             (
                 Fur::Golden,
                 Collar::Red,
-                Wear::Bandana,
+                Wear::None,
                 Some(Season::Christmas),
             ),
         ];
@@ -249,6 +263,8 @@ fn main() {
             (Anim::Sad, 2, 1.0, false),
             (Anim::Sleep, 0, 1.0, false),
             (Anim::Held, 1, 1.0, false),
+            (Anim::Happy, 0, 1.0, false),
+            (Anim::Happy, 2, -1.0, false),
         ];
         let pad = 30;
         let (lw, lh) = (cw + 2 * pad, ch + 2 * pad);
@@ -513,4 +529,31 @@ fn main() {
         }
     }
     println!("{out}, {bubble_out}");
+}
+
+fn todo_lists() -> Vec<dost::todo::List> {
+    use dost::todo::{Item, List};
+    let item = |id, text: &str, done, remind_at| Item {
+        id,
+        text: text.into(),
+        done,
+        remind_at,
+        ..Item::default()
+    };
+    vec![
+        List {
+            id: 1,
+            name: "Release 0.3".into(),
+            items: vec![
+                item(2, "Bump the version", true, None),
+                item(3, "Build the macOS app and the dmg", false, None),
+                item(4, "Write the release notes", false, Some(4_102_477_200)),
+            ],
+        },
+        List {
+            id: 5,
+            name: "Todo".into(),
+            items: vec![item(6, "Buy dog food", false, None)],
+        },
+    ]
 }

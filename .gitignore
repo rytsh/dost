@@ -14,4 +14,7 @@ art/px/*/review-contact.png
 .DS_Store
 art/items-hd/
 art/items-guide/
+art/items-fit/
 art/items/*/review-contact.png
+# Raw image-model takes (art/anim/fit keeps them registered to the sprite grid).
+art/anim/takes/

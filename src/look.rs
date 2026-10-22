@@ -5,17 +5,24 @@ use chrono::{Datelike, NaiveDate};
 use serde::{Deserialize, Serialize};
 use tiny_skia::{ColorU8, Pixmap, PremultipliedColorU8};
 
-/// Where an item sits in `assets/items.png` and how it is worn.
+/// One picture of an item in `assets/items.png` and where it goes.
 #[derive(Clone, Copy, Debug)]
-pub struct ItemSprite {
+pub struct ItemPose {
     /// (x, y, w, h) in the items atlas.
     pub rect: (u32, u32, u32, u32),
     /// The point of the item that goes on the dog (item pixels).
     pub pin: (i32, i32),
-    /// Where the pin goes on idle's first frame, relative to the feet point (sprite pixels).
+    /// Where the pin goes on the pose's first frame, relative to the feet point (sprite
+    /// pixels); it follows the head from there.
     pub at: (i32, i32),
-    /// Follows the collar instead of the head.
-    pub neck: bool,
+}
+
+/// An item: toys have one picture; worn items one per pose (`POSES`), each drawn by the image
+/// model on that pose, so they fit a sleeping or a sad head too.
+#[derive(Clone, Copy, Debug)]
+pub struct ItemSprite {
+    pub worn: bool,
+    pub poses: [ItemPose; POSES.len()],
 }
 
 include!("../assets/items_atlas.rs");
@@ -28,8 +35,6 @@ pub enum Item {
     PartyHat,
     WitchHat,
     SantaHat,
-    Bandana,
-    Glasses,
     Pumpkin,
 }
 
@@ -96,18 +101,22 @@ pub enum Collar {
     Pink,
     Purple,
     Black,
+    /// No collar (and no tag).
+    None,
 }
 
 impl Collar {
-    pub const ALL: [Collar; 6] = [
+    pub const ALL: [Collar; 7] = [
         Collar::Red,
         Collar::Blue,
         Collar::Green,
         Collar::Pink,
         Collar::Purple,
         Collar::Black,
+        Collar::None,
     ];
 
+    /// Colour of the swatch in the panel (`None` is drawn crossed out).
     pub fn swatch(self) -> ColorU8 {
         match self {
             Collar::Red => rgb(0xe0, 0x1e, 0x14),
@@ -116,12 +125,13 @@ impl Collar {
             Collar::Pink => rgb(0xf0, 0x6a, 0xb4),
             Collar::Purple => rgb(0x8a, 0x3c, 0xd0),
             Collar::Black => rgb(0x2a, 0x28, 0x2c),
+            Collar::None => rgb(0xff, 0xff, 0xff),
         }
     }
 
     fn map(self, (h, s, l): (f32, f32, f32)) -> (f32, f32, f32) {
         match self {
-            Collar::Red => (h, s, l),
+            Collar::Red | Collar::None => (h, s, l),
             Collar::Blue => (215.0, s * 0.85, l * 1.05),
             Collar::Green => (130.0, s * 0.7, l * 0.95),
             Collar::Pink => (328.0, s * 0.9, (l + 0.14).min(0.85)),
@@ -137,18 +147,14 @@ impl Collar {
 pub enum Wear {
     #[default]
     None,
-    Bandana,
     Beanie,
-    Glasses,
+    /// An item that is no longer offered (the bandana, the glasses): worn as nothing.
+    #[serde(other)]
+    Gone,
 }
 
 impl Wear {
-    pub const ALL: [(Wear, &str); 4] = [
-        (Wear::None, "None"),
-        (Wear::Bandana, "Bandana"),
-        (Wear::Beanie, "Beanie"),
-        (Wear::Glasses, "Glasses"),
-    ];
+    pub const ALL: [(Wear, &str); 2] = [(Wear::None, "None"), (Wear::Beanie, "Beanie")];
 }
 
 /// Colours of the speech bubble.
@@ -201,8 +207,6 @@ impl Season {
 /// What is drawn on the dog, back to front.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Outfit {
-    pub neck: Option<Item>,
-    pub face: Option<Item>,
     pub hat: Option<Item>,
     /// The toy to fetch (and carry in the mouth).
     pub toy: Option<Item>,
@@ -217,8 +221,6 @@ impl Outfit {
             None => (wear == Wear::Beanie).then_some(Item::Beanie),
         };
         Outfit {
-            neck: (wear == Wear::Bandana).then_some(Item::Bandana),
-            face: (wear == Wear::Glasses).then_some(Item::Glasses),
             hat,
             toy: Some(if season == Some(Season::Halloween) {
                 Item::Pumpkin
@@ -230,7 +232,7 @@ impl Outfit {
 
     /// Worn items, drawn in this order.
     pub fn worn(&self) -> impl Iterator<Item = Item> {
-        [self.neck, self.face, self.hat].into_iter().flatten()
+        self.hat.into_iter()
     }
 }
 
@@ -243,33 +245,48 @@ pub fn today() -> NaiveDate {
     chrono::Local::now().date_naive()
 }
 
-/// Recolours the dog's fur and collar in place; outline, eyes' shine, the cream patches, the
-/// tongue and the gold tag stay as drawn.
-pub fn recolor(pm: &mut Pixmap, fur: Fur, collar: Collar) {
+/// Recolours the dog in place: the fur everywhere, the collar where `collar_mask` says
+/// (`assets/collar.png`: band alpha 255, tag 192, the collar's outline 128, the rest of the dog
+/// 100; RGB is the dog drawn without a collar).
+/// Outline, eyes, the cream patches, the tongue and the ears stay as drawn.
+pub fn recolor(pm: &mut Pixmap, collar_mask: &Pixmap, fur: Fur, collar: Collar) {
     if fur == Fur::Golden && collar == Collar::Red {
         return;
     }
-    for p in pm.pixels_mut() {
+    let mask = collar_mask.pixels();
+    for (i, p) in pm.pixels_mut().iter_mut().enumerate() {
         if p.alpha() == 0 {
             continue;
         }
-        let c = p.demultiply();
+        let m = mask.get(i).map_or(0, |m| m.alpha());
+        let c = if m > 0 && collar == Collar::None {
+            // No collar: the dog as drawn without one.
+            let f = mask[i].demultiply();
+            ColorU8::from_rgba(f.red(), f.green(), f.blue(), p.alpha())
+        } else {
+            p.demultiply()
+        };
         let hsl = to_hsl(c);
         let (h, s, l) = hsl;
-        let mapped = if l < 0.08 {
-            continue;
-        } else if !(12.0..=345.0).contains(&h) && s > 0.5 && l < 0.6 {
+        // 100: not the collar, only drawn differently without one.
+        let on_collar = m > 100 && collar != Collar::None;
+        // Kept as drawn: the tag and the collar's outline, outline, cream and gold.
+        let keep = (on_collar && m < 255)
+            || l < 0.08
+            || l >= 0.8
+            || ((50.0..=62.0).contains(&h) && s > 0.8 && l < 0.75);
+        let mapped = if on_collar && m == 255 {
             collar.map(hsl)
-        } else if (50.0..=62.0).contains(&h) && s > 0.8 && l < 0.75 {
-            continue; // the gold tag
-        } else if l >= 0.8 {
-            continue; // cream
-        } else if (10.0..=65.0).contains(&h) {
+        } else if !keep && (10.0..=65.0).contains(&h) {
             fur.map(hsl)
         } else {
-            continue;
+            hsl
         };
-        let (r, g, b) = from_hsl(mapped);
+        let (r, g, b) = if mapped == hsl {
+            (c.red(), c.green(), c.blue())
+        } else {
+            from_hsl(mapped)
+        };
         if let Some(n) = ColorU8::from_rgba(r, g, b, c.alpha()).premultiply().into() {
             *p = n;
         }
@@ -321,6 +338,23 @@ fn from_hsl((h, s, l): (f32, f32, f32)) -> (u8, u8, u8) {
     (u(r), u(g), u(b))
 }
 
+/// Colours a source gets; the panel cycles through them when a colour is picked.
+pub const SOURCE_PALETTE: [ColorU8; 8] = [
+    rgb(0xc9, 0x6f, 0x12),
+    rgb(0x2f, 0x6f, 0xc4),
+    rgb(0x3a, 0x93, 0x58),
+    rgb(0x9b, 0x4c, 0xb8),
+    rgb(0xc4, 0x4a, 0x36),
+    rgb(0x1f, 0x8c, 0x8a),
+    rgb(0xa3, 0x80, 0x12),
+    rgb(0xc2, 0x43, 0x82),
+];
+
+/// `"#rrggbb"` for a colour.
+pub fn to_hex(c: ColorU8) -> String {
+    format!("#{:02x}{:02x}{:02x}", c.red(), c.green(), c.blue())
+}
+
 /// A colour for a notification's source: from `overrides` (lowercase name -> colour), or a
 /// stable pick from a small palette, so each agent keeps its colour.
 pub fn source_color(source: &str, overrides: &[(String, ColorU8)]) -> ColorU8 {
@@ -328,16 +362,7 @@ pub fn source_color(source: &str, overrides: &[(String, ColorU8)]) -> ColorU8 {
     if let Some((_, c)) = overrides.iter().find(|(k, _)| *k == key) {
         return *c;
     }
-    const PALETTE: [ColorU8; 8] = [
-        rgb(0xc9, 0x6f, 0x12),
-        rgb(0x2f, 0x6f, 0xc4),
-        rgb(0x3a, 0x93, 0x58),
-        rgb(0x9b, 0x4c, 0xb8),
-        rgb(0xc4, 0x4a, 0x36),
-        rgb(0x1f, 0x8c, 0x8a),
-        rgb(0xa3, 0x80, 0x12),
-        rgb(0xc2, 0x43, 0x82),
-    ];
+    const PALETTE: [ColorU8; 8] = SOURCE_PALETTE;
     // FNV-1a: stable across runs and platforms.
     let mut h: u32 = 0x811c_9dc5;
     for b in key.bytes() {
@@ -382,9 +407,8 @@ mod tests {
 
     #[test]
     fn outfits() {
-        let o = Outfit::new(Wear::Glasses, Some(Season::Halloween));
+        let o = Outfit::new(Wear::Beanie, Some(Season::Halloween));
         assert_eq!(o.hat, Some(Item::WitchHat));
-        assert_eq!(o.face, Some(Item::Glasses));
         assert_eq!(o.toy, Some(Item::Pumpkin));
         let o = Outfit::new(Wear::Beanie, None);
         assert_eq!(o.worn().collect::<Vec<_>>(), [Item::Beanie]);
@@ -408,22 +432,31 @@ mod tests {
             assert!((g as i32 - c.green() as i32).abs() <= 1);
             assert!((b as i32 - c.blue() as i32).abs() <= 1);
         }
-        let mut pm = Pixmap::new(4, 1).unwrap();
+        let mut pm = Pixmap::new(5, 1).unwrap();
         let px = [
             rgb(0xff, 0xb6, 0x21), // fur
             rgb(0xf3, 0x15, 0x0e), // collar
             rgb(0x05, 0x02, 0x00), // outline
             rgb(0xfe, 0xfe, 0xe7), // cream
+            rgb(0xf3, 0x15, 0x0e), // the same red in the mouth: not the collar
         ];
         for (d, c) in pm.pixels_mut().iter_mut().zip(px) {
             *d = premul(c);
         }
-        recolor(&mut pm, Fur::Black, Collar::Blue);
+        let mut mask = Pixmap::new(5, 1).unwrap();
+        mask.pixels_mut()[1] = premul(rgb(0xff, 0xb6, 0x21));
+        let original = pm.clone();
+        recolor(&mut pm, &mask, Fur::Black, Collar::Blue);
         let out: Vec<ColorU8> = pm.pixels().iter().map(|p| p.demultiply()).collect();
         assert!(to_hsl(out[0]).2 < 0.3, "fur got dark");
         assert!((200.0..230.0).contains(&to_hsl(out[1]).0), "collar is blue");
         assert_eq!(out[2], px[2]);
         assert_eq!(out[3], px[3]);
+        assert_eq!(out[4], px[4], "the tongue keeps its colour");
+        // No collar: fur where it was.
+        let mut pm = original;
+        recolor(&mut pm, &mask, Fur::Golden, Collar::None);
+        assert_eq!(pm.pixels()[1].demultiply(), px[0]);
     }
 
     #[test]

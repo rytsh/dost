@@ -9,24 +9,13 @@ use serde::{Deserialize, Serialize};
 use crate::look::{Collar, Fur, Theme, Wear};
 
 /// Dog size, percent. The sprite is 128 px tall; on screen it is rounded to a whole multiple so
-/// pixels stay crisp and even (100 = 1:1).
-pub const SIZES: [(u32, &str); 3] = [(100, "1×"), (200, "2×"), (300, "3×")];
+/// pixels stay crisp and even (100 = 1:1). The panel steps by `SIZE_STEP`.
+pub const SIZE_STEP: u32 = 50;
 pub const SPEEDS: [(f32, &str); 3] = [(0.6, "Slow"), (1.0, "Normal"), (1.6, "Fast")];
-/// How long the notification bubble stays on screen; 0 = until clicked.
-/// Upward offset of the ground from the baseline, in logical pixels (multiplied by the screen scale).
-/// A negative value sinks the dog slightly below the baseline (into the taskbar edge).
-pub const LIFTS: [(i32, &str); 6] = [
-    (-6, "−6"),
-    (-3, "−3"),
-    (0, "0"),
-    (20, "+20"),
-    (60, "+60"),
-    (150, "+150"),
-];
 /// Bubble text size multipliers.
 pub const TEXT_SIZES: [(f32, &str); 4] = [(1.0, "S"), (1.2, "M"), (1.45, "L"), (1.75, "XL")];
-pub const NOTIFY_SECS: [(u64, &str); 4] =
-    [(5, "5 s"), (10, "10 s"), (30, "30 s"), (0, "Until click")];
+/// How long the bubble stays, seconds, as the panel steps through them; 0 = until clicked.
+pub const NOTIFY_STEPS: [u64; 10] = [5, 10, 15, 20, 30, 45, 60, 120, 300, 0];
 
 /// The baseline the dog stands on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +53,8 @@ pub struct Settings {
     pub notify_secs: u64,
     pub mcp_enabled: bool,
     pub mcp_addr: String,
+    /// Which web pages may use the MCP server from a browser (pages on localhost always can).
+    pub mcp_cors: crate::mcp::Cors,
     /// Do not disturb: no barking and only important bubbles (questions, sticky, progress).
     pub quiet: bool,
     /// Daily quiet hours as "HH:MM" local time; `quiet_from` == `quiet_to` disables them.
@@ -117,6 +108,7 @@ impl Default for Settings {
             sound_on_pet: false,
             mcp_enabled: true,
             mcp_addr: "127.0.0.1:7777".into(),
+            mcp_cors: Default::default(),
             quiet: false,
             quiet_from: "22:00".into(),
             quiet_to: "22:00".into(),
@@ -170,6 +162,9 @@ impl Settings {
             self.quiet_to = d.quiet_to;
         }
         self.name = clean_name(&self.name);
+        if self.wear == Wear::Gone {
+            self.wear = Wear::None;
+        }
         if !self.birthday.is_empty() && crate::look::parse_date(&self.birthday).is_none() {
             self.birthday.clear();
         }
@@ -359,7 +354,7 @@ mod tests {
     #[test]
     fn identity_and_look() {
         let s: Settings = serde_json::from_str(
-            r##"{ "name": "  Karabaş\n ", "fur": "black", "collar": "blue", "wear": "glasses",
+            r##"{ "name": "  Karabaş\n ", "fur": "black", "collar": "blue", "wear": "beanie",
                  "birthday": "2026-02-30", "source_colors": { "CI": "#ff0000", "x": "nope" } }"##,
         )
         .unwrap();
@@ -367,11 +362,19 @@ mod tests {
         assert_eq!(s.name, "Karabaş");
         assert_eq!(
             (s.fur, s.collar, s.wear),
-            (Fur::Black, Collar::Blue, Wear::Glasses)
+            (Fur::Black, Collar::Blue, Wear::Beanie)
         );
         assert_eq!(s.birthday, "", "not a real date");
         assert_eq!(s.source_colors().len(), 1);
         assert_eq!(s.source_colors()[0].0, "ci");
+        // The bandana and the glasses are gone: an old file reads as wearing nothing.
+        for gone in ["bandana", "glasses"] {
+            let old: Settings =
+                serde_json::from_str(&format!(r#"{{ "wear": "{gone}", "collar": "none" }}"#))
+                    .unwrap();
+            let old = old.sanitized();
+            assert_eq!((old.wear, old.collar), (Wear::None, Collar::None));
+        }
         assert_eq!(clean_name(""), DEFAULT_NAME);
         assert_eq!(clean_name(&"x".repeat(50)).chars().count(), NAME_MAX);
         // Defaults are not written out for the empty maps and lists.

@@ -16,8 +16,10 @@ use crate::notify::ProgressState;
 
 /// Output of `art/pack_atlas.py`: each row is an animation (in `Anim` order), each column a frame.
 const ATLAS_PNG: &[u8] = include_bytes!("../assets/dog.png");
-/// Output of `art/pack_items.py`: hats, glasses, the bandana and toys, in `Item` order.
+/// Output of `art/pack_items.py`: hats and toys, in `Item` order.
 const ITEMS_PNG: &[u8] = include_bytes!("../assets/items.png");
+/// Output of `art/collar.py`: where the collar is in `dog.png`, and the fur under it.
+const COLLAR_PNG: &[u8] = include_bytes!("../assets/collar.png");
 /// Text uses the system UI font; these families are tried in order.
 const SYSTEM_FAMILIES: [&str; 7] = [
     "Segoe UI",
@@ -226,6 +228,8 @@ pub struct Hits {
 pub struct Renderer {
     /// The dog as drawn (`assets/dog.png`).
     original: Pixmap,
+    /// Where the collar is in `original` (`assets/collar.png`).
+    collar: Pixmap,
     /// The dog in the chosen colours.
     atlas: Pixmap,
     items: Pixmap,
@@ -302,6 +306,7 @@ impl Renderer {
         }
         Renderer {
             original: atlas.clone(),
+            collar: Pixmap::decode_png(COLLAR_PNG).expect("assets/collar.png"),
             atlas,
             items,
             outfit: Outfit::default(),
@@ -325,7 +330,7 @@ impl Renderer {
         if self.colors != (fur, collar) {
             self.colors = (fur, collar);
             self.atlas = self.original.clone();
-            look::recolor(&mut self.atlas, fur, collar);
+            look::recolor(&mut self.atlas, &self.collar, fur, collar);
         }
         if self.outfit != outfit {
             self.outfit = outfit;
@@ -345,14 +350,14 @@ impl Renderer {
 
     /// Size of the toy's window: a square that fits it turned any quarter turn (physical).
     pub fn toy_size(&self, item: Item, px: u32) -> u32 {
-        let (_, _, w, h) = item.sprite().rect;
+        let (_, _, w, h) = item.sprite().poses[0].rect;
         w.max(h) * px
     }
 
     /// Draws the toy turned `quarter` quarter turns, centred, resting on the bottom edge.
     pub fn draw_toy(&self, pm: &mut Pixmap, item: Item, quarter: u8, px: u32) {
         pm.fill(Color::TRANSPARENT);
-        let (rx, ry, w, h) = item.sprite().rect;
+        let (rx, ry, w, h) = item.sprite().poses[0].rect;
         let turned = quarter % 2 == 1;
         let (tw, th) = if turned { (h, w) } else { (w, h) };
         let (pw, ph) = (pm.width() as i32, pm.height() as i32);
@@ -388,11 +393,9 @@ impl Renderer {
     /// The dog and what it wears (and carries), feet point at (`ax`, `ground`).
     fn blit_dog(&self, pm: &mut Pixmap, f: &DogFrame, ax: i32, ground: i32, px: i32) {
         blit_sprite(pm, &self.atlas, f, ax, ground, px);
-        let cell = f.anim.cell(f.frame);
         let toy = self.outfit.toy.filter(|_| f.carry);
         for item in self.outfit.worn().chain(toy) {
-            let s = item.sprite();
-            let (tx, ty) = item_target(s, cell);
+            let (s, (tx, ty)) = item_target(item.sprite(), f.anim, f.frame);
             let (rx, ry, w, h) = s.rect;
             blit_region(
                 pm,
@@ -1199,6 +1202,28 @@ fn bubble_path(
     pb.finish()
 }
 
+/// Whether something is drawn at (`x`, `y`) of `pm` or within `reach` pixels of it: clicks
+/// there are for us; elsewhere they go through to what is behind the window.
+pub fn drawn_near(pm: &Pixmap, x: i32, y: i32, reach: i32) -> bool {
+    let (w, h) = (pm.width() as i32, pm.height() as i32);
+    for dy in -reach..=reach {
+        for dx in -reach..=reach {
+            let (px, py) = (x + dx, y + dy);
+            if px >= 0
+                && py >= 0
+                && px < w
+                && py < h
+                && pm
+                    .pixel(px as u32, py as u32)
+                    .is_some_and(|p| p.alpha() > 40)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Bounding box of a cell's opaque pixels (atlas coordinates, right/bottom exclusive).
 fn opaque_box(atlas: &Pixmap, anim: Anim, frame: usize) -> (u32, u32, u32, u32) {
     let (cx, cy) = (frame as u32 * CELL.0, anim.row() * CELL.1);
@@ -1223,12 +1248,10 @@ fn sprite_height(atlas: &Pixmap, anim: Anim, outfit: &Outfit) -> u32 {
         .map(|f| {
             let (_, y0, _, _) = opaque_box(atlas, anim, f);
             let body = (anim.row() * CELL.1 + ANCHOR.1).saturating_sub(y0) as i32;
-            let cell = anim.cell(f);
             outfit
                 .worn()
                 .map(|i| {
-                    let s = i.sprite();
-                    let (_, ty) = item_target(s, cell);
+                    let (s, (_, ty)) = item_target(i.sprite(), anim, f);
                     -(ty - s.pin.1)
                 })
                 .fold(body, i32::max)
@@ -1238,15 +1261,24 @@ fn sprite_height(atlas: &Pixmap, anim: Anim, outfit: &Outfit) -> u32 {
         .unwrap_or(ANCHOR.1)
 }
 
-/// Where an item's pin goes in frame `cell`, relative to the feet point (sprite pixels).
-fn item_target(s: look::ItemSprite, cell: usize) -> (i32, i32) {
-    if s.neck {
-        let (nx, ny) = NECK[cell];
-        (nx as i32 + s.at.0, ny as i32 + s.at.1)
+/// Which picture of an item frame `frame` of `anim` uses, and where its pin goes (relative to
+/// the feet point, sprite pixels). Worn items have a picture per action (per frame for happy),
+/// fitted on its first frame, and follow the head from there; toys follow it from idle's.
+fn item_target(s: look::ItemSprite, anim: Anim, frame: usize) -> (look::ItemPose, (i32, i32)) {
+    let cell = anim.cell(frame);
+    let (pose, from) = if !s.worn {
+        (0, 0)
+    } else if anim == Anim::Happy {
+        let name = format!("happy{frame}");
+        let i = look::POSES.iter().position(|p| *p == name).unwrap_or(0);
+        (i, cell)
     } else {
-        let (hx, hy) = HEAD[cell];
-        (s.at.0 + hx as i32, s.at.1 + hy as i32)
-    }
+        (anim.row() as usize, anim.cell(0))
+    };
+    let p = s.poses[pose];
+    let (hx, hy) = HEAD[cell];
+    let (fx, fy) = HEAD[from];
+    (p, (p.at.0 + (hx - fx) as i32, p.at.1 + (hy - fy) as i32))
 }
 
 /// Draws `rect` of `src` with its top-left at `at` (sprite pixels from the feet point),

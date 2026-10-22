@@ -702,7 +702,15 @@ mod tests {
         };
         assert!(run_check(&open).unwrap().0);
         drop(listener);
-        assert!(!run_check(&open).unwrap().0);
+        // The port may take a moment to close.
+        let closed = (0..50).any(|_| {
+            let open_now = run_check(&open).unwrap().0;
+            if open_now {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            !open_now
+        });
+        assert!(closed);
 
         assert!(
             run_check(&Check::Process {

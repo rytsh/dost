@@ -598,6 +598,17 @@ impl App {
     }
 
     fn on_action(&mut self, action: panel::Action) {
+        if action == panel::Action::TakeToy {
+            // The Bone button dragged out of the panel: the toy follows the mouse from here.
+            unsafe { ReleaseCapture() };
+            self.close_panel();
+            let p = cursor_pos();
+            let lift = 12.0 * self.bounds().scale;
+            self.core.take_toy(p.x as f32, p.y as f32 + lift);
+            self.shell.toy.drag = Some((0.0, -lift));
+            unsafe { SetCapture(self.shell.toy.hwnd) };
+            return;
+        }
         self.core.on_action(&mut self.shell, action);
         self.sync_menu();
     }
@@ -768,6 +779,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_RBUTTONUP => {
+            // Right click on the toy: put it away.
+            if with_app(|a| a.shell.toy.hwnd == hwnd) == Some(true) {
+                with_app(|a| a.core.put_toy_away());
+                return 0;
+            }
             // The menu runs its own modal loop (WM_TIMER still arrives), so it must not be
             // shown while App is borrowed.
             if let Some(menu) = with_app(|a| a.shell.menu.clone()) {
@@ -776,6 +792,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_MOUSEACTIVATE => MA_NOACTIVATE as LRESULT,
+        WM_NCHITTEST => {
+            // The dog's window is much bigger than the dog (room for the bubble and hats):
+            // only what is drawn takes the mouse; elsewhere it goes to the windows behind.
+            let p = POINT {
+                x: (lp & 0xffff) as i16 as i32,
+                y: ((lp >> 16) & 0xffff) as i16 as i32,
+            };
+            let over = with_app(|a| {
+                let sh = &a.shell;
+                if sh.hwnd != hwnd || sh.drag.is_some() {
+                    return true;
+                }
+                let px = a.core.scale(monitor_scale(p)).px as i32;
+                dost::render::drawn_near(&sh.pixmap, p.x - sh.win_pos.x, p.y - sh.win_pos.y, 2 * px)
+            });
+            if over == Some(false) {
+                HTTRANSPARENT as LRESULT
+            } else {
+                unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+            }
+        }
         WM_DESTROY => {
             unsafe { PostQuitMessage(0) };
             0
@@ -1052,6 +1089,29 @@ mod clipboard {
 
     const CF_UNICODETEXT: u32 = 13;
 
+    pub fn get_text() -> Option<String> {
+        unsafe {
+            if OpenClipboard(std::ptr::null_mut()) == 0 {
+                return None;
+            }
+            let h = GetClipboardData(CF_UNICODETEXT);
+            let mut out = None;
+            if !h.is_null() {
+                let p = GlobalLock(h) as *const u16;
+                if !p.is_null() {
+                    let mut n = 0;
+                    while *p.add(n) != 0 {
+                        n += 1;
+                    }
+                    out = Some(String::from_utf16_lossy(std::slice::from_raw_parts(p, n)));
+                    GlobalUnlock(h);
+                }
+            }
+            CloseClipboard();
+            out
+        }
+    }
+
     pub fn set_text(text: &str) -> bool {
         let wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
         unsafe {
@@ -1224,7 +1284,8 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
     match msg {
         WM_MOUSEMOVE => {
             let (x, y) = pt();
-            with_app(|a| {
+            // Actions may close the panel (and this window), so run them after the borrow.
+            let action = with_app(|a| {
                 if !a.shell.panel.tracking {
                     a.shell.panel.tracking = true;
                     let mut tme = TRACKMOUSEEVENT {
@@ -1243,10 +1304,12 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                     .as_mut()
                     .map_or((false, None), |p| p.pointer_move(x, y, &settings));
                 a.shell.panel.redraw |= redraw;
-                if let Some(action) = action {
-                    a.on_action(action);
-                }
-            });
+                action
+            })
+            .flatten();
+            if let Some(action) = action {
+                with_app(|a| a.on_action(action));
+            }
             0
         }
         WM_MOUSELEAVE => {
@@ -1330,7 +1393,14 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             0
         }
         WM_CHAR => {
-            // Typed text for the name field (Backspace and Enter come as WM_KEYDOWN).
+            // Typed text for the fields (Backspace and Enter come as WM_KEYDOWN); Ctrl+V
+            // arrives as character 0x16: paste.
+            if wp == 0x16 {
+                if let Some(t) = clipboard::get_text() {
+                    with_app(|a| a.panel_key(panel::Key::Text(t)));
+                }
+                return 0;
+            }
             let c = char::from_u32(wp as u32).filter(|c| !c.is_control());
             if let Some(c) = c {
                 with_app(|a| a.panel_key(panel::Key::Text(c.to_string())));

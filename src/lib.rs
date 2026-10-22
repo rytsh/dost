@@ -8,6 +8,7 @@ pub mod panel;
 pub mod render;
 pub mod settings;
 pub mod sound;
+pub mod todo;
 pub mod toy;
 pub mod update;
 pub mod watch;

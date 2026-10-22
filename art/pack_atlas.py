@@ -26,12 +26,16 @@ MARGIN = 1
 
 
 def load(anim):
+    """Frames as 8 channels: the frame's RGBA, then the same frame without the collar
+    (art/px/<anim>/plain, drawn by the image model), so both get the same shifts."""
     fin = json.load(open(f"art/px/{anim}/finish.json"))
     ax, ay = fin["anchor"]
     frames = []
     for path in sorted(glob.glob(f"art/px/{anim}/frames/*.png")):
         im = np.asarray(Image.open(path).convert("RGBA"))
-        frames.append((im, ax, ay))
+        plain = path.replace("/frames/", "/plain/")
+        pl = np.asarray(Image.open(plain).convert("RGBA")) if glob.os.path.exists(plain) else im
+        frames.append((np.concatenate([im, pl], -1), ax, ay))
     return frames
 
 
@@ -43,7 +47,7 @@ def place(frames, pad=round(48 * SCALE)):
     h = top + max(im.shape[0] - ay for im, _, ay in frames) + pad
     out = []
     for im, ax, ay in frames:
-        c = np.zeros((h, w, 4), np.uint8)
+        c = np.zeros((h, w, im.shape[2]), np.uint8)
         c[top - ay : top - ay + im.shape[0], left - ax : left - ax + im.shape[1]] = im
         out.append(c)
     return out, (left, top)
@@ -148,14 +152,18 @@ left, top = ext[0] + MARGIN, ext[1] + MARGIN
 cw, ch = left + ext[2] + MARGIN, top + ext[3] + MARGIN
 cols = max(len(f) for f, _ in registered.values())
 
-atlas = np.zeros((ch * len(ANIMS), cw * cols, 4), np.uint8)
+both = np.zeros((ch * len(ANIMS), cw * cols, 8), np.uint8)
 for row, anim in enumerate(ANIMS):
     frames, (ax, ay) = registered[anim]
     for col, f in enumerate(frames):
-        atlas[row * ch : (row + 1) * ch, col * cw : (col + 1) * cw] = f[ay - top : ay - top + ch, ax - left : ax - left + cw]
+        both[row * ch : (row + 1) * ch, col * cw : (col + 1) * cw] = f[ay - top : ay - top + ch, ax - left : ax - left + cw]
+atlas = np.ascontiguousarray(both[..., :4])
 Image.fromarray(atlas).save("assets/dog.png", optimize=True)
+# The dog without its collar, for collar.py (not shipped).
+glob.os.makedirs("target", exist_ok=True)
+Image.fromarray(np.ascontiguousarray(both[..., 4:])).save("target/dog-plain.png")
 
-# Where the head and the collar are in every cell, so accessories (hats, glasses, bandana)
+# Where the head and the collar are in every cell, so hats
 # follow the dog. The head is found by matching idle's first head against each frame.
 def cells():
     for row, anim in enumerate(ANIMS):

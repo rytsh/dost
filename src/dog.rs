@@ -43,16 +43,23 @@ impl Anim {
     }
 
     /// Duration of each frame (seconds). `Walk` advances by distance travelled, not by time.
+    /// The frames are one base pose with small moving parts (tail, eyes, mouth), with an
+    /// in-between on each side, so short frames read as smooth motion.
     fn durations(self) -> &'static [f32] {
         match self {
-            Anim::Idle => &[0.9, 0.3, 0.3, 0.15],
+            // Tail wag there and back, then a blink.
+            Anim::Idle => &[
+                0.7, 0.09, 0.12, 0.09, 0.09, 0.09, 0.12, 0.09, 0.06, 0.1, 0.06,
+            ],
             Anim::Walk => &[0.0; 8],
-            Anim::Sit => &[1.4, 0.35, 0.35, 0.15],
-            Anim::Bark => &[0.2, 0.12, 0.22, 0.14],
+            // Tail sweep, a little pant, a blink.
+            Anim::Sit => &[1.1, 0.12, 0.18, 0.12, 0.5, 0.45, 0.6, 0.06, 0.1, 0.06],
+            Anim::Bark => &[0.16, 0.06, 0.2, 0.08],
             Anim::Happy => &[0.14, 0.11, 0.13, 0.14],
-            Anim::Sleep => &[0.8, 0.7, 0.8, 0.7],
-            Anim::Held => &[0.28, 0.2, 0.28, 0.2],
-            Anim::Sad => &[1.2, 0.9, 1.1, 0.2],
+            // Breathing, an ear twitch now and then.
+            Anim::Sleep => &[0.9, 0.9, 0.9, 0.9, 0.6, 0.25],
+            Anim::Held => &[0.22, 0.08, 0.16, 0.08, 0.5, 0.14],
+            Anim::Sad => &[1.0, 0.12, 0.5, 0.12, 0.6, 0.9],
         }
     }
 
@@ -907,8 +914,12 @@ mod tests {
     #[test]
     fn frame_at_cycles() {
         assert_eq!(Anim::Idle.frame_at(0.0), 0);
-        assert_eq!(Anim::Idle.frame_at(0.95), 1);
-        assert_eq!(Anim::Idle.frame_at(1.65 + 0.1), 0);
+        assert_eq!(Anim::Idle.frame_at(0.75), 1);
+        let total: f32 = Anim::Idle.durations().iter().sum();
+        assert_eq!(Anim::Idle.frame_at(total + 0.1), 0);
+        for a in Anim::ALL {
+            assert_eq!(a.durations().len(), a.frames(), "{a:?}");
+        }
     }
 
     fn run_until(dog: &mut Dog, secs: f32, done: impl Fn(&Dog) -> bool) {
@@ -973,6 +984,6 @@ mod tests {
         assert_eq!(dog.frame().anim, Anim::Sad);
         run_until(&mut dog, 10.0, |d| d.frame().anim != Anim::Sad);
         assert_ne!(dog.frame().anim, Anim::Sad);
-        assert_eq!(Anim::Sad.cell(0), 32);
+        assert_eq!(Anim::Sad.cell(0), FRAMES[..7].iter().sum::<usize>());
     }
 }

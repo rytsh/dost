@@ -1,0 +1,492 @@
+{
+ "_note": "Frames per action: the base cell (art/anim/base.png, frame 0) plus patches from art/anim/fit. See art/anim/edit.py.",
+ "idle": [
+  {
+   "patches": []
+  },
+  {
+   "patches": [
+    {
+     "fit": "idle-tailR2",
+     "box": [
+      11,
+      40,
+      56,
+      88
+     ]
+    }
+   ]
+  },
+  {
+   "patches": [
+    {
+     "fit": "idle-tailR",
+     "box": [
+      11,
+      40,
+      56,
+      88
+     ]
+    }
+   ]
+  },
+  {
+   "patches": [
+    {
+     "fit": "idle-tailR2",
+     "box": [
+      11,
+      40,
+      56,
+      88
+     ]
+    }
+   ]
+  },
+  {
+   "patches": []
+  },
+  {
+   "patches": [
+    {
+     "fit": "idle-tailL2",
+     "box": [
+      4,
+      41,
+      48,
+      86
+     ]
+    }
+   ]
+  },
+  {
+   "patches": [
+    {
+     "fit": "idle-tailL",
+     "box": [
+      4,
+      41,
+      48,
+      77
+     ]
+    }
+   ]
+  },
+  {
+   "patches": [
+    {
+     "fit": "idle-tailL2",
+     "box": [
+      4,
+      41,
+      48,
+      86
+     ]
+    }
+   ]
+  },
+  {
+   "patches": [
+    {
+     "fit": "idle-half3",
+     "box": [
+      88,
+      36,
+      128,
+      64
+     ]
+    }
+   ]
+  },
+  {
+   "patches": [
+    {
+     "fit": "idle-blink3",
+     "box": [
+      88,
+      36,
+      128,
+      64
+     ]
+    }
+   ]
+  },
+  {
+   "patches": [
+    {
+     "fit": "idle-half3",
+     "box": [
+      88,
+      36,
+      128,
+      64
+     ]
+    }
+   ]
+  }
+ ],
+ "sit": [
+  {
+   "patches": []
+  },
+  {
+   "patches": [
+    {
+     "fit": "sit-tailL2",
+     "box": [
+      3,
+      102,
+      41,
+      140
+     ]
+    }
+   ]
+  },
+  {
+   "patches": [
+    {
+     "fit": "sit-tailL",
+     "box": [
+      3,
+      102,
+      41,
+      140
+     ]
+    }
+   ]
+  },
+  {
+   "patches": [
+    {
+     "fit": "sit-tailL2",
+     "box": [
+      3,
+      102,
+      41,
+      140
+     ]
+    }
+   ]
+  },
+  {
+   "patches": []
+  },
+  {
+   "patches": [
+    {
+     "fit": "sit-pant",
+     "box": [
+      106,
+      70,
+      124,
+      84
+     ]
+    }
+   ]
+  },
+  {
+   "patches": []
+  },
+  {
+   "patches": [
+    {
+     "fit": "sit-half3",
+     "box": [
+      86,
+      38,
+      126,
+      67
+     ]
+    }
+   ]
+  },
+  {
+   "patches": [
+    {
+     "fit": "sit-blink3",
+     "box": [
+      86,
+      38,
+      126,
+      67
+     ]
+    }
+   ]
+  },
+  {
+   "patches": [
+    {
+     "fit": "sit-half3",
+     "box": [
+      86,
+      38,
+      126,
+      67
+     ]
+    }
+   ]
+  }
+ ],
+ "bark": [
+  {
+   "patches": []
+  },
+  {
+   "patches": [
+    {
+     "fit": "bark-half",
+     "box": [
+      100,
+      55,
+      136,
+      85
+     ]
+    }
+   ]
+  },
+  {
+   "patches": [
+    {
+     "fit": "bark-open",
+     "box": [
+      100,
+      55,
+      136,
+      85
+     ]
+    }
+   ]
+  },
+  {
+   "patches": [
+    {
+     "fit": "bark-half",
+     "box": [
+      100,
+      55,
+      136,
+      85
+     ]
+    }
+   ]
+  }
+ ],
+ "held": [
+  {
+   "patches": []
+  },
+  {
+   "patches": [
+    {
+     "fit": "held-kick2",
+     "box": [
+      70,
+      75,
+      129,
+      119
+     ]
+    }
+   ]
+  },
+  {
+   "patches": [
+    {
+     "fit": "held-kick",
+     "box": [
+      70,
+      75,
+      129,
+      119
+     ]
+    }
+   ]
+  },
+  {
+   "patches": [
+    {
+     "fit": "held-kick2",
+     "box": [
+      70,
+      75,
+      129,
+      119
+     ]
+    }
+   ]
+  },
+  {
+   "patches": []
+  },
+  {
+   "patches": [
+    {
+     "fit": "held-blink3",
+     "box": [
+      86,
+      22,
+      122,
+      50
+     ]
+    }
+   ]
+  }
+ ],
+ "sad": [
+  {
+   "patches": []
+  },
+  {
+   "patches": [
+    {
+     "fit": "sad-half2",
+     "box": [
+      90,
+      43,
+      133,
+      72
+     ]
+    }
+   ]
+  },
+  {
+   "patches": [
+    {
+     "fit": "sad-blink2",
+     "box": [
+      90,
+      43,
+      133,
+      72
+     ]
+    }
+   ]
+  },
+  {
+   "patches": [
+    {
+     "fit": "sad-half2",
+     "box": [
+      90,
+      43,
+      133,
+      72
+     ]
+    }
+   ]
+  },
+  {
+   "patches": []
+  },
+  {
+   "patches": [
+    {
+     "fit": "sad-look",
+     "box": [
+      92,
+      39,
+      132,
+      72
+     ]
+    }
+   ]
+  }
+ ],
+ "sleep": [
+  {
+   "patches": []
+  },
+  {
+   "patches": [
+    {
+     "fit": "sleep-breathe",
+     "box": [
+      25,
+      75,
+      74,
+      111
+     ]
+    }
+   ]
+  },
+  {
+   "patches": []
+  },
+  {
+   "patches": [
+    {
+     "fit": "sleep-breathe",
+     "box": [
+      25,
+      75,
+      74,
+      111
+     ]
+    }
+   ]
+  },
+  {
+   "patches": []
+  },
+  {
+   "patches": [
+    {
+     "fit": "sleep-ear",
+     "box": [
+      122,
+      55,
+      156,
+      88
+     ]
+    }
+   ]
+  }
+ ],
+ "walk": [
+  {
+   "file": "walk-0",
+   "plain": "walk-plain-0"
+  },
+  {
+   "file": "walk-1",
+   "plain": "walk-plain-1"
+  },
+  {
+   "file": "walk-2",
+   "plain": "walk-plain-2"
+  },
+  {
+   "file": "walk-3",
+   "plain": "walk-plain-3"
+  },
+  {
+   "file": "walk-4",
+   "plain": "walk-plain-4"
+  },
+  {
+   "file": "walk-5",
+   "plain": "walk-plain-5"
+  },
+  {
+   "file": "walk-6",
+   "plain": "walk-plain-6"
+  },
+  {
+   "file": "walk-7",
+   "plain": "walk-plain-7"
+  }
+ ],
+ "happy": [
+  {
+   "base": 0
+  },
+  {
+   "base": 1
+  },
+  {
+   "base": 2
+  },
+  {
+   "base": 3
+  }
+ ]
+}

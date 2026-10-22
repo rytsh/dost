@@ -15,6 +15,7 @@ use crate::panel::{self, Action};
 use crate::render::{Bubble, Hits, Renderer, Scale};
 use crate::settings::{self, Settings, Store};
 use crate::sound::{Sounds, Voice};
+use crate::todo::Todos;
 use crate::toy::{self, Toy};
 use crate::update;
 use crate::watch::{self, Watches};
@@ -216,9 +217,18 @@ impl Core {
     ) -> Self {
         let (notifier, rx) = notify::channel();
         let status = Arc::new(Mutex::new(DogStatus::default()));
-        let watches = Watches::new(notifier.clone(), watches_path);
+        let watches = Watches::new(notifier.clone(), watches_path.clone());
         watches.start();
-        let mcp = Arc::new(Mcp::new(notifier.clone(), watches, Arc::clone(&status)));
+        // Todo lists live next to the watches (none in tests).
+        let todos = Arc::new(Todos::new(
+            watches_path.and_then(|p| Some(p.parent()?.join("todos.json"))),
+        ));
+        let mcp = Arc::new(Mcp::new(
+            notifier.clone(),
+            watches,
+            Arc::clone(&todos),
+            Arc::clone(&status),
+        ));
         Core {
             dog: Dog::new(x.round(), ground),
             renderer,
@@ -356,6 +366,7 @@ impl Core {
                 Event::Notify(n) => self.receive(*n),
                 Event::React(r) => self.reactions.push(r),
                 Event::Dismiss(key) => self.dismiss(&key),
+                Event::PanelChanged => self.panel_dirty = true,
             }
         }
         for r in std::mem::take(&mut self.reactions) {
@@ -512,6 +523,33 @@ impl Core {
     pub fn grab_toy(&mut self) {
         self.dog.stop_fetch();
         self.toy.grab();
+    }
+
+    /// The toy is taken out (dragged from the panel) and held at (`x`, `y`), physical: it
+    /// comes back if it was put away, and leaves the dog's mouth.
+    pub fn take_toy(&mut self, x: f32, y: f32) {
+        if !self.settings.toy {
+            let s = Settings {
+                toy: true,
+                ..self.settings.clone()
+            };
+            self.apply_settings(s, true);
+        }
+        self.dog.stop_fetch();
+        let _ = (self.dog.take_picked(), self.dog.take_dropped());
+        self.toy.put_down(x, y);
+        self.toy.grab();
+    }
+
+    /// Right click on the toy: put away (the Bone button or the Walk tab bring it back).
+    pub fn put_toy_away(&mut self) {
+        if self.settings.toy {
+            let s = Settings {
+                toy: false,
+                ..self.settings.clone()
+            };
+            self.apply_settings(s, true);
+        }
     }
 
     /// Throws the toy from the dog's mouth (or where it lies) in a random arc.
@@ -1259,6 +1297,7 @@ impl Core {
             }
         }
         self.mcp.set_name(&s.name);
+        self.mcp.set_cors(&s.mcp_cors);
         self.settings = s;
         self.apply_look();
         self.panel_dirty = true;
@@ -1300,6 +1339,12 @@ impl Core {
                 }
                 self.reactions.push(Reaction::Fetch);
             }
+            // The shells handle it (they know where the mouse is); without one, bring it out.
+            Action::TakeToy => {
+                let (x, y) = (self.dog.x, self.dog.y - 80.0);
+                self.take_toy(x, y);
+                self.toy.release(1.0);
+            }
             Action::ToggleSleep => self.dog.toggle_sleep(),
             Action::ToggleVisible => {
                 self.toggle_visible = true;
@@ -1334,6 +1379,7 @@ impl Core {
                 p.quit();
             }
             Action::Close => p.close_panel(),
+            Action::Todo(edit) => self.mcp.todo_edit(&edit),
             Action::CheckUpdate => {
                 if self.update_ready {
                     self.shutdown();
@@ -1381,6 +1427,7 @@ impl Core {
             history: self.history_items(),
             quiet: self.settings.is_quiet(local_minute()) || self.fullscreen,
             missed: self.missed,
+            todos: self.mcp.todo_lists(),
         }
     }
 
@@ -2231,11 +2278,27 @@ mod tests {
     }
 
     #[test]
+    fn toy_put_away_by_right_click_and_taken_out_of_the_panel() {
+        let (mut c, mut p) = (core(), Fake::default());
+        c.put_toy_away();
+        assert!(!c.settings.toy && !c.toy_shown());
+        // Dragged out of the panel: back, held where the mouse is, thrown when let go.
+        c.take_toy(700.0, 500.0);
+        assert!(c.settings.toy);
+        assert_eq!(c.toy.state, toy::State::Held);
+        assert_eq!((c.toy.x, c.toy.y), (700.0, 500.0));
+        c.toy.drag_to(760.0, 480.0);
+        c.toy.release(B.scale);
+        run(&mut c, &mut p, 5.0, |c| c.toy.state == toy::State::Resting);
+        assert_eq!(c.toy.state, toy::State::Resting);
+    }
+
+    #[test]
     fn name_and_look_reach_mcp_and_renderer() {
         let (mut c, mut p) = (core(), Fake::default());
         let s = Settings {
             name: "Karabaş".into(),
-            wear: look::Wear::Bandana,
+            wear: look::Wear::Beanie,
             ..c.settings.clone()
         };
         c.on_action(&mut p, Action::Settings(Box::new(s)));
@@ -2245,7 +2308,7 @@ mod tests {
             .unwrap();
         let text = r["result"]["instructions"].as_str().unwrap();
         assert!(text.starts_with("Karabaş (the user's dog)"), "{text}");
-        assert_eq!(c.renderer.outfit().neck, Some(look::Item::Bandana));
+        assert_eq!(c.renderer.outfit().hat, Some(look::Item::Beanie));
         assert_eq!(c.panel_view(&p).settings.name, "Karabaş");
     }
 

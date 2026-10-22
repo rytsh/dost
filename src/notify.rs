@@ -226,6 +226,8 @@ pub enum Event {
     React(Reaction),
     /// Withdraws a question or notification by its `key` (answered elsewhere).
     Dismiss(String),
+    /// Something the settings panel shows changed (the todo lists).
+    PanelChanged,
 }
 
 impl Event {
@@ -252,6 +254,10 @@ impl Notifier {
 
     pub fn react(&self, r: Reaction) -> bool {
         self.0.send(Event::React(r)).is_ok()
+    }
+
+    pub fn panel_changed(&self) -> bool {
+        self.0.send(Event::PanelChanged).is_ok()
     }
 }
 

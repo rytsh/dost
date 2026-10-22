@@ -55,6 +55,7 @@ preview:
 atlas:
 	~/tools/agent-sprite-forge/.venv/bin/python art/pack_atlas.py
 	~/tools/agent-sprite-forge/.venv/bin/python art/pack_items.py
+	~/tools/agent-sprite-forge/.venv/bin/python art/collar.py
 
 # examples/icon.rs -> packaging/macos/AppIcon.icns and packaging/windows/dost.ico.
 ICON_TMP := target/icons

@@ -1,0 +1,13 @@
+Worn items, drawn ON the dog in every pose (art/fit_worn.py). References: art/items-fit/poses/<pose>.png
+(`fit_worn.py ref`: each action's first frame, every frame of happy, 5x nearest on a magenta 1024
+canvas with room above for hats). generate_image, 1024x1024, quality high, reference_images
+[<pose>.png]. Each prompt is one line below followed by the suffix; saved as
+art/items-fit/<item>-<pose>.png.
+
+
+Suffix: Keep the puppy EXACTLY as it is in the attached image: same pose, same size, same position in the frame, same pixels, same pixel-art style (chunky 16-bit pixel art, dark outline, cel shading). Keep the flat pure magenta #FF00FF background. Only ADD the hat, drawn in the same pixel-art style with the same dark outline, worn naturally for THIS pose and head angle: it sits ON the top of the head and tilts with the head, not floating. No text, no shadow, no other changes.
+
+beanie: Put a cosy knitted winter BEANIE on the puppy's head: red and white horizontal stripes, a ribbed cuff, a white pompom on top. It sits snugly on the crown of the head between the ears, pulled down to just above the eyes; the floppy ear hangs out from under the cuff, the perked ear pokes out.
+party: Put a small cone-shaped birthday PARTY HAT on the puppy's head: bright blue with yellow dots, a small fluffy yellow tuft on the tip. Its base rests on the crown of the head between the two ears, about as tall as the head.
+witch: Put a pointy purple WITCH HAT with an orange band on the puppy's head: the wide brim rests on the crown of the head between the ears, the tip bent slightly backward. The brim is about as wide as the head, not wider.
+santa: Put a red SANTA HAT with a white fur trim and a white pompom on the puppy's head: the white trim sits snugly on the crown just above the eyes, the floppy red tip hangs down backward with the pompom behind the head. Sized to the head.

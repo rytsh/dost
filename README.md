@@ -76,8 +76,16 @@ Dost serves MCP at `http://127.0.0.1:7777/mcp` (local only), so any AI assistant
 { "mcp": { "dost": { "type": "remote", "url": "http://127.0.0.1:7777/mcp" } } }
 ```
 
-Then ask things like *"tell me when localhost:3000 is up"*, *"bark when the build finishes"* or
-*"remind me at 15:00 to join the call"*.
+Then ask things like *"tell me when localhost:3000 is up"*, *"bark when the build finishes"*,
+*"remind me at 15:00 to join the call"* or *"make a todo list for the release, and remind me about
+the notes tomorrow at 10"*.
+
+**From a browser**: web pages on `localhost` can always call it. For a browser-based MCP client on
+another address, set settings → Connect → *Browsers* to **Any**, or list the pages in
+`settings.json`: `"mcp_cors": { "allow_origins": ["https://app.example.com", "https://*.example.com"], "allow_private_network": true }`
+(*allow_private_network* answers Chrome's preflight for a public page reaching this machine). Any page
+that is allowed can make the dog bark, ask you questions and add watches, including `command`
+watches that run shell commands, so only allow pages you trust.
 
 | Tool | What the dog does |
 | --- | --- |
@@ -90,8 +98,14 @@ Then ask things like *"tell me when localhost:3000 is up"*, *"bark when the buil
 | `copy` | Puts text on the clipboard and says so. |
 | `status` · `history` | What the dog is doing, how long you have been idle, and what you may have missed. |
 | `check_now` · `list_watches` · `remove_watch` | Manage watches and reminders. |
+| `todo_lists` · `todo_create_list` · `todo_add` · `todo_update` · `todo_remove` | Todo lists the dog keeps for you: a list per piece of work, items to check off, and a reminder per item (the dog barks it unless it is done by then). |
 
-**Quiet** (settings → Sound): *Night* is 22:00–08:00, *On* until you turn it off. It is also quiet
+**Todo** (settings → Todo): your lists, the same ones agents see. Click an item to check it off, ✕ to
+remove it, type into *Add* for a new item or *New list* for a list. Saved to `todos.json` next to
+`settings.json`.
+
+**Quiet** (settings → Sound): *Quiet now* until you turn it off, or every day *From*–*To* (e.g.
+22:00–08:00; the same time twice means no quiet hours). It is also quiet
 while an app is full screen (a video, a presentation), unless you turn that off. While quiet the dog
 does not bark and only shows questions, progress and sticky messages; the rest goes to *History*.
 
@@ -105,7 +119,7 @@ Settings → **Look**:
 - **Name**: click it and type. The name shows in the panel and is told to AI assistants over MCP,
   so you can say *"tell Karabaş when the build is done"*. The dog's birthday is the day you first
   started it; on that day it wears a party hat.
-- **Fur** and **collar** colours, and what it **wears**: a bandana, a beanie or sunglasses.
+- **Fur** and **collar** colours (or no collar), and what it **wears**: a beanie.
 - **Holiday outfits**: a witch hat (and a pumpkin instead of the bone) 24–31 October, a Santa hat
   20 December – 1 January.
 - **Bubble**: Classic, Dark, Sky or Mint. Each `source` gets a colour of its own; pick one with
@@ -113,8 +127,9 @@ Settings → **Look**:
 
 **Fetch**: a bone lies next to the dog. Drag it and fling it; the dog runs after it and brings it
 back (just picking it up and letting go moves it without a game). Now and then the dog plays with
-it by itself. **Bone** in the panel (or `dost react fetch`) throws it for you; turn it off with
-*Bone to play with* (settings → Walk).
+it by itself. In settings → **Play**, click the bone to throw it for you (or `dost react fetch`), or
+drag it out of the panel to pick it up and throw it yourself. Right-click the bone to put it away;
+*Out to play with* turns it on and off too.
 
 **Moods**: good news (tests passed, done) makes the dog happy, failures make it sad. With *Happy,
 sad and asking voices* on (settings → Sound) it also sounds different: a double yip, a little howl,
@@ -125,9 +140,12 @@ a short "wuf?" for questions.
 
 ## Settings
 
-Click the tray (menu bar) icon for settings: size, walking, sound and quiet hours, recent
-notifications, MCP and start at login. Settings are saved to `%APPDATA%\dost\settings.json` (Windows) or
-`~/.config/dost/settings.json` (macOS).
+Click the tray (menu bar) icon for settings. Everything in `settings.json` can be changed there:
+size and text, the dog's name, birthday and look, source colours, the toy (**Play**), walking and
+the offset (on **Dog**), sounds, quiet hours and your own bark files, the MCP address and which web pages may use
+it, start at login and updates. Long tabs scroll; fields save on Enter or when you click elsewhere
+(Esc cancels), and paste works in them. Settings are saved to `%APPDATA%\dost\settings.json`
+(Windows) or `~/.config/dost/settings.json` (macOS); edits to the file show up in the panel too.
 
 **Hide** sends the dog off the right edge of the screen. While it is away, questions, progress and
 sticky messages still pop up in a bubble next to the tray icon; other notifications bark, go to

@@ -3,26 +3,34 @@
 //! knows its own hit areas and turns clicks and drags into [`Action`]s.
 
 use tiny_skia::{
-    Color, ColorU8, FillRule, LineCap, Paint, PathBuilder, Pixmap, Rect, Stroke, Transform,
+    Color, ColorU8, FillRule, LineCap, Paint, PathBuilder, Pixmap, PixmapPaint, Rect, Stroke,
+    Transform,
 };
 
-use crate::look::{Collar, Fur, Outfit, Theme, Wear};
+use crate::look::{Collar, Fur, Item, Outfit, SOURCE_PALETTE, Theme, Wear, parse_hex};
 use crate::render::{Renderer, TextStyle};
 use crate::settings::{
-    Ground, LIFTS, NAME_MAX, NOTIFY_SECS, SIZES, SPEEDS, Settings, TEXT_SIZES, clean_name,
+    Ground, NAME_MAX, NOTIFY_STEPS, SPEEDS, Settings, TEXT_SIZES, clean_name, parse_hhmm,
 };
 
 /// Logical width of the panel; height is fixed so switching tabs does not resize it.
-pub const WIDTH: f32 = 300.0;
+pub const WIDTH: f32 = 340.0;
 const PAD: f32 = 12.0;
 const ROW: f32 = 32.0;
 const GAP: f32 = 10.0;
 const HEADER: f32 = 30.0;
 const TABS: f32 = 48.0;
 const QUICK: f32 = 28.0;
-/// Area under the tabs: fits the Look tab (six rows); the Dog tab puts its quick actions
-/// above its card.
-const BODY: f32 = 6.0 * ROW;
+/// Area under the tabs: room for the longest tab (Sound, with a bark file), so nothing scrolls
+/// unless a list gets long or the screen is short. The Dog tab puts its quick actions above its
+/// card.
+const BODY: f32 = 14.0 * ROW;
+/// Small grey title above a card.
+const SECTION: f32 = 24.0;
+/// The toy's tile on the Play tab.
+const TILE: f32 = 64.0;
+/// Longest text in a field other than the name.
+const TEXT_MAX: usize = 300;
 const FOOTER: f32 = 24.0;
 const RADIUS: f32 = 14.0;
 /// The arrow pointing at the menu bar icon (macOS).
@@ -50,13 +58,14 @@ const SHORTCUTS: &str = "Bubble keys: ⌥⌘↩ yes · ⌥⌘1-4 · ⌥⌘⌫ no
 #[cfg(not(target_os = "macos"))]
 const SHORTCUTS: &str = "Ctrl+Alt + Enter yes · 1-4 · Backspace no · L later";
 
-const TAB_NAMES: [&str; 6] = ["Dog", "Look", "Walk", "Sound", "History", "Connect"];
+const TAB_NAMES: [&str; 7] = ["Dog", "Look", "Play", "Sound", "Todo", "History", "Connect"];
 const TAB_LOOK: usize = 1;
-const TAB_WALK: usize = 2;
+const TAB_PLAY: usize = 2;
 const TAB_SOUND: usize = 3;
-const TAB_HISTORY: usize = 4;
-/// Quiet hours the "Night" choice sets.
-const NIGHT: (&str, &str) = ("22:00", "08:00");
+const TAB_TODO: usize = 4;
+const TAB_HISTORY: usize = 5;
+#[cfg(test)]
+const TAB_CONNECT: usize = 6;
 
 const fn rgb(r: u8, g: u8, b: u8) -> ColorU8 {
     ColorU8::from_rgba(r, g, b, 255)
@@ -75,11 +84,15 @@ pub enum Action {
     TestNotification,
     /// Throws the bone for the dog.
     Fetch,
+    /// The Bone button was dragged out of the panel: the toy follows the mouse until let go.
+    TakeToy,
     ToggleSleep,
     ToggleVisible,
     ToggleAutostart,
     CopyMcpUrl,
     OpenConfigDir,
+    /// A change to the todo lists.
+    Todo(crate::todo::Edit),
     /// The version in the footer: checks for updates (or restarts into an installed one).
     CheckUpdate,
     Quit,
@@ -111,6 +124,7 @@ pub struct View {
     pub quiet: bool,
     /// Notifications missed while the dog was hidden (badge on the History tab).
     pub missed: usize,
+    pub todos: Vec<crate::todo::List>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -129,10 +143,49 @@ enum Hit {
     Toggle(Toggle),
     Slider,
     Button(Button),
-    /// The name field.
-    Name,
+    /// A text field.
+    Text(TextField),
     Fur(usize),
     Collar(usize),
+    /// The ✕ on an entry of a list.
+    Remove(List, usize),
+    /// The colour dot of a source colour: picks the next colour.
+    SourceColor(usize),
+    /// The bone on the Play tab: drag it out, or click to throw.
+    ToyTile,
+    /// A todo item's check box (item id).
+    TodoCheck(u64),
+    /// The ✕ of a todo item (item id).
+    TodoRemove(u64),
+    /// A list's "Clear done" and ✕ (list id).
+    TodoClear(u64),
+    TodoRemoveList(u64),
+}
+
+/// Fields the user types into.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TextField {
+    Name,
+    Birthday,
+    QuietFrom,
+    QuietTo,
+    Lift,
+    McpAddr,
+    /// New entries for the lists.
+    AddOrigin,
+    AddBark,
+    AddSource,
+    /// A new item for a todo list (list id).
+    AddTodo(u64),
+    NewList,
+}
+
+/// Lists edited in the panel.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum List {
+    Origins,
+    Barks,
+    Sources,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -141,21 +194,24 @@ enum Field {
     TextSize,
     Speed,
     Ground,
-    Lift,
     Notify,
-    Quiet,
     Wear,
     Theme,
+    /// Which web pages may use the MCP server.
+    Browsers,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Toggle {
     Sound,
     SoundOnPet,
+    QuietNow,
     QuietFullscreen,
     Wander,
     Mcp,
+    PrivateNetwork,
     Autostart,
+    CheckUpdates,
     AutoUpdate,
     Seasonal,
     EventSounds,
@@ -165,7 +221,6 @@ enum Toggle {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Button {
     Test,
-    Fetch,
     Sleep,
     Hide,
     CopyMcp,
@@ -175,21 +230,22 @@ enum Button {
     Close,
 }
 
-/// A key typed while the name field is being edited.
+/// A key typed while a text field is being edited.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Key {
-    /// Text typed (one or more characters).
+    /// Text typed or pasted (one or more characters).
     Text(String),
     Backspace,
-    /// Enter: save the name.
+    /// Enter: save.
     Enter,
     /// Esc: cancel.
     Escape,
 }
 
-/// The name being edited.
+/// The text field being edited.
 #[derive(Clone, Debug)]
 struct Editing {
+    field: TextField,
     text: String,
     /// When editing started (the caret blinks from then).
     since: std::time::Instant,
@@ -202,14 +258,20 @@ pub struct Panel {
     slider: Option<Rect>,
     hover: Option<Hit>,
     dragging: bool,
+    /// How far the tab's body is scrolled (physical).
     scroll: f32,
-    content_height: f32,
+    /// Height of the tab's body content (physical), for the scroll limit.
+    body_content: f32,
     tab: usize,
     /// Draws an arrow at the top pointing at this x (physical, panel-relative).
     arrow: Option<f32>,
     /// Missed while hidden; shown as a badge on History.
     missed: usize,
     editing: Option<Editing>,
+    /// Mouse down on the toy's tile (where): dragging it away takes the toy out.
+    toy_press: Option<(f32, f32)>,
+    /// "Custom" was picked for Browsers: show the list of pages even while it is empty.
+    custom_origins: bool,
 }
 
 impl Panel {
@@ -221,29 +283,36 @@ impl Panel {
             hover: None,
             dragging: false,
             scroll: 0.0,
-            content_height: 0.0,
+            body_content: 0.0,
             tab: 0,
             arrow: None,
             missed: 0,
             editing: None,
+            toy_press: None,
+            custom_origins: false,
         }
     }
 
-    /// The name field takes the keyboard (the shell sends keys to [`Panel::key`]).
+    /// A text field takes the keyboard (the shell sends keys to [`Panel::key`]).
     pub fn is_editing(&self) -> bool {
         self.editing.is_some()
     }
 
-    /// A key while editing the name. Returns the new settings when the name is saved, and
-    /// whether the panel needs a redraw.
+    /// A key while editing a field. Returns the new settings when it is saved, and whether
+    /// the panel needs a redraw.
     pub fn key(&mut self, key: Key, v: &View) -> (bool, Option<Action>) {
         let Some(e) = self.editing.as_mut() else {
             return (false, None);
         };
+        let max = if e.field == TextField::Name {
+            NAME_MAX
+        } else {
+            TEXT_MAX
+        };
         match key {
             Key::Text(t) => {
                 for c in t.chars().filter(|c| !c.is_control()) {
-                    if e.text.chars().count() < NAME_MAX {
+                    if e.text.chars().count() < max {
                         e.text.push(c);
                     }
                 }
@@ -260,16 +329,102 @@ impl Panel {
         (true, None)
     }
 
-    /// Ends editing; the new name as settings if it changed.
+    /// Ends editing; the new settings if the field changed them. Text that does not fit the
+    /// field (a time that is not HH:MM...) is dropped.
     pub fn finish_editing(&mut self, v: &View) -> Option<Action> {
         let e = self.editing.take()?;
-        let name = clean_name(&e.text);
-        (name != v.settings.name).then(|| {
-            Action::Settings(Box::new(Settings {
-                name,
-                ..v.settings.clone()
-            }))
-        })
+        let mut s = v.settings.clone();
+        let t = e.text.trim();
+        match e.field {
+            TextField::Name => s.name = clean_name(t),
+            TextField::Birthday => {
+                if t.is_empty() || crate::look::parse_date(t).is_some() {
+                    s.birthday = t.to_string();
+                }
+            }
+            TextField::QuietFrom | TextField::QuietTo => {
+                if let Some(m) = parse_hhmm(t) {
+                    let hhmm = format!("{:02}:{:02}", m / 60, m % 60);
+                    if e.field == TextField::QuietFrom {
+                        s.quiet_from = hhmm;
+                    } else {
+                        s.quiet_to = hhmm;
+                    }
+                }
+            }
+            TextField::Lift => {
+                if let Ok(n) = t.replace('−', "-").parse::<i32>() {
+                    s.lift = n.clamp(-20, 2000);
+                }
+            }
+            TextField::McpAddr => {
+                let port_ok = t
+                    .rsplit_once(':')
+                    .is_some_and(|(h, p)| !h.is_empty() && p.parse::<u16>().is_ok());
+                if port_ok {
+                    s.mcp_addr = t.to_string();
+                }
+            }
+            TextField::AddOrigin => {
+                let o = t.trim_end_matches('/');
+                if !o.is_empty() {
+                    let list = &mut s.mcp_cors.allow_origins;
+                    list.retain(|x| x != "*");
+                    if !list.iter().any(|x| x == o) {
+                        list.push(o.to_string());
+                    }
+                }
+            }
+            TextField::AddTodo(list) => {
+                return (!t.is_empty()).then(|| {
+                    Action::Todo(crate::todo::Edit::Add {
+                        list: list.to_string(),
+                        text: t.to_string(),
+                    })
+                });
+            }
+            TextField::NewList => {
+                return (!t.is_empty())
+                    .then(|| Action::Todo(crate::todo::Edit::NewList(t.to_string())));
+            }
+            TextField::AddBark => {
+                // Paths copied from a file manager may come quoted.
+                let p = t.trim_matches(|c| c == '"' || c == '\'');
+                if !p.is_empty() && !s.bark_files.iter().any(|x| x == p) {
+                    s.bark_files.push(p.to_string());
+                }
+            }
+            TextField::AddSource => {
+                let k = t.to_lowercase();
+                if !k.is_empty() && !s.source_colors.contains_key(&k) {
+                    let used: Vec<String> = s.source_colors.values().cloned().collect();
+                    let c = SOURCE_PALETTE
+                        .iter()
+                        .map(|c| crate::look::to_hex(*c))
+                        .find(|h| !used.contains(h))
+                        .unwrap_or_else(|| crate::look::to_hex(SOURCE_PALETTE[0]));
+                    s.source_colors.insert(k, c);
+                }
+            }
+        }
+        (s != v.settings).then(|| Action::Settings(Box::new(s)))
+    }
+
+    /// The text a field starts with when clicked.
+    fn field_value(f: TextField, s: &Settings) -> String {
+        match f {
+            TextField::Name => s.name.clone(),
+            TextField::Birthday => s.birthday.clone(),
+            TextField::QuietFrom => s.quiet_from.clone(),
+            TextField::QuietTo => s.quiet_to.clone(),
+            TextField::Lift => s.lift.to_string(),
+            TextField::McpAddr => s.mcp_addr.clone(),
+            TextField::AddOrigin
+            | TextField::AddBark
+            | TextField::AddSource
+            | TextField::AddTodo(_)
+            | TextField::NewList => String::new(),
+        }
     }
 
     pub fn set_ui_scale(&mut self, ui: f32) {
@@ -279,12 +434,13 @@ impl Panel {
     /// Selects a tab (0-based); out-of-range values pick the last one.
     pub fn set_tab(&mut self, tab: usize) {
         self.tab = tab.min(TAB_NAMES.len() - 1);
+        self.scroll = 0.0;
     }
 
     /// Opened after notifications were missed while hidden: start on History, with a badge
     /// until another tab is chosen.
     pub fn show_missed(&mut self, count: usize) {
-        self.tab = TAB_HISTORY;
+        self.set_tab(TAB_HISTORY);
         self.missed = count;
     }
 
@@ -320,9 +476,9 @@ impl Panel {
         (w, h.min(max_height))
     }
 
-    /// Mouse wheel; `delta` in lines (positive = up).
-    pub fn scroll_by(&mut self, delta: f32, view_height: u32) {
-        let max = (self.content_height - view_height as f32).max(0.0);
+    /// Mouse wheel over the panel; `delta` in lines (positive = up). Scrolls the tab's body.
+    pub fn scroll_by(&mut self, delta: f32, _view_height: u32) {
+        let max = (self.body_content - self.body_height() * self.ui).max(0.0);
         self.scroll = (self.scroll - delta * ROW * self.ui).clamp(0.0, max);
     }
 
@@ -349,7 +505,7 @@ impl Panel {
             stroke_arrow(pm, ax, top, u, BORDER);
         }
 
-        let mut y = top - self.scroll + PAD * u;
+        let mut y = top + PAD * u;
         let x = PAD * u;
         let inner = w - 2.0 * x;
 
@@ -359,18 +515,80 @@ impl Panel {
         if self.tab == 0 {
             y = self.quick_actions(pm, r, y, x, inner, v);
         }
-        let body_top = y;
-        match self.tab {
-            0 => self.tab_dog(pm, r, y, x, inner, &v.settings),
-            TAB_LOOK => self.tab_look(pm, r, y, x, inner, v),
-            TAB_WALK => self.tab_walk(pm, r, y, x, inner, &v.settings),
-            TAB_SOUND => self.tab_sound(pm, r, y, x, inner, &v.settings),
-            TAB_HISTORY => self.tab_history(pm, r, y, x, inner, v),
-            _ => self.tab_connect(pm, r, y, x, inner, v),
+        // The tab's body: drawn on its own canvas, scrolled, then copied into its place.
+        let body_h = (self.body_height() * u).round();
+        let view_h = body_h.min((h - y - (GAP + FOOTER + PAD) * u).max(0.0));
+        if let Some(mut canvas) = Pixmap::new(pm.width(), (view_h.max(1.0)) as u32) {
+            let first = self.hits.len();
+            let end = {
+                let cy = -self.scroll;
+                match self.tab {
+                    0 => self.tab_dog(&mut canvas, r, cy, x, inner, &v.settings),
+                    TAB_LOOK => self.tab_look(&mut canvas, r, cy, x, inner, v),
+                    TAB_PLAY => self.tab_play(&mut canvas, r, cy, x, inner, v),
+                    TAB_SOUND => self.tab_sound(&mut canvas, r, cy, x, inner, &v.settings),
+                    TAB_TODO => self.tab_todo(&mut canvas, r, cy, x, inner, v),
+                    TAB_HISTORY => self.tab_history(&mut canvas, r, cy, x, inner, v),
+                    _ => self.tab_connect(&mut canvas, r, cy, x, inner, v),
+                }
+            };
+            self.body_content = end + self.scroll;
+            let max = (self.body_content - view_h).max(0.0);
+            if self.scroll > max {
+                // The content got shorter (a list entry removed): draw again in range.
+                self.scroll = max;
+                self.hits.truncate(first);
+                return self.draw(pm, r, v);
+            }
+            // Hits are in the canvas: move them into the panel, and drop what is scrolled out.
+            let moved: Vec<(Rect, Hit)> = self.hits.drain(first..).collect();
+            for (rect, hit) in moved {
+                let Some(clipped) = Rect::from_ltrb(
+                    rect.left(),
+                    rect.top().max(0.0),
+                    rect.right(),
+                    rect.bottom().min(view_h),
+                ) else {
+                    continue;
+                };
+                if let Some(r) = Rect::from_xywh(
+                    clipped.left(),
+                    clipped.top() + y,
+                    clipped.width(),
+                    clipped.height(),
+                ) {
+                    self.hits.push((r, hit));
+                }
+            }
+            if let Some(s) = self.slider {
+                self.slider = Rect::from_xywh(s.left(), s.top() + y, s.width(), s.height());
+            }
+            pm.draw_pixmap(
+                0,
+                y.round() as i32,
+                canvas.as_ref(),
+                &PixmapPaint::default(),
+                Transform::identity(),
+                None,
+            );
+            self.scrollbar(pm, x + inner + 4.0 * u, y, view_h);
         }
-        y = body_top + self.body_height() * u + GAP * u;
-        y = self.footer(pm, r, y, x, inner, v);
-        self.content_height = y + self.scroll - top;
+        // On a short screen the body is cut to what fits; the footer stays right under it.
+        y += view_h + GAP * u;
+        self.footer(pm, r, y, x, inner, v);
+    }
+
+    /// A thin bar on the right while the tab's body is longer than its room.
+    fn scrollbar(&self, pm: &mut Pixmap, x: f32, y: f32, view_h: f32) {
+        if self.body_content <= view_h + 1.0 {
+            return;
+        }
+        let u = self.ui;
+        let k = view_h / self.body_content;
+        let bar_h = (view_h * k).max(20.0 * u);
+        let max = self.body_content - view_h;
+        let by = y + (view_h - bar_h) * (self.scroll / max).clamp(0.0, 1.0);
+        fill_round(pm, Rect::from_xywh(x, by, 3.0 * u, bar_h), 1.5 * u, TRACK);
     }
 
     /// Name, the dog's state as a colored pill, close button.
@@ -471,8 +689,9 @@ impl Panel {
             let glyph = [
                 Glyph::Paw,
                 Glyph::Bow,
-                Glyph::Steps,
+                Glyph::Bone,
                 Glyph::Speaker,
+                Glyph::Check,
                 Glyph::Clock,
                 Glyph::Plug,
             ][i];
@@ -534,10 +753,9 @@ impl Panel {
         v: &View,
     ) -> f32 {
         let u = self.ui;
-        let bw = (inner - 3.0 * 6.0 * u) / 4.0;
+        let bw = (inner - 2.0 * 6.0 * u) / 3.0;
         let quick = [
             (Button::Test, "Test"),
-            (Button::Fetch, "Bone"),
             (Button::Sleep, if v.sleeping { "Wake" } else { "Sleep" }),
             (Button::Hide, if v.visible { "Hide" } else { "Show" }),
         ];
@@ -548,6 +766,39 @@ impl Panel {
         y + QUICK * u + GAP * u
     }
 
+    /// A small grey title above a card.
+    fn section(&mut self, pm: &mut Pixmap, r: &mut Renderer, y: f32, x: f32, title: &str) -> f32 {
+        let u = self.ui;
+        r.draw_text(
+            pm,
+            x + 4.0 * u,
+            y + 5.0 * u,
+            title,
+            sys(11.0 * u, true, MUTED),
+        );
+        y + SECTION * u
+    }
+
+    /// A card of `rows` rows at `y`; returns where its rows start.
+    fn card(&mut self, pm: &mut Pixmap, y: f32, rows: usize) -> f32 {
+        fill_card(pm, self.card_start(y, rows), self.ui);
+        y
+    }
+
+    /// One line of grey help text.
+    fn note(&mut self, pm: &mut Pixmap, r: &mut Renderer, y: f32, x: f32, text: &str) -> f32 {
+        let u = self.ui;
+        r.draw_text(
+            pm,
+            x + 4.0 * u,
+            y + 4.0 * u,
+            text,
+            sys(11.0 * u, false, MUTED),
+        );
+        y + 22.0 * u
+    }
+
+    /// Size, text size, how long bubbles stay, the bubble's keyboard shortcuts and walking.
     fn tab_dog(
         &mut self,
         pm: &mut Pixmap,
@@ -556,21 +807,10 @@ impl Panel {
         x: f32,
         inner: f32,
         s: &Settings,
-    ) {
-        let card = self.card_start(y, 3);
-        fill_card(pm, card, self.ui);
-        let mut cy = y;
-        cy = self.choice_row(
-            pm,
-            r,
-            cy,
-            x,
-            inner,
-            "Size",
-            Field::Size,
-            &SIZES.map(|(_, l)| l),
-            SIZES.iter().position(|(v, _)| *v == s.size),
-        );
+    ) -> f32 {
+        let mut cy = self.card(pm, y, 3);
+        let size = format!("{}%", s.size);
+        cy = self.stepper_row(pm, r, cy, x, inner, "Size", &size, Field::Size);
         cy = self.choice_row(
             pm,
             r,
@@ -582,17 +822,12 @@ impl Panel {
             &TEXT_SIZES.map(|(_, l)| l),
             TEXT_SIZES.iter().position(|(v, _)| *v == s.text_size),
         );
-        cy = self.choice_row(
-            pm,
-            r,
-            cy,
-            x,
-            inner,
-            "Bubble",
-            Field::Notify,
-            &NOTIFY_SECS.map(|(_, l)| l),
-            NOTIFY_SECS.iter().position(|(v, _)| *v == s.notify_secs),
-        );
+        let bubble = match s.notify_secs {
+            0 => "Until clicked".to_string(),
+            n if n % 60 == 0 => format!("{} min", n / 60),
+            n => format!("{n} s"),
+        };
+        cy = self.stepper_row(pm, r, cy, x, inner, "Bubble stays", &bubble, Field::Notify);
         // The bubble's keyboard shortcuts, so they can be found.
         let u = self.ui;
         let st = sys(11.0 * u, false, MUTED);
@@ -604,9 +839,13 @@ impl Panel {
             SHORTCUTS,
             st,
         );
+        cy += ROW * u;
+        cy = self.section(pm, r, cy, x, "WALKING");
+        self.walking(pm, r, cy, x, inner, s)
     }
 
-    /// Name, colours, what it wears, holiday outfits and the bubble theme.
+    /// Name and birthday, colours, what it wears, holiday outfits, the bubble theme and the
+    /// colours of sources.
     fn tab_look(
         &mut self,
         pm: &mut Pixmap,
@@ -615,12 +854,39 @@ impl Panel {
         x: f32,
         inner: f32,
         v: &View,
-    ) {
+    ) -> f32 {
         let u = self.ui;
         let s = &v.settings;
-        let card = self.card_start(y, 6);
-        fill_card(pm, card, u);
-        let mut cy = self.name_row(pm, r, y, x, inner, v);
+        let mut cy = self.card(pm, y, 7);
+        let age = if v.age == "new here" {
+            "new here".to_string()
+        } else {
+            format!("{} old", v.age)
+        };
+        cy = self.text_row(
+            pm,
+            r,
+            cy,
+            x,
+            inner,
+            "Name",
+            TextField::Name,
+            s,
+            Some(&age),
+            "",
+        );
+        cy = self.text_row(
+            pm,
+            r,
+            cy,
+            x,
+            inner,
+            "Birthday",
+            TextField::Birthday,
+            s,
+            None,
+            "YYYY-MM-DD",
+        );
         cy = self.swatch_row(
             pm,
             r,
@@ -655,13 +921,13 @@ impl Panel {
             Wear::ALL.iter().position(|(w, _)| *w == s.wear),
         );
         let holiday = match v.outfit.hat {
-            Some(crate::look::Item::PartyHat) => "Holiday outfits · birthday today!",
-            Some(crate::look::Item::WitchHat) => "Holiday outfits · Halloween",
-            Some(crate::look::Item::SantaHat) => "Holiday outfits · Christmas",
+            Some(Item::PartyHat) => "Holiday outfits · birthday today!",
+            Some(Item::WitchHat) => "Holiday outfits · Halloween",
+            Some(Item::SantaHat) => "Holiday outfits · Christmas",
             _ => "Holiday outfits",
         };
         cy = self.toggle_row(pm, r, cy, x, inner, holiday, s.seasonal, Toggle::Seasonal);
-        self.choice_row(
+        cy = self.choice_row(
             pm,
             r,
             cy,
@@ -672,10 +938,46 @@ impl Panel {
             &Theme::ALL.map(|(_, l)| l),
             Theme::ALL.iter().position(|(t, _)| *t == s.theme),
         );
+        cy += GAP * u;
+        cy = self.section(pm, r, cy, x, "SOURCE COLOURS");
+        let entries: Vec<(String, String)> = s
+            .source_colors
+            .iter()
+            .map(|(k, c)| (k.clone(), c.clone()))
+            .collect();
+        let start = self.card(pm, cy, entries.len() + 1);
+        cy = start;
+        for (i, (name, hex)) in entries.iter().enumerate() {
+            let color = parse_hex(hex).unwrap_or(MUTED);
+            cy = self.list_row(
+                pm,
+                r,
+                cy,
+                x,
+                inner,
+                name,
+                Some((color, i)),
+                List::Sources,
+                i,
+            );
+        }
+        cy = self.text_row(
+            pm,
+            r,
+            cy,
+            x,
+            inner,
+            "Add",
+            TextField::AddSource,
+            s,
+            None,
+            "a source, e.g. CI",
+        );
+        self.note(pm, r, cy, x, "Click a colour to change it.")
     }
 
-    /// The name: a text field (click to edit) and how long the dog has been around.
-    fn name_row(
+    /// The toy: a tile to drag it out of the panel (or click to throw it), whether it is out.
+    fn tab_play(
         &mut self,
         pm: &mut Pixmap,
         r: &mut Renderer,
@@ -685,113 +987,85 @@ impl Panel {
         v: &View,
     ) -> f32 {
         let u = self.ui;
-        r.draw_text(
-            pm,
-            x + 12.0 * u,
-            y + 8.0 * u,
-            "Name",
-            sys(13.0 * u, false, INK),
-        );
-        let age = sys(11.0 * u, false, MUTED);
-        let age_text = format!("{} old", v.age);
-        let age_text = if v.age == "new here" {
-            "new here".to_string()
-        } else {
-            age_text
-        };
-        let (aw, _) = r.measure(&age_text, age);
-        r.draw_text(pm, x + inner - 10.0 * u - aw, y + 9.0 * u, &age_text, age);
-        let fx = x + 88.0 * u;
-        let fw = inner - 88.0 * u - 22.0 * u - aw;
-        let Some(field) = Rect::from_xywh(fx, y + 4.0 * u, fw, 24.0 * u) else {
-            return y + ROW * u;
-        };
-        let editing = self.editing.as_ref();
-        let (bg, border) = match (editing, self.hover == Some(Hit::Name)) {
-            (Some(_), _) => (CARD, ACCENT),
-            (None, true) => (HOVER, BORDER),
-            (None, false) => (CARD, BORDER),
-        };
-        fill_round(pm, Some(field), 7.0 * u, bg);
-        stroke_round(
-            pm,
-            Some(field),
-            7.0 * u,
-            border,
-            if editing.is_some() { 1.5 * u } else { 1.0 },
-        );
-        let st = sys(12.5 * u, false, INK);
-        let text = editing.map_or(v.settings.name.as_str(), |e| e.text.as_str());
-        let max = fw - 16.0 * u;
-        // While editing, show the end of the text (where the caret is).
-        let shown = if editing.is_some() {
-            fit_end(r, text, st, max)
-        } else {
-            fit(r, text, st, max)
-        };
-        let (tw, th) = r.measure(&shown, st);
-        let ty = (field.top() + (field.height() - th) / 2.0).round();
-        r.draw_text(pm, fx + 8.0 * u, ty, &shown, st);
-        if let Some(e) = editing
-            && (e.since.elapsed().as_millis() / 530).is_multiple_of(2)
-        {
-            let cx = (fx + 8.0 * u + tw + 1.0 * u).round();
+        let s = &v.settings;
+        let mut cy = self.section(pm, r, y, x, "TOYS");
+        let card_h = TILE + 16.0;
+        if let Some(card) = Rect::from_xywh(x, cy, inner, card_h * u) {
+            fill_card(pm, Some(card), u);
+        }
+        // The bone's tile.
+        let item = v.outfit.toy.unwrap_or(Item::Bone);
+        if let Some(tile) = Rect::from_xywh(x + 8.0 * u, cy + 8.0 * u, TILE * u, TILE * u) {
+            let hover = self.hover == Some(Hit::ToyTile);
             fill_round(
                 pm,
-                Rect::from_xywh(cx, field.top() + 5.0 * u, (1.2 * u).max(1.0), 14.0 * u),
-                0.0,
-                INK,
+                Some(tile),
+                10.0 * u,
+                if hover { ACCENT_SOFT } else { HOVER },
             );
+            stroke_round(
+                pm,
+                Some(tile),
+                10.0 * u,
+                if hover { ACCENT } else { BORDER },
+                1.0,
+            );
+            let px = (((TILE - 16.0) * u) / r.toy_size(item, 1) as f32)
+                .floor()
+                .max(1.0) as u32;
+            let size = r.toy_size(item, px);
+            if let Some(mut icon) = Pixmap::new(size, size) {
+                r.draw_toy(&mut icon, item, 0, px);
+                let ix = (tile.left() + (tile.width() - size as f32) / 2.0).round() as i32;
+                let iy = (tile.top() + (tile.height() - size as f32) / 2.0).round() as i32;
+                pm.draw_pixmap(
+                    ix,
+                    iy,
+                    icon.as_ref(),
+                    &PixmapPaint::default(),
+                    Transform::identity(),
+                    None,
+                );
+            }
+            self.hits.push((tile, Hit::ToyTile));
         }
-        self.hits.push((field, Hit::Name));
-        y + ROW * u
-    }
-
-    /// A row of colour dots; the chosen one has a ring.
-    #[allow(clippy::too_many_arguments)]
-    fn swatch_row(
-        &mut self,
-        pm: &mut Pixmap,
-        r: &mut Renderer,
-        y: f32,
-        x: f32,
-        _inner: f32,
-        label: &str,
-        colors: &[ColorU8],
-        selected: Option<usize>,
-        hit: fn(usize) -> Hit,
-    ) -> f32 {
-        let u = self.ui;
+        let tx = x + (TILE + 20.0) * u;
+        let name = if item == Item::Pumpkin {
+            "Pumpkin"
+        } else {
+            "Bone"
+        };
+        r.draw_text(pm, tx, cy + 12.0 * u, name, sys(13.0 * u, true, INK));
+        let help = if s.toy {
+            "Drag it out, or click to throw."
+        } else {
+            "Put away. Drag it out to play."
+        };
+        r.draw_text(pm, tx, cy + 32.0 * u, help, sys(11.0 * u, false, MUTED));
         r.draw_text(
             pm,
-            x + 12.0 * u,
-            y + 8.0 * u,
-            label,
-            sys(13.0 * u, false, INK),
+            tx,
+            cy + 48.0 * u,
+            "Right-click it to put it away.",
+            sys(11.0 * u, false, MUTED),
         );
-        let d = 18.0 * u;
-        let gap = 10.0 * u;
-        for (i, c) in colors.iter().enumerate() {
-            let cx = x + 88.0 * u + i as f32 * (d + gap);
-            let Some(cell) = Rect::from_xywh(cx - 3.0 * u, y + 4.0 * u, d + 6.0 * u, d + 6.0 * u)
-            else {
-                continue;
-            };
-            let h = hit(i);
-            if selected == Some(i) {
-                stroke_round(pm, Some(cell), (d + 6.0 * u) / 2.0, ACCENT, 2.0 * u);
-            } else if self.hover == Some(h) {
-                fill_round(pm, Some(cell), (d + 6.0 * u) / 2.0, HOVER);
-            }
-            let dot = Rect::from_xywh(cx, y + 7.0 * u, d, d);
-            fill_round(pm, dot, d / 2.0, *c);
-            stroke_round(pm, dot, d / 2.0, BORDER, 1.0);
-            self.hits.push((cell, h));
-        }
-        y + ROW * u
+        cy += card_h * u + GAP * u;
+        let start = self.card(pm, cy, 1);
+        cy = self.toggle_row(
+            pm,
+            r,
+            start,
+            x,
+            inner,
+            "Out to play with",
+            s.toy,
+            Toggle::Toy,
+        );
+        cy
     }
 
-    fn tab_walk(
+    /// Walking around, speed, what it stands on and the offset.
+    fn walking(
         &mut self,
         pm: &mut Pixmap,
         r: &mut Renderer,
@@ -799,12 +1073,9 @@ impl Panel {
         x: f32,
         inner: f32,
         s: &Settings,
-    ) {
-        let card = self.card_start(y, 5);
-        fill_card(pm, card, self.ui);
-        let mut cy = y;
+    ) -> f32 {
+        let mut cy = self.card(pm, y, 4);
         cy = self.toggle_row(pm, r, cy, x, inner, "Walk around", s.wander, Toggle::Wander);
-        cy = self.toggle_row(pm, r, cy, x, inner, "Bone to play with", s.toy, Toggle::Toy);
         cy = self.choice_row(
             pm,
             r,
@@ -832,17 +1103,19 @@ impl Panel {
             &grounds,
             Some(gi),
         );
-        self.choice_row(
+        cy = self.text_row(
             pm,
             r,
             cy,
             x,
             inner,
             "Offset",
-            Field::Lift,
-            &LIFTS.map(|(_, l)| l),
-            LIFTS.iter().position(|(v, _)| *v == s.lift),
+            TextField::Lift,
+            s,
+            Some("px"),
+            "0",
         );
+        self.note(pm, r, cy, x, "Offset raises the dog (−20 to 2000).")
     }
 
     fn tab_sound(
@@ -853,10 +1126,9 @@ impl Panel {
         x: f32,
         inner: f32,
         s: &Settings,
-    ) {
-        let card = self.card_start(y, 6);
-        fill_card(pm, card, self.ui);
-        let mut cy = y;
+    ) -> f32 {
+        let u = self.ui;
+        let mut cy = self.card(pm, y, 4);
         cy = self.toggle_row(
             pm,
             r,
@@ -888,25 +1160,44 @@ impl Panel {
             s.event_sounds,
             Toggle::EventSounds,
         );
-        let quiet = if s.quiet {
-            2
-        } else if s.quiet_from != s.quiet_to {
-            1
-        } else {
-            0
-        };
-        cy = self.choice_row(
+        cy += GAP * u;
+        cy = self.section(pm, r, cy, x, "QUIET");
+        let start = self.card(pm, cy, 4);
+        cy = self.toggle_row(
+            pm,
+            r,
+            start,
+            x,
+            inner,
+            "Quiet now",
+            s.quiet,
+            Toggle::QuietNow,
+        );
+        cy = self.text_row(
             pm,
             r,
             cy,
             x,
             inner,
-            "Quiet",
-            Field::Quiet,
-            &["Off", "Night", "On"],
-            Some(quiet),
+            "From",
+            TextField::QuietFrom,
+            s,
+            None,
+            "22:00",
         );
-        self.toggle_row(
+        cy = self.text_row(
+            pm,
+            r,
+            cy,
+            x,
+            inner,
+            "To",
+            TextField::QuietTo,
+            s,
+            None,
+            "08:00",
+        );
+        cy = self.toggle_row(
             pm,
             r,
             cy,
@@ -916,6 +1207,224 @@ impl Panel {
             s.quiet_fullscreen,
             Toggle::QuietFullscreen,
         );
+        cy = self.note(pm, r, cy, x, "Same From and To: no quiet hours.");
+        cy += GAP * u;
+        cy = self.section(pm, r, cy, x, "BARK SOUNDS");
+        let start = self.card(pm, cy, s.bark_files.len() + 1);
+        cy = start;
+        for (i, f) in s.bark_files.iter().enumerate() {
+            let name = std::path::Path::new(f)
+                .file_name()
+                .map_or(f.clone(), |n| n.to_string_lossy().into_owned());
+            cy = self.list_row(pm, r, cy, x, inner, &name, None, List::Barks, i);
+        }
+        cy = self.text_row(
+            pm,
+            r,
+            cy,
+            x,
+            inner,
+            "Add",
+            TextField::AddBark,
+            s,
+            None,
+            "path to a .wav file",
+        );
+        self.note(pm, r, cy, x, "16-bit WAV files; one is picked at random.")
+    }
+
+    /// Todo lists: each a title (open count, Clear done, ✕) over a card of items with a
+    /// check box, the reminder and a ✕, and a field to add one; a field for a new list below.
+    fn tab_todo(
+        &mut self,
+        pm: &mut Pixmap,
+        r: &mut Renderer,
+        y: f32,
+        x: f32,
+        inner: f32,
+        v: &View,
+    ) -> f32 {
+        let u = self.ui;
+        let s = &v.settings;
+        let mut cy = y;
+        if v.todos.is_empty() {
+            cy = self.note(
+                pm,
+                r,
+                cy,
+                x,
+                "No lists yet. Make one below, or ask an agent:",
+            );
+            cy = self.note(pm, r, cy, x, "“make a todo list for the release”.");
+            cy += GAP * u / 2.0;
+        }
+        for l in &v.todos {
+            // Title: name and open count on the left, Clear done and ✕ on the right.
+            let title = format!("{} · {} open", l.name.to_uppercase(), l.open_count());
+            let st = sys(11.0 * u, true, MUTED);
+            let shown = fit(r, &title, st, inner - 120.0 * u);
+            r.draw_text(pm, x + 4.0 * u, cy + 5.0 * u, &shown, st);
+            let mut bx = x + inner;
+            let rm = Rect::from_xywh(bx - 22.0 * u, cy, 22.0 * u, 20.0 * u);
+            if let Some(rect) = rm {
+                let hit = Hit::TodoRemoveList(l.id);
+                if self.hover == Some(hit) {
+                    fill_round(pm, Some(rect), 6.0 * u, HOVER);
+                }
+                let c = if self.hover == Some(hit) {
+                    DANGER
+                } else {
+                    MUTED
+                };
+                draw_glyph(
+                    pm,
+                    Glyph::Close,
+                    rect.left() + rect.width() / 2.0,
+                    rect.top() + rect.height() / 2.0,
+                    u * 0.7,
+                    c,
+                );
+                self.hits.push((rect, hit));
+                bx = rect.left() - 4.0 * u;
+            }
+            if l.items.iter().any(|i| i.done) {
+                let st = sys(11.0 * u, false, MUTED);
+                let label = "Clear done";
+                let (tw, _) = r.measure(label, st);
+                if let Some(rect) = Rect::from_xywh(bx - tw - 12.0 * u, cy, tw + 12.0 * u, 20.0 * u)
+                {
+                    let hit = Hit::TodoClear(l.id);
+                    let color = if self.hover == Some(hit) {
+                        fill_round(pm, Some(rect), 6.0 * u, HOVER);
+                        INK
+                    } else {
+                        MUTED
+                    };
+                    r.draw_text(
+                        pm,
+                        rect.left() + 6.0 * u,
+                        cy + 3.0 * u,
+                        label,
+                        sys(11.0 * u, false, color),
+                    );
+                    self.hits.push((rect, hit));
+                }
+            }
+            cy += SECTION * u;
+            let start = self.card(pm, cy, l.items.len() + 1);
+            cy = start;
+            for it in &l.items {
+                cy = self.todo_row(pm, r, cy, x, inner, it);
+            }
+            cy = self.text_row(
+                pm,
+                r,
+                cy,
+                x,
+                inner,
+                "Add",
+                TextField::AddTodo(l.id),
+                s,
+                None,
+                "a new item",
+            );
+            cy += GAP * u;
+        }
+        let start = self.card(pm, cy, 1);
+        cy = self.text_row(
+            pm,
+            r,
+            start,
+            x,
+            inner,
+            "New list",
+            TextField::NewList,
+            s,
+            None,
+            "e.g. Release 0.3",
+        );
+        self.note(pm, r, cy, x, "Agents can add items and reminders over MCP.")
+    }
+
+    /// A todo item: check box, the text (struck through when done), the reminder, a ✕.
+    fn todo_row(
+        &mut self,
+        pm: &mut Pixmap,
+        r: &mut Renderer,
+        y: f32,
+        x: f32,
+        inner: f32,
+        it: &crate::todo::Item,
+    ) -> f32 {
+        let u = self.ui;
+        let check = Hit::TodoCheck(it.id);
+        if let Some(row) = Rect::from_xywh(x, y, inner - 36.0 * u, ROW * u) {
+            if self.hover == Some(check) {
+                fill_round(pm, row.inset(2.0 * u), 10.0 * u, HOVER);
+            }
+            self.hits.push((row, check));
+        }
+        let b = 16.0 * u;
+        let bx = Rect::from_xywh(x + 12.0 * u, y + (ROW * u - b) / 2.0, b, b);
+        if it.done {
+            fill_round(pm, bx, 5.0 * u, ACCENT);
+            if let Some(b) = bx {
+                draw_glyph(
+                    pm,
+                    Glyph::Check,
+                    b.left() + b.width() / 2.0,
+                    b.top() + b.height() / 2.0,
+                    u * 0.75,
+                    CARD,
+                );
+            }
+        } else {
+            fill_round(pm, bx, 5.0 * u, CARD);
+            stroke_round(pm, bx, 5.0 * u, BORDER, 1.5 * u);
+        }
+        let tx = x + 12.0 * u + b + 10.0 * u;
+        let mut right = x + inner - 40.0 * u;
+        if let Some(at) = it.remind_at.filter(|_| !it.done) {
+            let st = sys(11.0 * u, false, ACCENT_INK);
+            let when = crate::todo::local_time(at);
+            let (tw, _) = r.measure(&when, st);
+            r.draw_text(pm, right - tw, y + 9.0 * u, &when, st);
+            right -= tw + 8.0 * u;
+        }
+        let st = sys(12.5 * u, false, if it.done { MUTED } else { INK });
+        let shown = fit(r, &it.text, st, right - tx);
+        let (tw, th) = r.measure(&shown, st);
+        let ty = y + 8.0 * u;
+        r.draw_text(pm, tx, ty, &shown, st);
+        if it.done {
+            fill_round(
+                pm,
+                Rect::from_xywh(tx, (ty + th / 2.0).round(), tw, (1.2 * u).max(1.0)),
+                0.0,
+                MUTED,
+            );
+        }
+        let remove = Hit::TodoRemove(it.id);
+        if let Some(rect) = Rect::from_xywh(x + inner - 32.0 * u, y + 4.0 * u, 24.0 * u, 24.0 * u) {
+            if self.hover == Some(remove) {
+                fill_round(pm, Some(rect), 7.0 * u, HOVER);
+            }
+            let c = if self.hover == Some(remove) {
+                DANGER
+            } else {
+                MUTED
+            };
+            draw_glyph(
+                pm,
+                Glyph::Close,
+                rect.left() + rect.width() / 2.0,
+                rect.top() + rect.height() / 2.0,
+                u * 0.8,
+                c,
+            );
+            self.hits.push((rect, remove));
+        }
+        y + ROW * u
     }
 
     /// The latest notifications: time, source, title and what happened.
@@ -927,9 +1436,10 @@ impl Panel {
         x: f32,
         inner: f32,
         v: &View,
-    ) {
+    ) -> f32 {
         let u = self.ui;
-        let card = self.card_start(y, 5);
+        let rows = 5;
+        let card = self.card_start(y, rows);
         fill_card(pm, card, u);
         if v.history.is_empty() {
             let st = sys(12.5 * u, false, MUTED);
@@ -938,13 +1448,13 @@ impl Panel {
             r.draw_text(
                 pm,
                 (x + (inner - tw) / 2.0).round(),
-                (y + (5.0 * ROW * u - th) / 2.0).round(),
+                (y + (rows as f32 * ROW * u - th) / 2.0).round(),
                 msg,
                 st,
             );
-            return;
+            return y + rows as f32 * ROW * u;
         }
-        for (i, h) in v.history.iter().take(5).enumerate() {
+        for (i, h) in v.history.iter().take(rows).enumerate() {
             let ry = y + i as f32 * ROW * u;
             if i > 0
                 && let Some(rule) = Rect::from_xywh(x + 12.0 * u, ry, inner - 24.0 * u, 1.0)
@@ -967,8 +1477,10 @@ impl Panel {
             let fitted = fit(r, &label, st, ox - tx - 8.0 * u);
             r.draw_text(pm, tx, ry + 8.0 * u, &fitted, st);
         }
+        y + rows as f32 * ROW * u
     }
 
+    /// The MCP server (address, which web pages may use it) and the app (login, updates).
     fn tab_connect(
         &mut self,
         pm: &mut Pixmap,
@@ -977,42 +1489,122 @@ impl Panel {
         x: f32,
         inner: f32,
         v: &View,
-    ) {
+    ) -> f32 {
         let u = self.ui;
         let s = &v.settings;
-        let card = self.card_start(y, 4);
-        fill_card(pm, card, u);
-        let mut cy = y;
-        cy = self.toggle_row(
+        let start = self.card(pm, y, 3);
+        let mut cy = self.toggle_row(
             pm,
             r,
-            cy,
+            start,
             x,
             inner,
             "MCP server",
             s.mcp_enabled,
             Toggle::Mcp,
         );
-        let status_color = if v.mcp_ok { MUTED } else { DANGER };
-        r.draw_text(
+        cy = self.text_row(
             pm,
-            x + 12.0 * u,
-            cy + 8.0 * u,
-            &v.mcp_status,
-            sys(11.5 * u, false, status_color),
+            r,
+            cy,
+            x,
+            inner,
+            "Address",
+            TextField::McpAddr,
+            s,
+            None,
+            "127.0.0.1:7777",
         );
+        let status_color = if v.mcp_ok { MUTED } else { DANGER };
+        let st = sys(11.5 * u, false, status_color);
+        let shown = fit(r, &v.mcp_status, st, inner - 90.0 * u);
+        r.draw_text(pm, x + 12.0 * u, cy + 8.0 * u, &shown, st);
         let copy = Rect::from_xywh(x + inner - 62.0 * u, cy + 4.0 * u, 54.0 * u, 24.0 * u);
         self.button(pm, r, copy, "Copy", Button::CopyMcp, true);
         cy += ROW * u;
+        cy += GAP * u;
+
+        // Web pages that may call the server from a browser (CORS).
+        cy = self.section(pm, r, cy, x, "BROWSERS");
+        let cors = &s.mcp_cors;
+        let any = cors.allow_origins.iter().any(|o| o == "*");
+        let custom = !any && (self.custom_origins || !cors.allow_origins.is_empty());
+        let selected = if any {
+            1
+        } else if custom {
+            2
+        } else {
+            0
+        };
+        let list: Vec<String> = if custom {
+            cors.allow_origins.clone()
+        } else {
+            Vec::new()
+        };
+        let rows = 2 + if custom { list.len() + 1 } else { 0 };
+        let start = self.card(pm, cy, rows);
+        cy = self.choice_row(
+            pm,
+            r,
+            start,
+            x,
+            inner,
+            "Allow",
+            Field::Browsers,
+            &["Local", "Any", "Custom"],
+            Some(selected),
+        );
+        if custom {
+            for (i, o) in list.iter().enumerate() {
+                cy = self.list_row(pm, r, cy, x, inner, o, None, List::Origins, i);
+            }
+            cy = self.text_row(
+                pm,
+                r,
+                cy,
+                x,
+                inner,
+                "Add",
+                TextField::AddOrigin,
+                s,
+                None,
+                "https://*.example.com",
+            );
+        }
         cy = self.toggle_row(
             pm,
             r,
             cy,
             x,
             inner,
+            "Private network access",
+            cors.allow_private_network,
+            Toggle::PrivateNetwork,
+        );
+        cy = self.note(pm, r, cy, x, "Pages on localhost can always connect.");
+        cy += GAP * u;
+
+        cy = self.section(pm, r, cy, x, "APP");
+        let start = self.card(pm, cy, 3);
+        cy = self.toggle_row(
+            pm,
+            r,
+            start,
+            x,
+            inner,
             v.autostart_label,
             v.autostart,
             Toggle::Autostart,
+        );
+        cy = self.toggle_row(
+            pm,
+            r,
+            cy,
+            x,
+            inner,
+            "Check for updates",
+            s.check_updates,
+            Toggle::CheckUpdates,
         );
         self.toggle_row(
             pm,
@@ -1020,10 +1612,282 @@ impl Panel {
             cy,
             x,
             inner,
-            "Update automatically",
+            "Install updates automatically",
             s.auto_update,
             Toggle::AutoUpdate,
+        )
+    }
+
+    /// A row with a text field: shows the value, click to edit (Enter saves, Esc cancels).
+    /// `suffix`: grey text right of the field; `hint`: shown while the field is empty.
+    #[allow(clippy::too_many_arguments)]
+    fn text_row(
+        &mut self,
+        pm: &mut Pixmap,
+        r: &mut Renderer,
+        y: f32,
+        x: f32,
+        inner: f32,
+        label: &str,
+        f: TextField,
+        s: &Settings,
+        suffix: Option<&str>,
+        hint: &str,
+    ) -> f32 {
+        let u = self.ui;
+        r.draw_text(
+            pm,
+            x + 12.0 * u,
+            y + 8.0 * u,
+            label,
+            sys(13.0 * u, false, INK),
         );
+        let st_suffix = sys(11.0 * u, false, MUTED);
+        let sw = suffix.map_or(0.0, |t| r.measure(t, st_suffix).0 + 10.0 * u);
+        if let Some(t) = suffix {
+            r.draw_text(
+                pm,
+                x + inner - 10.0 * u - (sw - 10.0 * u),
+                y + 9.0 * u,
+                t,
+                st_suffix,
+            );
+        }
+        let fx = x + 88.0 * u;
+        let fw = inner - 88.0 * u - 6.0 * u - sw;
+        let Some(field) = Rect::from_xywh(fx, y + 4.0 * u, fw, 24.0 * u) else {
+            return y + ROW * u;
+        };
+        let editing = self.editing.as_ref().filter(|e| e.field == f);
+        let hit = Hit::Text(f);
+        let (bg, border) = match (editing, self.hover == Some(hit)) {
+            (Some(_), _) => (CARD, ACCENT),
+            (None, true) => (HOVER, BORDER),
+            (None, false) => (CARD, BORDER),
+        };
+        fill_round(pm, Some(field), 7.0 * u, bg);
+        stroke_round(
+            pm,
+            Some(field),
+            7.0 * u,
+            border,
+            if editing.is_some() { 1.5 * u } else { 1.0 },
+        );
+        let value = Self::field_value(f, s);
+        let text = editing.map_or(value.as_str(), |e| e.text.as_str());
+        let max = fw - 16.0 * u;
+        let (shown, st) = if text.is_empty() && editing.is_none() {
+            (
+                fit(r, hint, sys(12.0 * u, false, MUTED), max),
+                sys(12.0 * u, false, MUTED),
+            )
+        } else {
+            let st = sys(12.5 * u, false, INK);
+            // While editing, show the end of the text (where the caret is).
+            let shown = if editing.is_some() {
+                fit_end(r, text, st, max)
+            } else {
+                fit(r, text, st, max)
+            };
+            (shown, st)
+        };
+        let (tw, th) = r.measure(&shown, st);
+        let ty = (field.top() + (field.height() - th) / 2.0).round();
+        r.draw_text(pm, fx + 8.0 * u, ty, &shown, st);
+        if let Some(e) = editing
+            && (e.since.elapsed().as_millis() / 530).is_multiple_of(2)
+        {
+            let tw = if text.is_empty() { 0.0 } else { tw };
+            let cx = (fx + 8.0 * u + tw + 1.0 * u).round();
+            fill_round(
+                pm,
+                Rect::from_xywh(cx, field.top() + 5.0 * u, (1.2 * u).max(1.0), 14.0 * u),
+                0.0,
+                INK,
+            );
+        }
+        self.hits.push((field, hit));
+        y + ROW * u
+    }
+
+    /// An entry of a list: optional colour dot (click: next colour), the text, a ✕ to remove.
+    #[allow(clippy::too_many_arguments)]
+    fn list_row(
+        &mut self,
+        pm: &mut Pixmap,
+        r: &mut Renderer,
+        y: f32,
+        x: f32,
+        inner: f32,
+        text: &str,
+        dot: Option<(ColorU8, usize)>,
+        list: List,
+        i: usize,
+    ) -> f32 {
+        let u = self.ui;
+        let mut tx = x + 12.0 * u;
+        if let Some((c, idx)) = dot {
+            let d = 14.0 * u;
+            if let Some(cell) = Rect::from_xywh(tx - 3.0 * u, y + 6.0 * u, d + 6.0 * u, d + 6.0 * u)
+            {
+                if self.hover == Some(Hit::SourceColor(idx)) {
+                    fill_round(pm, Some(cell), (d + 6.0 * u) / 2.0, HOVER);
+                }
+                self.hits.push((cell, Hit::SourceColor(idx)));
+            }
+            let dot = Rect::from_xywh(tx, y + 9.0 * u, d, d);
+            fill_round(pm, dot, d / 2.0, c);
+            tx += d + 10.0 * u;
+        }
+        let st = sys(12.5 * u, false, INK);
+        let shown = fit(r, text, st, x + inner - 40.0 * u - tx);
+        r.draw_text(pm, tx, y + 8.0 * u, &shown, st);
+        let remove = Rect::from_xywh(x + inner - 32.0 * u, y + 4.0 * u, 24.0 * u, 24.0 * u);
+        let hit = Hit::Remove(list, i);
+        if let Some(rect) = remove {
+            if self.hover == Some(hit) {
+                fill_round(pm, Some(rect), 7.0 * u, HOVER);
+            }
+            draw_glyph(
+                pm,
+                Glyph::Close,
+                rect.left() + rect.width() / 2.0,
+                rect.top() + rect.height() / 2.0,
+                u * 0.8,
+                if self.hover == Some(hit) {
+                    DANGER
+                } else {
+                    MUTED
+                },
+            );
+            self.hits.push((rect, hit));
+        }
+        y + ROW * u
+    }
+
+    /// A value with − and + on either side.
+    #[allow(clippy::too_many_arguments)]
+    fn stepper_row(
+        &mut self,
+        pm: &mut Pixmap,
+        r: &mut Renderer,
+        y: f32,
+        x: f32,
+        inner: f32,
+        label: &str,
+        value: &str,
+        field: Field,
+    ) -> f32 {
+        let u = self.ui;
+        r.draw_text(
+            pm,
+            x + 12.0 * u,
+            y + 8.0 * u,
+            label,
+            sys(13.0 * u, false, INK),
+        );
+        let seg_x = x + 88.0 * u;
+        let seg_w = inner - 88.0 * u - 6.0 * u;
+        let seg = Rect::from_xywh(seg_x, y + 5.0 * u, seg_w, 22.0 * u);
+        fill_round(pm, seg, 8.0 * u, TRACK);
+        let bw = 30.0 * u;
+        for (i, sign) in [(0, "−"), (1, "+")] {
+            let bx = if i == 0 { seg_x } else { seg_x + seg_w - bw };
+            let Some(cell) = Rect::from_xywh(bx, y + 5.0 * u, bw, 22.0 * u) else {
+                continue;
+            };
+            let hit = Hit::Choice(field, i);
+            if self.hover == Some(hit) {
+                fill_round(pm, cell.inset(2.0 * u), 6.0 * u, HOVER);
+            }
+            let st = sys(14.0 * u, true, INK);
+            let (tw, th) = r.measure(sign, st);
+            r.draw_text(
+                pm,
+                (cell.left() + (cell.width() - tw) / 2.0).round(),
+                (cell.top() + (cell.height() - th) / 2.0).round(),
+                sign,
+                st,
+            );
+            self.hits.push((cell, hit));
+        }
+        if let Some(mid) = Rect::from_xywh(seg_x + bw, y + 5.0 * u, seg_w - 2.0 * bw, 22.0 * u) {
+            fill_round(pm, mid.inset(2.0 * u), 6.0 * u, CARD);
+            let st = sys(11.5 * u, true, INK);
+            let (tw, th) = r.measure(value, st);
+            r.draw_text(
+                pm,
+                (mid.left() + (mid.width() - tw) / 2.0).round(),
+                (mid.top() + (mid.height() - th) / 2.0).round(),
+                value,
+                st,
+            );
+        }
+        y + ROW * u
+    }
+
+    /// A row of colour dots; the chosen one has a ring.
+    #[allow(clippy::too_many_arguments)]
+    fn swatch_row(
+        &mut self,
+        pm: &mut Pixmap,
+        r: &mut Renderer,
+        y: f32,
+        x: f32,
+        _inner: f32,
+        label: &str,
+        colors: &[ColorU8],
+        selected: Option<usize>,
+        hit: fn(usize) -> Hit,
+    ) -> f32 {
+        let u = self.ui;
+        r.draw_text(
+            pm,
+            x + 12.0 * u,
+            y + 8.0 * u,
+            label,
+            sys(13.0 * u, false, INK),
+        );
+        let d = 18.0 * u;
+        let gap = if colors.len() > 6 { 7.0 * u } else { 10.0 * u };
+        for (i, c) in colors.iter().enumerate() {
+            let cx = x + 88.0 * u + i as f32 * (d + gap);
+            let Some(cell) = Rect::from_xywh(cx - 3.0 * u, y + 4.0 * u, d + 6.0 * u, d + 6.0 * u)
+            else {
+                continue;
+            };
+            let h = hit(i);
+            if selected == Some(i) {
+                stroke_round(pm, Some(cell), (d + 6.0 * u) / 2.0, ACCENT, 2.0 * u);
+            } else if self.hover == Some(h) {
+                fill_round(pm, Some(cell), (d + 6.0 * u) / 2.0, HOVER);
+            }
+            let dot = Rect::from_xywh(cx, y + 7.0 * u, d, d);
+            fill_round(pm, dot, d / 2.0, *c);
+            stroke_round(pm, dot, d / 2.0, BORDER, 1.0);
+            // White means "none": crossed out.
+            if *c == rgb(0xff, 0xff, 0xff)
+                && let Some(dot) = dot
+            {
+                let mut pb = PathBuilder::new();
+                let k = d * 0.2;
+                pb.move_to(dot.left() + k, dot.bottom() - k);
+                pb.line_to(dot.right() - k, dot.top() + k);
+                if let Some(path) = pb.finish() {
+                    let mut paint = Paint::default();
+                    paint.set_color_rgba8(MUTED.red(), MUTED.green(), MUTED.blue(), 255);
+                    paint.anti_alias = true;
+                    let stroke = Stroke {
+                        width: 1.5 * u,
+                        line_cap: LineCap::Round,
+                        ..Stroke::default()
+                    };
+                    pm.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+                }
+            }
+            self.hits.push((cell, h));
+        }
+        y + ROW * u
     }
 
     /// Settings file and quit as quiet text links, version on the right.
@@ -1107,6 +1971,12 @@ impl Panel {
             )
                 .filter_volume(settings);
         }
+        if let Some((px, py)) = self.toy_press
+            && ((x - px).powi(2) + (y - py).powi(2)).sqrt() > 8.0 * self.ui
+        {
+            self.toy_press = None;
+            return (false, Some(Action::TakeToy));
+        }
         let hover = self.hit(x, y);
         let changed = hover != self.hover;
         self.hover = hover;
@@ -1120,7 +1990,9 @@ impl Panel {
     }
 
     pub fn pointer_down(&mut self, x: f32, y: f32) -> Option<Action> {
-        if self.hit(x, y) == Some(Hit::Slider) {
+        let hit = self.hit(x, y);
+        self.toy_press = (hit == Some(Hit::ToyTile)).then_some((x, y));
+        if hit == Some(Hit::Slider) {
             self.dragging = true;
             return self.slider_value(x).map(|volume| Action::Volume {
                 volume,
@@ -1131,22 +2003,31 @@ impl Panel {
     }
 
     pub fn pointer_up(&mut self, x: f32, y: f32, v: &View) -> Option<Action> {
+        let toy_click = self.toy_press.take().is_some();
         if std::mem::take(&mut self.dragging) {
             return self
                 .slider_value(x)
                 .map(|volume| Action::Volume { volume, done: true });
         }
         let hit = self.hit(x, y);
-        if hit == Some(Hit::Name) {
-            if self.editing.is_none() {
-                self.editing = Some(Editing {
-                    text: v.settings.name.clone(),
-                    since: std::time::Instant::now(),
-                });
+        if let Some(Hit::Text(f)) = hit {
+            if self.editing.as_ref().is_some_and(|e| e.field == f) {
+                return None;
             }
-            return None;
+            // Clicking another field saves the one being edited first.
+            let saved = self.finish_editing(v);
+            let s = match &saved {
+                Some(Action::Settings(s)) => s.as_ref(),
+                _ => &v.settings,
+            };
+            self.editing = Some(Editing {
+                field: f,
+                text: Self::field_value(f, s),
+                since: std::time::Instant::now(),
+            });
+            return saved;
         }
-        // Clicking anywhere else saves the name being edited.
+        // Clicking anywhere else saves the field being edited.
         if let Some(a) = self.finish_editing(v) {
             return Some(a);
         }
@@ -1154,17 +2035,65 @@ impl Panel {
         match hit? {
             Hit::Tab(i) => {
                 if self.tab != i {
-                    self.tab = i;
-                    self.scroll = 0.0;
+                    self.set_tab(i);
                     self.missed = 0;
                 }
                 return None;
             }
-            Hit::Name => return None,
+            Hit::Text(_) => return None,
+            Hit::ToyTile => return toy_click.then_some(Action::Fetch),
             Hit::Fur(i) => s.fur = Fur::ALL[i],
             Hit::Collar(i) => s.collar = Collar::ALL[i],
+            Hit::Remove(list, i) => match list {
+                List::Origins => {
+                    if i < s.mcp_cors.allow_origins.len() {
+                        s.mcp_cors.allow_origins.remove(i);
+                    }
+                }
+                List::Barks => {
+                    if i < s.bark_files.len() {
+                        s.bark_files.remove(i);
+                    }
+                }
+                List::Sources => {
+                    if let Some(k) = s.source_colors.keys().nth(i).cloned() {
+                        s.source_colors.remove(&k);
+                    }
+                }
+            },
+            Hit::TodoCheck(id) => return Some(Action::Todo(crate::todo::Edit::Toggle(id))),
+            Hit::TodoRemove(id) => return Some(Action::Todo(crate::todo::Edit::Remove(id))),
+            Hit::TodoClear(id) => return Some(Action::Todo(crate::todo::Edit::ClearDone(id))),
+            Hit::TodoRemoveList(id) => {
+                return Some(Action::Todo(crate::todo::Edit::RemoveList(id)));
+            }
+            Hit::SourceColor(i) => {
+                if let Some(c) = s.source_colors.values_mut().nth(i) {
+                    let now = parse_hex(c);
+                    let at = SOURCE_PALETTE.iter().position(|p| Some(*p) == now);
+                    let next = at.map_or(0, |a| (a + 1) % SOURCE_PALETTE.len());
+                    *c = crate::look::to_hex(SOURCE_PALETTE[next]);
+                }
+            }
             Hit::Choice(field, i) => match field {
-                Field::Size => s.size = SIZES[i].0,
+                Field::Size => {
+                    let step = crate::settings::SIZE_STEP as i32;
+                    let d = if i == 0 { -step } else { step };
+                    let snapped = (s.size as i32 / step) * step;
+                    s.size = (snapped + d).clamp(50, 400) as u32;
+                }
+                Field::Notify => {
+                    let at = NOTIFY_STEPS
+                        .iter()
+                        .position(|n| *n == s.notify_secs)
+                        .unwrap_or(1);
+                    let next = if i == 0 {
+                        at.saturating_sub(1)
+                    } else {
+                        (at + 1).min(NOTIFY_STEPS.len() - 1)
+                    };
+                    s.notify_secs = NOTIFY_STEPS[next];
+                }
                 Field::TextSize => s.text_size = TEXT_SIZES[i].0,
                 Field::Speed => s.speed = SPEEDS[i].0,
                 Field::Ground => {
@@ -1174,23 +2103,38 @@ impl Panel {
                         Ground::Screen
                     }
                 }
-                Field::Lift => s.lift = LIFTS[i].0,
-                Field::Notify => s.notify_secs = NOTIFY_SECS[i].0,
-                Field::Quiet => {
-                    s.quiet = i == 2;
-                    let (from, to) = if i == 1 { NIGHT } else { (NIGHT.0, NIGHT.0) };
-                    s.quiet_from = from.into();
-                    s.quiet_to = to.into();
-                }
                 Field::Wear => s.wear = Wear::ALL[i].0,
                 Field::Theme => s.theme = Theme::ALL[i].0,
+                Field::Browsers => {
+                    self.custom_origins = i == 2;
+                    let keep = s
+                        .mcp_cors
+                        .allow_origins
+                        .iter()
+                        .filter(|o| *o != "*")
+                        .cloned()
+                        .collect();
+                    s.mcp_cors.allow_origins = match i {
+                        0 => Vec::new(),
+                        1 => vec!["*".into()],
+                        _ => keep,
+                    };
+                    if i == 2 {
+                        return (s != v.settings).then(|| Action::Settings(Box::new(s)));
+                    }
+                }
             },
             Hit::Toggle(t) => match t {
                 Toggle::Sound => s.sound = !s.sound,
                 Toggle::SoundOnPet => s.sound_on_pet = !s.sound_on_pet,
+                Toggle::QuietNow => s.quiet = !s.quiet,
                 Toggle::QuietFullscreen => s.quiet_fullscreen = !s.quiet_fullscreen,
                 Toggle::Wander => s.wander = !s.wander,
                 Toggle::Mcp => s.mcp_enabled = !s.mcp_enabled,
+                Toggle::PrivateNetwork => {
+                    s.mcp_cors.allow_private_network = !s.mcp_cors.allow_private_network
+                }
+                Toggle::CheckUpdates => s.check_updates = !s.check_updates,
                 Toggle::AutoUpdate => s.auto_update = !s.auto_update,
                 Toggle::Seasonal => s.seasonal = !s.seasonal,
                 Toggle::EventSounds => s.event_sounds = !s.event_sounds,
@@ -1201,7 +2145,6 @@ impl Panel {
             Hit::Button(b) => {
                 return Some(match b {
                     Button::Test => Action::TestNotification,
-                    Button::Fetch => Action::Fetch,
                     Button::Sleep => Action::ToggleSleep,
                     Button::Hide => Action::ToggleVisible,
                     Button::CopyMcp => Action::CopyMcpUrl,
@@ -1466,8 +2409,11 @@ enum Glyph {
     Paw,
     /// A bow tie: the Look tab.
     Bow,
-    Steps,
+    /// A bone: the Play tab.
+    Bone,
     Speaker,
+    /// A check mark: the Todo tab.
+    Check,
     Clock,
     Plug,
 }
@@ -1539,13 +2485,18 @@ fn draw_glyph(pm: &mut Pixmap, g: Glyph, cx: f32, cy: f32, u: f32, c: ColorU8) {
             oval(&mut pb, 0.0, 0.0, 2.2, 2.6);
             fill(pm, pb);
         }
-        Glyph::Steps => {
-            // Two footprints, one ahead of the other.
+        Glyph::Bone => {
+            // A shaft with two round knobs at each end, tilted.
             let mut pb = PathBuilder::new();
-            oval(&mut pb, -3.2, 1.6, 2.4, 3.6);
-            oval(&mut pb, -3.2, 6.2, 1.6, 1.3);
-            oval(&mut pb, 3.2, -3.4, 2.4, 3.6);
-            oval(&mut pb, 3.2, 1.2, 1.6, 1.3);
+            let (x0, y0) = p(-4.0, 3.0);
+            let (x1, y1) = p(4.0, -3.0);
+            pb.move_to(x0, y0);
+            pb.line_to(x1, y1);
+            stroke(pm, pb, 3.0);
+            let mut pb = PathBuilder::new();
+            for (x, y) in [(-6.6, 2.4), (-4.6, 5.4), (6.6, -2.4), (4.6, -5.4)] {
+                oval(&mut pb, x, y, 2.1, 2.1);
+            }
             fill(pm, pb);
         }
         Glyph::Speaker => {
@@ -1575,6 +2526,16 @@ fn draw_glyph(pm: &mut Pixmap, g: Glyph, cx: f32, cy: f32, u: f32, c: ColorU8) {
                 pb.quad_to(xm, ym, x1, y1);
             }
             stroke(pm, pb, 1.5);
+        }
+        Glyph::Check => {
+            let mut pb = PathBuilder::new();
+            let (x0, y0) = p(-6.0, 0.5);
+            let (x1, y1) = p(-2.0, 4.5);
+            let (x2, y2) = p(6.0, -4.5);
+            pb.move_to(x0, y0);
+            pb.line_to(x1, y1);
+            pb.line_to(x2, y2);
+            stroke(pm, pb, 2.2);
         }
         Glyph::Clock => {
             let mut pb = PathBuilder::new();
@@ -1831,6 +2792,37 @@ mod tests {
         ((r.left() + r.right()) / 2.0, (r.top() + r.bottom()) / 2.0)
     }
 
+    fn find(p: &Panel, hit: Hit) -> (f32, f32) {
+        p.hits
+            .iter()
+            .find(|(_, h)| *h == hit)
+            .map(|(r, _)| center(*r))
+            .unwrap_or_else(|| panic!("{hit:?} is not on screen"))
+    }
+
+    /// Scrolls the tab until `hit` is on screen.
+    fn reach(p: &mut Panel, pm: &mut Pixmap, r: &mut Renderer, v: &View, hit: Hit) -> (f32, f32) {
+        for _ in 0..40 {
+            p.draw(pm, r, v);
+            if p.hits.iter().any(|(_, h)| *h == hit) {
+                return find(p, hit);
+            }
+            p.scroll_by(-1.0, pm.height());
+        }
+        panic!("{hit:?} not reached");
+    }
+
+    /// Applies an action's settings to the view, like the app does.
+    fn apply(v: &mut View, a: Option<Action>) -> Settings {
+        match a {
+            Some(Action::Settings(s)) => {
+                v.settings = *s;
+                v.settings.clone()
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn clicks_produce_actions() {
         let mut r = Renderer::new(false, Vec::new());
@@ -1839,25 +2831,14 @@ mod tests {
         let (w, h) = p.size(10_000);
         let mut pm = Pixmap::new(w, h).unwrap();
         p.draw(&mut pm, &mut r, &v);
-        assert!(
-            p.content_height <= h as f32 + 1.0,
-            "{} > {h}",
-            p.content_height
-        );
 
-        let find = |p: &Panel, hit: Hit| {
-            p.hits
-                .iter()
-                .find(|(_, h)| *h == hit)
-                .map(|(r, _)| center(*r))
-                .unwrap()
-        };
-
+        // Size steps by 50%.
         let (x, y) = find(&p, Hit::Choice(Field::Size, 1));
-        match p.pointer_up(x, y, &v) {
-            Some(Action::Settings(s)) => assert_eq!(s.size, SIZES[1].0),
-            other => panic!("{other:?}"),
-        }
+        assert!(matches!(p.pointer_up(x, y, &v), Some(Action::Settings(s)) if s.size == 150));
+        let (x, y) = find(&p, Hit::Choice(Field::Size, 0));
+        assert!(matches!(p.pointer_up(x, y, &v), Some(Action::Settings(s)) if s.size == 50));
+        let (x, y) = find(&p, Hit::Choice(Field::Notify, 1));
+        assert!(matches!(p.pointer_up(x, y, &v), Some(Action::Settings(s)) if s.notify_secs == 15));
         let (x, y) = find(&p, Hit::Button(Button::Quit));
         assert_eq!(p.pointer_up(x, y, &v), Some(Action::Quit));
 
@@ -1873,11 +2854,265 @@ mod tests {
         let (x, y) = find(&p, Hit::Toggle(Toggle::Sound));
         assert!(matches!(p.pointer_up(x, y, &v), Some(Action::Settings(s)) if !s.sound));
 
-        p.set_tab(TAB_WALK);
-        p.draw(&mut pm, &mut r, &v);
+        // Walking is on the Dog tab, further down.
+        p.set_tab(0);
         // Choosing what is already selected changes nothing.
-        let (x, y) = find(&p, Hit::Choice(Field::Speed, 1));
+        let (x, y) = reach(&mut p, &mut pm, &mut r, &v, Hit::Choice(Field::Speed, 1));
         assert_eq!(p.pointer_up(x, y, &v), None);
+    }
+
+    #[test]
+    fn play_tab_takes_the_toy_out() {
+        let mut r = Renderer::new(false, Vec::new());
+        let mut p = Panel::new(1.0);
+        let v = view();
+        let (w, h) = p.size(10_000);
+        let mut pm = Pixmap::new(w, h).unwrap();
+        p.set_tab(TAB_PLAY);
+        p.draw(&mut pm, &mut r, &v);
+        // Dragging the tile away takes the toy out; a plain click throws it.
+        let (x, y) = find(&p, Hit::ToyTile);
+        assert_eq!(p.pointer_down(x, y), None);
+        assert_eq!(p.pointer_move(x + 2.0, y, &v.settings).1, None);
+        assert_eq!(
+            p.pointer_move(x + 30.0, y - 30.0, &v.settings).1,
+            Some(Action::TakeToy)
+        );
+        assert_eq!(p.pointer_down(x, y), None);
+        assert_eq!(p.pointer_up(x, y, &v), Some(Action::Fetch));
+        let (x, y) = find(&p, Hit::Toggle(Toggle::Toy));
+        assert!(matches!(p.pointer_up(x, y, &v), Some(Action::Settings(s)) if !s.toy));
+    }
+
+    #[test]
+    fn connect_tab_edits_the_server() {
+        let mut r = Renderer::new(false, Vec::new());
+        let mut p = Panel::new(1.0);
+        let mut v = view();
+        let (w, h) = p.size(10_000);
+        let mut pm = Pixmap::new(w, h).unwrap();
+        p.set_tab(TAB_CONNECT);
+        p.draw(&mut pm, &mut r, &v);
+
+        // Address: a bad one is dropped, a good one saved.
+        let (x, y) = find(&p, Hit::Text(TextField::McpAddr));
+        p.pointer_up(x, y, &v);
+        for _ in 0..30 {
+            p.key(Key::Backspace, &v);
+        }
+        p.key(Key::Text("nope".into()), &v);
+        assert_eq!(p.key(Key::Enter, &v).1, None);
+        p.pointer_up(x, y, &v);
+        for _ in 0..30 {
+            p.key(Key::Backspace, &v);
+        }
+        p.key(Key::Text("127.0.0.1:8888".into()), &v);
+        let s = {
+            let a = p.key(Key::Enter, &v).1;
+            apply(&mut v, a)
+        };
+        assert_eq!(s.mcp_addr, "127.0.0.1:8888");
+
+        // Any, then Custom with a page of its own, then the page removed.
+        let (x, y) = find(&p, Hit::Choice(Field::Browsers, 1));
+        assert_eq!(
+            {
+                let a = p.pointer_up(x, y, &v);
+                apply(&mut v, a)
+            }
+            .mcp_cors
+            .allow_origins,
+            ["*"]
+        );
+        p.draw(&mut pm, &mut r, &v);
+        let (x, y) = find(&p, Hit::Choice(Field::Browsers, 2));
+        assert!(
+            {
+                let a = p.pointer_up(x, y, &v);
+                apply(&mut v, a)
+            }
+            .mcp_cors
+            .allow_origins
+            .is_empty()
+        );
+        let (x, y) = reach(&mut p, &mut pm, &mut r, &v, Hit::Text(TextField::AddOrigin));
+        p.pointer_up(x, y, &v);
+        p.key(Key::Text("https://app.example.com/".into()), &v);
+        let s = {
+            let a = p.key(Key::Enter, &v).1;
+            apply(&mut v, a)
+        };
+        assert_eq!(s.mcp_cors.allow_origins, ["https://app.example.com"]);
+        let (x, y) = reach(&mut p, &mut pm, &mut r, &v, Hit::Remove(List::Origins, 0));
+        assert!(
+            {
+                let a = p.pointer_up(x, y, &v);
+                apply(&mut v, a)
+            }
+            .mcp_cors
+            .allow_origins
+            .is_empty()
+        );
+        let (x, y) = reach(
+            &mut p,
+            &mut pm,
+            &mut r,
+            &v,
+            Hit::Toggle(Toggle::PrivateNetwork),
+        );
+        assert!(
+            {
+                let a = p.pointer_up(x, y, &v);
+                apply(&mut v, a)
+            }
+            .mcp_cors
+            .allow_private_network
+        );
+        let (x, y) = reach(
+            &mut p,
+            &mut pm,
+            &mut r,
+            &v,
+            Hit::Toggle(Toggle::CheckUpdates),
+        );
+        assert!(
+            !{
+                let a = p.pointer_up(x, y, &v);
+                apply(&mut v, a)
+            }
+            .check_updates
+        );
+    }
+
+    #[test]
+    fn sound_and_look_lists() {
+        let mut r = Renderer::new(false, Vec::new());
+        let mut p = Panel::new(1.0);
+        let mut v = view();
+        let (w, h) = p.size(10_000);
+        let mut pm = Pixmap::new(w, h).unwrap();
+
+        p.set_tab(TAB_SOUND);
+        // Quiet hours: a time is normalised, nonsense is dropped.
+        let (x, y) = reach(&mut p, &mut pm, &mut r, &v, Hit::Text(TextField::QuietFrom));
+        p.pointer_up(x, y, &v);
+        for _ in 0..10 {
+            p.key(Key::Backspace, &v);
+        }
+        p.key(Key::Text("7:5".into()), &v);
+        assert_eq!(
+            {
+                let a = p.key(Key::Enter, &v).1;
+                apply(&mut v, a)
+            }
+            .quiet_from,
+            "07:05"
+        );
+        p.pointer_up(x, y, &v);
+        p.key(Key::Text("x".into()), &v);
+        assert_eq!(p.key(Key::Enter, &v).1, None);
+        let (x, y) = reach(&mut p, &mut pm, &mut r, &v, Hit::Text(TextField::AddBark));
+        p.pointer_up(x, y, &v);
+        p.key(Key::Text("\"~/woof.wav\"".into()), &v);
+        assert_eq!(
+            {
+                let a = p.key(Key::Enter, &v).1;
+                apply(&mut v, a)
+            }
+            .bark_files,
+            ["~/woof.wav"]
+        );
+        let (x, y) = reach(&mut p, &mut pm, &mut r, &v, Hit::Remove(List::Barks, 0));
+        assert!(
+            {
+                let a = p.pointer_up(x, y, &v);
+                apply(&mut v, a)
+            }
+            .bark_files
+            .is_empty()
+        );
+
+        p.set_tab(TAB_LOOK);
+        let (x, y) = reach(&mut p, &mut pm, &mut r, &v, Hit::Text(TextField::AddSource));
+        p.pointer_up(x, y, &v);
+        p.key(Key::Text("CI".into()), &v);
+        let s = {
+            let a = p.key(Key::Enter, &v).1;
+            apply(&mut v, a)
+        };
+        let first = s.source_colors["ci"].clone();
+        let (x, y) = reach(&mut p, &mut pm, &mut r, &v, Hit::SourceColor(0));
+        let s = {
+            let a = p.pointer_up(x, y, &v);
+            apply(&mut v, a)
+        };
+        assert_ne!(s.source_colors["ci"], first, "next colour");
+        let (x, y) = reach(&mut p, &mut pm, &mut r, &v, Hit::Remove(List::Sources, 0));
+        assert!(
+            {
+                let a = p.pointer_up(x, y, &v);
+                apply(&mut v, a)
+            }
+            .source_colors
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn todo_tab() {
+        use crate::todo::{Edit, Item, List};
+        let mut r = Renderer::new(false, Vec::new());
+        let mut p = Panel::new(1.0);
+        let mut v = view();
+        let (w, h) = p.size(10_000);
+        let mut pm = Pixmap::new(w, h).unwrap();
+        p.set_tab(TAB_TODO);
+        p.draw(&mut pm, &mut r, &v);
+        // No lists: a field for a new one.
+        let (x, y) = find(&p, Hit::Text(TextField::NewList));
+        p.pointer_up(x, y, &v);
+        p.key(Key::Text("Release".into()), &v);
+        assert_eq!(
+            p.key(Key::Enter, &v).1,
+            Some(Action::Todo(Edit::NewList("Release".into())))
+        );
+        v.todos = vec![List {
+            id: 1,
+            name: "Release".into(),
+            items: vec![
+                Item {
+                    id: 2,
+                    text: "tag".into(),
+                    ..Item::default()
+                },
+                Item {
+                    id: 3,
+                    text: "build".into(),
+                    done: true,
+                    ..Item::default()
+                },
+            ],
+        }];
+        p.draw(&mut pm, &mut r, &v);
+        let (x, y) = find(&p, Hit::TodoCheck(2));
+        assert_eq!(p.pointer_up(x, y, &v), Some(Action::Todo(Edit::Toggle(2))));
+        let (x, y) = find(&p, Hit::TodoRemove(3));
+        assert_eq!(p.pointer_up(x, y, &v), Some(Action::Todo(Edit::Remove(3))));
+        let (x, y) = find(&p, Hit::TodoClear(1));
+        assert_eq!(
+            p.pointer_up(x, y, &v),
+            Some(Action::Todo(Edit::ClearDone(1)))
+        );
+        let (x, y) = find(&p, Hit::Text(TextField::AddTodo(1)));
+        p.pointer_up(x, y, &v);
+        p.key(Key::Text("notes".into()), &v);
+        assert_eq!(
+            p.key(Key::Enter, &v).1,
+            Some(Action::Todo(Edit::Add {
+                list: "1".into(),
+                text: "notes".into()
+            }))
+        );
     }
 
     #[test]
@@ -1889,22 +3124,15 @@ mod tests {
         let (w, h) = p.size(10_000);
         let mut pm = Pixmap::new(w, h).unwrap();
         p.draw(&mut pm, &mut r, &v);
-        let find = |p: &Panel, hit: Hit| {
-            p.hits
-                .iter()
-                .find(|(_, h)| *h == hit)
-                .map(|(r, _)| center(*r))
-                .unwrap()
-        };
         let (x, y) = find(&p, Hit::Fur(3));
         assert!(matches!(p.pointer_up(x, y, &v), Some(Action::Settings(s)) if s.fur == Fur::Black));
-        let (x, y) = find(&p, Hit::Choice(Field::Wear, 2));
+        let (x, y) = find(&p, Hit::Choice(Field::Wear, 1));
         assert!(
             matches!(p.pointer_up(x, y, &v), Some(Action::Settings(s)) if s.wear == Wear::Beanie)
         );
 
         // Click the name, type, Enter.
-        let (x, y) = find(&p, Hit::Name);
+        let (x, y) = find(&p, Hit::Text(TextField::Name));
         assert_eq!(p.pointer_up(x, y, &v), None);
         assert!(p.is_editing());
         p.draw(&mut pm, &mut r, &v);
@@ -1930,10 +3158,20 @@ mod tests {
         p.key(Key::Text("x".repeat(40)), &v);
         let (_, a) = p.key(Key::Enter, &v);
         assert!(matches!(a, Some(Action::Settings(s)) if s.name.chars().count() == NAME_MAX));
+        // A birthday must be a date.
+        let (x, y) = find(&p, Hit::Text(TextField::Birthday));
+        p.pointer_up(x, y, &v);
+        p.key(Key::Text("2025-02-30".into()), &v);
+        assert_eq!(p.key(Key::Enter, &v).1, None);
+        p.pointer_up(x, y, &v);
+        p.key(Key::Text("2025-03-14".into()), &v);
+        assert!(
+            matches!(p.key(Key::Enter, &v).1, Some(Action::Settings(s)) if s.birthday == "2025-03-14")
+        );
     }
 
     #[test]
-    fn every_tab_fits() {
+    fn every_tab_fits_and_scrolls() {
         let mut r = Renderer::new(false, Vec::new());
         for arrow in [None, Some(150.0)] {
             let mut p = Panel::new(1.0);
@@ -1943,7 +3181,25 @@ mod tests {
             for tab in 0..TAB_NAMES.len() {
                 p.set_tab(tab);
                 p.draw(&mut pm, &mut r, &view());
-                assert!(p.content_height + p.top() <= h as f32 + 1.0, "tab {tab}");
+                // Nothing clickable outside the panel, and the footer is always there.
+                assert!(
+                    p.hits.iter().all(|(r, _)| r.bottom() <= h as f32 + 1.0),
+                    "tab {tab}"
+                );
+                assert!(p.hits.iter().any(|(_, h)| *h == Hit::Button(Button::Quit)));
+                // Scrolled to the end: no hit leaks over the tabs or the footer.
+                p.scroll_by(-100.0, h);
+                p.draw(&mut pm, &mut r, &view());
+                let (_, tab_y) = find(&p, Hit::Tab(0));
+                let (_, quit_y) = find(&p, Hit::Button(Button::Quit));
+                for (rect, hit) in &p.hits {
+                    if !matches!(hit, Hit::Tab(_) | Hit::Button(_)) {
+                        assert!(
+                            rect.top() > tab_y && rect.bottom() < quit_y,
+                            "tab {tab}: {hit:?}"
+                        );
+                    }
+                }
             }
         }
     }

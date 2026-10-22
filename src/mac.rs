@@ -65,6 +65,8 @@ struct Shell {
     window: Retained<NSWindow>,
     view: Retained<NSImageView>,
     pixmap: Pixmap,
+    /// The dog window's top-left on screen (physical).
+    dog_pos: (f64, f64),
     drag: Option<Drag>,
     status: Retained<NSStatusItem>,
     /// Whether the menu bar icon is drawn pressed (while the panel is open).
@@ -143,6 +145,7 @@ pub fn run() {
         window,
         view,
         pixmap: Pixmap::new(1, 1).unwrap(),
+        dog_pos: (0.0, 0.0),
         drag: None,
         status,
         status_pressed: false,
@@ -739,6 +742,26 @@ impl App {
             sh.view.setImage(Some(&image));
         }
         place(sh.mtm, &sh.window, x, y, w as f64, h as f64, full.scale);
+        sh.dog_pos = (x, y);
+        self.update_click_through();
+    }
+
+    /// The dog's window is much bigger than the dog (room for the bubble and hats): clicks
+    /// only count on what is drawn, elsewhere they go to the windows behind it.
+    fn update_click_through(&mut self) {
+        let sh = &self.shell;
+        // While dragging, keep the mouse.
+        let over = sh.drag.is_some() || {
+            let (mx, my) = mouse_px(sh.mtm);
+            let (wx, wy) = (mx - sh.dog_pos.0, my - sh.dog_pos.1);
+            let (_, full) = screen_at(sh.mtm, sh.dog_pos.0, sh.dog_pos.1);
+            let px = self.core.scale(full.scale as f32).px as f64;
+            let reach = (2.0 * px).round() as i32;
+            dost::render::drawn_near(&sh.pixmap, wx.floor() as i32, wy.floor() as i32, reach)
+        };
+        if sh.window.ignoresMouseEvents() == over {
+            sh.window.setIgnoresMouseEvents(!over);
+        }
     }
 
     /// While hidden: shows the current bubble on its own under the menu bar icon, or hides it.
@@ -817,6 +840,15 @@ impl App {
     }
 
     fn on_action(&mut self, action: panel::Action) {
+        if action == panel::Action::TakeToy {
+            // The Bone button dragged out of the panel: the toy follows the mouse from here.
+            self.close_panel();
+            let (mx, my) = mouse_px(self.shell.mtm);
+            let lift = 12.0 * self.bounds().scale;
+            self.core.take_toy(mx as f32, my as f32 + lift);
+            self.shell.toy.drag = Some((0.0, -lift));
+            return;
+        }
         self.core.on_action(&mut self.shell, action);
         self.sync_menu();
     }
@@ -942,16 +974,23 @@ impl App {
         let on_toy = self.shell.toy.shown
             && window.is_some_and(|w| std::ptr::eq(w, &*self.shell.toy.window));
         if on_toy {
-            if kind == NSEventType::LeftMouseDown {
-                self.shell.toy.drag =
-                    Some((mx as f32 - self.core.toy.x, my as f32 - self.core.toy.y));
-                self.core.grab_toy();
+            match kind {
+                NSEventType::LeftMouseDown => {
+                    self.shell.toy.drag =
+                        Some((mx as f32 - self.core.toy.x, my as f32 - self.core.toy.y));
+                    self.core.grab_toy();
+                }
+                // Right click: put it away.
+                NSEventType::RightMouseUp => self.core.put_toy_away(),
+                _ => {}
             }
             return matches!(
                 kind,
                 NSEventType::LeftMouseDown
                     | NSEventType::LeftMouseUp
                     | NSEventType::LeftMouseDragged
+                    | NSEventType::RightMouseDown
+                    | NSEventType::RightMouseUp
             );
         }
         let on_alone = self.shell.alone.shown
@@ -1148,10 +1187,20 @@ fn install_mouse_monitor() {
                     }
                     return false;
                 }
+                let cmd = ev
+                    .modifierFlags()
+                    .contains(objc2_app_kit::NSEventModifierFlags::Command);
                 let key = match code {
                     53 => panel::Key::Escape,
                     36 | 76 => panel::Key::Enter,
                     51 => panel::Key::Backspace,
+                    // ⌘V: paste.
+                    9 if cmd => {
+                        let pb = NSPasteboard::generalPasteboard();
+                        let s = pb.stringForType(unsafe { NSPasteboardTypeString });
+                        panel::Key::Text(s.map(|s| s.to_string()).unwrap_or_default())
+                    }
+                    _ if cmd => return true,
                     _ => panel::Key::Text(text),
                 };
                 a.panel_key(key);
