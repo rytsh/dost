@@ -4,7 +4,7 @@
 
 **A pixel-art dog that lives on your taskbar and barks when your AI agents need you.**
 
-Windows · macOS · single ~6 MB file · no account, no telemetry
+Windows · macOS · Linux · single ~6 MB file · no account, no telemetry
 
 </div>
 
@@ -17,6 +17,11 @@ bubble to dismiss it.
 - **Windows**: download `dost.exe` from [Releases](https://github.com/rytsh/dost/releases) and run it.
 - **macOS**: download `Dost.dmg` from [Releases](https://github.com/rytsh/dost/releases) and drag it
   into Applications. It is not notarized yet, so open it the first time with right click → *Open*.
+- **Linux** (X11, or Wayland through XWayland): download `dost-linux-x86_64` from
+  [Releases](https://github.com/rytsh/dost/releases), `chmod +x` it and run it. The tray icon needs a
+  StatusNotifierItem host (KDE, most panels; on GNOME the AppIndicator extension), otherwise right-click
+  the dog for settings. Sound plays through `paplay`, `pw-play` or `aplay`; copy and paste use `wl-copy`
+  / `wl-paste` or `xclip` / `xsel`.
 
 ## OpenCode
 
@@ -39,10 +44,15 @@ agent; the dog also barks when it waits for you or finishes its turn. Add to
   "hooks": {
     "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "dost hook claude", "timeout": 600 }] }],
     "Notification": [{ "matcher": "idle_prompt|elicitation_dialog", "hooks": [{ "type": "command", "command": "dost hook claude" }] }],
-    "Stop": [{ "hooks": [{ "type": "command", "command": "dost hook claude" }] }]
+    "Stop": [{ "hooks": [{ "type": "command", "command": "dost hook claude" }] }],
+    "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "dost hook claude" }] }],
+    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "dost hook claude" }] }]
   }
 }
 ```
+
+`UserPromptSubmit` and `SessionEnd` are optional: with them each Claude Code session shows in the
+dog's **Agents** list as working, waiting for you, or gone.
 
 Codex (`~/.codex/config.toml`): `notify = ["dost", "hook", "codex"]`, and for permission buttons
 `~/.codex/hooks.json`:
@@ -90,13 +100,14 @@ watches that run shell commands, so only allow pages you trust.
 | Tool | What the dog does |
 | --- | --- |
 | `notify` | Barks and shows a bubble. Optional `url` (opened on click), `copy` (put on the clipboard), `source` (who sent it), `mood` (`good`: the dog is happy, `bad`: it is sad and howls; guessed from the words when left out). |
-| `ask` · `dismiss` | Shows a question with up to 4 answer buttons and waits for your click; the agent gets the answer. `dismiss` withdraws it. |
+| `ask` · `dismiss` | Shows a question with up to 4 answer buttons and waits for your click; the agent gets the answer. With `allow_text` the bubble also has *Reply…*, to answer in your own words. `dismiss` withdraws it. |
 | `progress` | A progress bar for a long task, updated in place; the dog is happy when it finishes, barks if it fails. |
 | `remind` | Barks later: after some minutes or at a local time. |
 | `add_watch` | Checks something every few seconds and barks when it changes: a `url`, a `port`, a `file` (or text in it), a process (`pid`), a GitHub Actions run (`github`: `owner/repo` or a run URL; set `GITHUB_TOKEN` for private repos), or a shell `command`. |
 | `react` | Happy, sad, bark, fetch (throws the bone), sleep, wake or zoomies. |
 | `copy` | Puts text on the clipboard and says so. |
 | `status` · `history` | What the dog is doing, how long you have been idle, and what you may have missed. |
+| `session` · `sessions` | An agent says what its session is doing (working, waiting, done, failed); you follow them all in **Agents**. `notify`, `ask` and `progress` take a `session` too. |
 | `check_now` · `list_watches` · `remove_watch` | Manage watches and reminders. |
 | `todo_lists` · `todo_create_list` · `todo_add` · `todo_update` · `todo_remove` | Todo lists the dog keeps for you: a list per piece of work, items to check off, and a reminder per item (the dog barks it unless it is done by then). |
 
@@ -111,6 +122,37 @@ does not bark and only shows questions, progress and sticky messages; the rest g
 
 > [!WARNING]
 > Watches can run shell commands on your computer. Only connect clients you trust.
+
+## Agents
+
+Settings → **Agents** lists every agent session the dog knows about: what it works on, what it is
+doing now, and how long for. Waiting ones come first (with a red count on the tab). The OpenCode
+plugin and the Claude Code / Codex hooks report sessions by themselves; other agents use the MCP
+`session` tool. Finished ones go after half an hour, or with *Clear done*.
+
+## On your phone
+
+Settings → **Phone** sends notifications to your phone while you are away (idle for 5 minutes or
+the screen is locked), always, or never. Questions keep their buttons there, so you can allow a
+command from the couch. Nothing listens on a port: Dost only makes outgoing HTTPS requests.
+
+- **ntfy**: turn it on and a random topic is made. Subscribe to it in the
+  [ntfy app](https://ntfy.sh) (*Copy link*). Works with ntfy.sh or your own server (with an access
+  token if it is protected). Anyone who knows the topic can read and answer, so keep it secret.
+- **Telegram**: make a bot with [@BotFather](https://t.me/BotFather), paste its token and send
+  `/start` to the bot: the dog pairs with that chat. Answer with the buttons, or reply to a question
+  in your own words when the agent allows it.
+
+*Send a test* checks the setup.
+
+## Special days
+
+On by default; settings → General → *Special days* turns them off.
+
+- **10 November**: the dog wears a black ribbon all day in memory of Atatürk. At **09:05** it stops,
+  sits still and stays silent for a minute (no barking, notifications wait), then a quiet bubble
+  remembers him. *Siren at 09:05* adds the siren (off by default).
+- **23 April, 19 May, 30 August, 29 October**: a little Turkish flag on the collar and a greeting.
 
 ## Make it yours
 
@@ -140,12 +182,17 @@ a short "wuf?" for questions.
 
 ## Settings
 
+Click the tray (menu bar) icon for the quick panel; its ⚙ (or *All settings…* in the right-click
+menu) opens the **settings window**, with a sidebar of pages: General (language, which screen the
+dog lives on, special days), Dog, Look, Play, Sound, Phone, Agents, Todo, History and Connect.
+The app speaks English and Turkish (*Language*: the system's, or either one).
+
 Click the tray (menu bar) icon for settings. Everything in `settings.json` can be changed there:
 size and text, the dog's name, birthday and look, source colours, the toy (**Play**), walking and
 the offset (on **Dog**), sounds, quiet hours and your own bark files, the MCP address and which web pages may use
 it, start at login and updates. Long tabs scroll; fields save on Enter or when you click elsewhere
 (Esc cancels), and paste works in them. Settings are saved to `%APPDATA%\dost\settings.json`
-(Windows) or `~/.config/dost/settings.json` (macOS); edits to the file show up in the panel too.
+(Windows) or `~/.config/dost/settings.json` (macOS, Linux); edits to the file show up in the panel too.
 
 **Hide** sends the dog off the right edge of the screen. While it is away, questions, progress and
 sticky messages still pop up in a bubble next to the tray icon; other notifications bark, go to
@@ -157,7 +204,7 @@ to wake it up.
 
 Hidden and asleep are remembered: the dog starts the same way next time, and so is *History*.
 
-**Keyboard**: while a bubble is up, <kbd>⌥⌘↩</kbd> (Windows: <kbd>Ctrl+Alt+Enter</kbd>) picks the
+**Keyboard**: while a bubble is up, <kbd>⌥⌘↩</kbd> (Windows, Linux: <kbd>Ctrl+Alt+Enter</kbd>) picks the
 first answer or closes it, <kbd>⌥⌘1</kbd>–<kbd>4</kbd> pick an answer, <kbd>⌥⌘⌫</kbd> the last one
 ("no"), and <kbd>⌥⌘L</kbd> means *Later*: the bubble comes back in 10 minutes (also a link in the
 bubble).
@@ -173,7 +220,7 @@ version at the bottom of the settings to check now. See [packaging/README.md](pa
 Requires [Rust](https://rustup.rs) 1.88+.
 
 ```sh
-cargo build --release   # Windows or macOS
+cargo build --release   # Windows, macOS or Linux
 make app                # macOS app bundle
 make build-windows      # Windows from WSL/Linux (needs cargo-xwin)
 ```

@@ -1,7 +1,9 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 mod hotkeys;
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(windows)]
 mod win;
 
@@ -29,7 +31,14 @@ fn start() {
     mac::run();
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
 fn start() {
-    eprintln!("Dost runs on Windows and macOS. To preview the art: cargo run --example preview");
+    linux::run();
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+fn start() {
+    eprintln!(
+        "Dost runs on Windows, macOS and Linux. To preview the art: cargo run --example preview"
+    );
 }

@@ -407,6 +407,15 @@ impl Dog {
         }
     }
 
+    /// Stops what it is doing and sits still (the minute of silence); `hold` keeps it there.
+    pub fn stand_still(&mut self) {
+        self.zoomies = 0;
+        self.drop_toy();
+        if !self.is_busy() {
+            self.set(Activity::Sit, 1.0);
+        }
+    }
+
     /// Something failed: the dog sits and looks sad for a while.
     pub fn sad(&mut self) {
         if self.is_busy() || self.forced_sleep || self.is_performing() {

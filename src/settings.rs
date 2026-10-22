@@ -91,6 +91,36 @@ pub struct Settings {
     pub event_sounds: bool,
     /// The bone lies next to the dog (to throw, and now and then it plays with it).
     pub toy: bool,
+    /// Language of the panel, the settings window and the dog's own bubbles.
+    pub language: Lang,
+    /// Special days: commemorations (10 November, 09:05) and national holidays.
+    pub special_days: bool,
+    /// The siren at a commemoration's minute of silence.
+    pub siren: bool,
+    /// Which screen the dog lives on: 0 wherever it is put, 1 the main screen, n the
+    /// screen n-1 (in the order the system lists them).
+    pub screen: u32,
+    /// Notifications on the phone (ntfy, Telegram).
+    pub phone: crate::remote::PhoneSettings,
+}
+
+/// The language of the app's own text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Lang {
+    /// The system's language (Turkish when it is Turkish, otherwise English).
+    #[default]
+    Auto,
+    En,
+    Tr,
+}
+
+impl Lang {
+    pub const ALL: [(Lang, &str); 3] = [
+        (Lang::Auto, "System"),
+        (Lang::En, "English"),
+        (Lang::Tr, "Türkçe"),
+    ];
 }
 
 impl Default for Settings {
@@ -128,6 +158,11 @@ impl Default for Settings {
             bark_files: Vec::new(),
             event_sounds: true,
             toy: true,
+            language: Lang::Auto,
+            special_days: true,
+            siren: false,
+            screen: 0,
+            phone: Default::default(),
         }
     }
 }
@@ -168,6 +203,15 @@ impl Settings {
         if !self.birthday.is_empty() && crate::look::parse_date(&self.birthday).is_none() {
             self.birthday.clear();
         }
+        self.screen = self.screen.min(16);
+        let p = &mut self.phone;
+        p.ntfy.server = p.ntfy.server.trim().trim_end_matches('/').to_string();
+        if p.ntfy.server.is_empty() {
+            p.ntfy.server = d.phone.ntfy.server;
+        }
+        p.ntfy.topic = p.ntfy.topic.trim().to_string();
+        p.telegram.token = p.telegram.token.trim().to_string();
+        p.telegram.chat_id = p.telegram.chat_id.trim().to_string();
         self
     }
 

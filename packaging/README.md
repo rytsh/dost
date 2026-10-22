@@ -22,6 +22,12 @@ Add them in GitHub → Settings → Secrets and variables → Actions:
 
 ### macOS: Developer ID + notarization
 
+With these secrets CI signs `Dost.app` with the hardened runtime and `packaging/macos/Dost.entitlements`,
+notarizes the dmg with `notarytool`, staples the ticket to the dmg and the app and checks the result
+with `spctl`. Gatekeeper then opens Dost without the "unidentified developer" warning. Locally the
+same is `make notarize SIGN_ID="Developer ID Application: …"` after
+`xcrun notarytool store-credentials dost --apple-id … --team-id …`.
+
 | Secret | Value |
 | --- | --- |
 | `MACOS_CERT_P12` | `base64 -i DeveloperID.p12` (the *Developer ID Application* certificate with its key) |

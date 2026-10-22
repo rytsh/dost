@@ -60,6 +60,14 @@ pub struct Notification {
     pub not_before: Option<Instant>,
     /// Good or bad news: how the dog reacts (and sounds).
     pub mood: Mood,
+    /// A question that may also be answered with typed text ("Reply…").
+    pub allow_text: bool,
+    /// From the app itself (hello, updates): never sent to the phone.
+    pub local: bool,
+    /// Shown without a bark or a reaction (the remembrance bubble).
+    pub silent: bool,
+    /// The agent session it belongs to (see [`crate::sessions`]).
+    pub session: Option<String>,
 }
 
 /// How a notification feels to the dog.
@@ -127,7 +135,17 @@ impl Notification {
             key: None,
             not_before: None,
             mood: Mood::Neutral,
+            allow_text: false,
+            local: false,
+            silent: false,
+            session: None,
         }
+    }
+
+    /// From the app itself: stays on this computer.
+    pub fn local(mut self) -> Self {
+        self.local = true;
+        self
     }
 
     /// Sets the mood, or guesses it from the text when `None`.
@@ -228,6 +246,8 @@ pub enum Event {
     Dismiss(String),
     /// Something the settings panel shows changed (the todo lists).
     PanelChanged,
+    /// Something came back from the phone.
+    Remote(crate::remote::RemoteEvent),
 }
 
 impl Event {
@@ -258,6 +278,20 @@ impl Notifier {
 
     pub fn panel_changed(&self) -> bool {
         self.0.send(Event::PanelChanged).is_ok()
+    }
+
+    /// A sender for the phone channels' events.
+    pub fn remote_sender(&self) -> Sender<crate::remote::RemoteEvent> {
+        let (tx, rx) = mpsc::channel();
+        let me = self.0.clone();
+        std::thread::spawn(move || {
+            for ev in rx {
+                if me.send(Event::Remote(ev)).is_err() {
+                    return;
+                }
+            }
+        });
+        tx
     }
 }
 

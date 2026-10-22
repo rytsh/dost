@@ -209,6 +209,131 @@ fn main() {
         }
     }
 
+    // The settings window, in English and Turkish, on a few pages.
+    {
+        use dost::panel::{Page, Panel, WINDOW_SIZE};
+        use dost::sessions::{Session, State};
+        let sessions = vec![
+            Session {
+                id: "1".into(),
+                source: "OpenCode".into(),
+                title: "Refactor auth".into(),
+                project: "api".into(),
+                state: State::Waiting,
+                detail: "Permission: bash · npm test".into(),
+                since: dost::watch::now_unix() - 300,
+                updated: dost::watch::now_unix(),
+                ..Default::default()
+            },
+            Session {
+                id: "2".into(),
+                source: "Claude Code".into(),
+                title: "Fix flaky test".into(),
+                project: "web".into(),
+                state: State::Working,
+                detail: "edit · 12 steps".into(),
+                since: dost::watch::now_unix() - 1260,
+                updated: dost::watch::now_unix(),
+                ..Default::default()
+            },
+            Session {
+                id: "3".into(),
+                source: "Codex".into(),
+                title: "Release notes".into(),
+                state: State::Done,
+                detail: "Finished in 4 min, your turn.".into(),
+                since: dost::watch::now_unix() - 240,
+                updated: dost::watch::now_unix(),
+                ..Default::default()
+            },
+        ];
+        for (lang, page, name) in [
+            (dost::settings::Lang::En, Page::General, "window-general"),
+            (dost::settings::Lang::Tr, Page::General, "window-general-tr"),
+            (dost::settings::Lang::Tr, Page::Phone, "window-phone-tr"),
+            (dost::settings::Lang::En, Page::Agents, "window-agents"),
+            (dost::settings::Lang::Tr, Page::Dog, "window-dog-tr"),
+            (dost::settings::Lang::En, Page::Look, "window-look"),
+        ] {
+            dost::i18n::set(lang);
+            let scale = 2.0;
+            let mut panel = Panel::new_window(scale);
+            panel.set_page(page);
+            let mut settings = dost::settings::Settings {
+                name: "Karabaş".into(),
+                language: lang,
+                ..Default::default()
+            };
+            settings.phone.ntfy.enabled = true;
+            settings.phone.ntfy.topic = "dost-k3x9q2m8w1p4z7r5".into();
+            settings.phone.telegram.enabled = true;
+            settings.phone.telegram.token = "123:abc".into();
+            let view = dost::panel::View {
+                settings,
+                age: "2 years".into(),
+                visible: true,
+                mcp_ok: true,
+                mcp_status: "http://127.0.0.1:7777/mcp".into(),
+                version: env!("CARGO_PKG_VERSION"),
+                autostart_label: "Open at login",
+                history: history.clone(),
+                todos: todo_lists(),
+                sessions: sessions.clone(),
+                screens: 2,
+                special: Some(dost::special::Day::Remembrance),
+                ..Default::default()
+            };
+            let (w, h) = (
+                (WINDOW_SIZE.0 * scale) as u32,
+                (WINDOW_SIZE.1 * scale) as u32,
+            );
+            let mut pm = Pixmap::new(w, h).unwrap();
+            panel.draw(&mut pm, &mut r, &view);
+            pm.save_png(out.replace(".png", &format!("-{name}.png")))
+                .unwrap();
+        }
+        dost::i18n::set(dost::settings::Lang::En);
+    }
+
+    // Special days: the ribbon (10 November) and the flag (national holidays), in a few poses.
+    {
+        let s = Scale::new(1.0, 300);
+        let poses = [
+            (Anim::Idle, 0, 1.0),
+            (Anim::Sit, 0, 1.0),
+            (Anim::Walk, 2, -1.0),
+            (Anim::Sleep, 0, 1.0),
+        ];
+        let (cw, ch) = ((CELL.0 * s.px) as i32, (CELL.1 * s.px) as i32);
+        let mut sheet = Pixmap::new((cw * poses.len() as i32) as u32, (ch * 2) as u32).unwrap();
+        sheet.fill(bg);
+        for (row, pin) in [dost::special::Pin::Ribbon, dost::special::Pin::Flag]
+            .into_iter()
+            .enumerate()
+        {
+            r.set_pin(Some(pin));
+            for (i, (anim, f, facing)) in poses.iter().enumerate() {
+                let frame = DogFrame {
+                    facing: *facing,
+                    ..DogFrame::still(*anim, *f)
+                };
+                let (w, h) = r.size(frame.anim, None, s);
+                let mut pm = Pixmap::new(w, h).unwrap();
+                r.draw(&mut pm, w as f32 / 2.0, &frame, None, s);
+                sheet.draw_pixmap(
+                    cw * i as i32 + cw / 2 - w as i32 / 2,
+                    ch * (row as i32 + 1) - h as i32,
+                    pm.as_ref(),
+                    &Default::default(),
+                    Transform::identity(),
+                    None,
+                );
+            }
+        }
+        r.set_pin(None);
+        sheet.save_png(out.replace(".png", "-pins.png")).unwrap();
+    }
+
     // Transparent dog + bubble, for the README screenshot.
     {
         let b = Bubble {

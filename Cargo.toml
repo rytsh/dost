@@ -32,11 +32,18 @@ block2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString", "NSArray", "NSData", "NSURL", "NSTimer", "NSDate", "NSGeometry", "NSRunLoop", "block2"] }
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSWindow", "NSView", "NSControl", "NSButton", "NSMenu", "NSStatusBar", "NSStatusBarButton", "NSStatusItem", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSImageView", "NSImageCell", "NSScreen", "NSEvent", "NSResponder", "NSRunningApplication", "NSGraphics", "NSColor", "NSSound", "NSPasteboard", "NSWorkspace", "block2", "objc2-core-foundation"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13", features = ["randr", "shape", "screensaver"] }
+# Tray icon over D-Bus (StatusNotifierItem), without GTK.
+ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
+global-hotkey = "0.9"
+
 [target.'cfg(windows)'.dependencies]
 tray-icon = "0.26"
 global-hotkey = "0.9"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Graphics_Gdi",
     "Win32_Media_Audio",
     "Win32_System_Console",

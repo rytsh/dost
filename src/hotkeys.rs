@@ -1,4 +1,4 @@
-//! Global keyboard shortcuts for the bubble: ⌥⌘ (macOS) or Ctrl+Alt (Windows) with
+//! Global keyboard shortcuts for the bubble: ⌥⌘ (macOS) or Ctrl+Alt (Windows, Linux) with
 //! Enter, 1-4, Backspace or L. They are only registered while a bubble is shown, so they do
 //! not take these keys away from other apps the rest of the time.
 
@@ -9,7 +9,7 @@ use dost::app::Key;
 
 #[cfg(target_os = "macos")]
 const MODS: Modifiers = Modifiers::ALT.union(Modifiers::META);
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 const MODS: Modifiers = Modifiers::ALT.union(Modifiers::CONTROL);
 
 const KEYS: [(Code, Key); 7] = [

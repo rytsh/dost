@@ -76,6 +76,8 @@ struct Shell {
     menu: Menu,
     items: MenuItems,
     panel: PanelWindow,
+    /// The big settings window (titled, resizable), while open.
+    settings: SettingsWindow,
     hotkeys: crate::hotkeys::Hotkeys,
     /// While hidden: the bubble on its own under the menu bar icon.
     alone: AloneBubble,
@@ -110,6 +112,8 @@ struct AloneBubble {
 struct MenuItems {
     show: MenuItem,
     mute: MenuItem,
+    settings: MenuItem,
+    quit: MenuItem,
 }
 
 thread_local! {
@@ -153,6 +157,7 @@ pub fn run() {
         menu,
         items,
         panel: PanelWindow::default(),
+        settings: SettingsWindow::default(),
         hotkeys: crate::hotkeys::Hotkeys::new(),
         alone: {
             let (window, view) = make_window(mtm, false);
@@ -254,15 +259,17 @@ fn build_menu() -> (Menu, MenuItems) {
     let items = MenuItems {
         show: MenuItem::with_id("show", "Hide", true, None),
         mute: MenuItem::with_id("mute", "Mute", true, None),
+        settings: MenuItem::with_id("settings", "All settings…", true, None),
+        quit: MenuItem::with_id("quit", "Quit Dost", true, None),
     };
     let menu = Menu::new();
     menu.append_items(&[
-        &MenuItem::with_id("panel", "Settings…", true, None),
+        &items.settings,
         &PredefinedMenuItem::separator(),
         &items.show,
         &items.mute,
         &PredefinedMenuItem::separator(),
-        &MenuItem::with_id("quit", "Quit Dost", true, None),
+        &items.quit,
     ])
     .expect("menu");
     (menu, items)
@@ -639,6 +646,31 @@ impl Platform for Shell {
     fn autostart_label(&self) -> &'static str {
         "Open at login"
     }
+
+    fn open_settings_window(&mut self) {
+        self.settings.open(self.mtm);
+    }
+
+    fn open_reply(&mut self, id: u64, title: &str, question: &str) {
+        if !self.panel.is_open() {
+            let anchor = status_anchor(self.mtm, &self.status);
+            let at = anchor.unwrap_or_else(|| mouse_px(self.mtm));
+            self.panel.open(self.mtm, at, anchor.is_some());
+        }
+        if let Some(p) = self.panel.panel.as_mut() {
+            p.start_reply(id, title, question);
+        }
+        self.panel.redraw = true;
+        // Typing goes to the panel.
+        if let Some(w) = self.panel.window.as_ref() {
+            NSApplication::sharedApplication(self.mtm).activate();
+            w.makeKeyAndOrderFront(None);
+        }
+    }
+
+    fn screen_count(&self) -> usize {
+        NSScreen::screens(self.mtm).len()
+    }
 }
 
 impl App {
@@ -670,6 +702,7 @@ impl App {
             self.sync_menu();
         }
         self.paint_panel();
+        self.paint_settings();
         self.shell.panel.animate();
         let open = self.shell.panel.is_open();
         if open != self.shell.status_pressed {
@@ -687,7 +720,14 @@ impl App {
         }
     }
 
+    /// The screen the dog is on, or the one it lives on (settings → Screen).
     fn dog_screen(&self) -> (PxRect, PxRect) {
+        let n = self.core.settings.screen as usize;
+        if n > 0
+            && let Some(s) = screens(self.shell.mtm).get(n - 1)
+        {
+            return *s;
+        }
         screen_at(
             self.shell.mtm,
             self.core.dog.x as f64,
@@ -813,24 +853,70 @@ impl App {
         }
     }
 
+    /// Draws the settings window when something changed (or its size did).
+    fn paint_settings(&mut self) {
+        let w = &mut self.shell.settings;
+        if w.window.as_ref().is_some_and(|win| !win.isVisible()) {
+            // Closed with its close button.
+            w.close();
+            return;
+        }
+        if w.panel.as_ref().is_some_and(Panel::is_editing) {
+            w.redraw = true;
+        }
+        if !w.is_open() || !(w.redraw || w.resized()) {
+            return;
+        }
+        w.redraw = false;
+        let view = self.core.panel_view(&self.shell);
+        self.shell.settings.paint(&mut self.core.renderer, &view);
+    }
+
+    /// A key for the settings window's text fields.
+    fn settings_key(&mut self, key: panel::Key) {
+        let view = self.core.panel_view(&self.shell);
+        let Some(p) = self.shell.settings.panel.as_mut() else {
+            return;
+        };
+        let (redraw, action) = p.key(key, &view);
+        self.shell.settings.redraw |= redraw;
+        if let Some(a) = action {
+            self.on_settings_action(a);
+        }
+    }
+
+    /// An action from the settings window: Close closes it; the rest as from the panel.
+    fn on_settings_action(&mut self, action: panel::Action) {
+        match action {
+            panel::Action::Close => self.shell.settings.close(),
+            panel::Action::OpenSettings => {}
+            a => self.on_action(a),
+        }
+        self.shell.settings.redraw = true;
+    }
+
     fn sync_menu(&mut self) {
+        use dost::i18n::t;
         let i = &self.shell.items;
         i.show
-            .set_text(if self.core.visible { "Hide" } else { "Show" });
-        i.mute.set_text(if self.core.settings.sound {
-            "Mute"
-        } else {
-            "Unmute"
+            .set_text(t(if self.core.visible { "Hide" } else { "Show" }));
+        let tr = dost::i18n::is_turkish();
+        i.mute.set_text(match (self.core.settings.sound, tr) {
+            (true, false) => "Mute",
+            (false, false) => "Unmute",
+            (true, true) => "Sesi kapat",
+            (false, true) => "Sesi aç",
         });
+        i.settings.set_text(t("All settings…"));
+        i.quit
+            .set_text(if tr { "Dost'tan çık" } else { "Quit Dost" });
         self.shell.panel.redraw = true;
+        self.shell.settings.redraw = true;
     }
 
     fn on_menu(&mut self, id: &str) {
         match id {
-            "panel" => {
-                let anchor = status_anchor(self.shell.mtm, &self.shell.status);
-                self.toggle_panel(anchor);
-            }
+            "settings" => self.shell.settings.open(self.shell.mtm),
             "show" => self.on_action(panel::Action::ToggleVisible),
             "mute" => self.core.toggle_mute(&mut self.shell),
             "quit" => self.on_action(panel::Action::Quit),
@@ -1027,6 +1113,16 @@ impl App {
                 _ => false,
             };
         }
+        let on_settings = window.is_some_and(|w| {
+            self.shell
+                .settings
+                .window
+                .as_deref()
+                .is_some_and(|p| std::ptr::eq(w, p))
+        });
+        if on_settings {
+            return self.settings_mouse(kind, scroll);
+        }
         let on_panel = window.is_some_and(|w| {
             self.shell
                 .panel
@@ -1130,6 +1226,61 @@ impl App {
         false
     }
 
+    /// Mouse events on the settings window. Returns true if consumed (clicks in the title
+    /// bar go on to AppKit, so the window can be moved and closed).
+    fn settings_mouse(&mut self, kind: NSEventType, scroll: f64) -> bool {
+        let Some((x, y)) = self.shell.settings.mouse() else {
+            return false;
+        };
+        let inside = self.shell.settings.contains(x, y);
+        let sw = &mut self.shell.settings;
+        let Some(panel) = sw.panel.as_mut() else {
+            return false;
+        };
+        match kind {
+            NSEventType::MouseMoved | NSEventType::LeftMouseDragged => {
+                let (redraw, action) = if inside {
+                    panel.pointer_move(x, y, &self.core.settings)
+                } else {
+                    (panel.pointer_leave(), None)
+                };
+                sw.redraw |= redraw;
+                if let Some(a) = action {
+                    self.on_settings_action(a);
+                }
+                false
+            }
+            NSEventType::LeftMouseDown if inside => {
+                let action = panel.pointer_down(x, y);
+                sw.redraw = true;
+                if let Some(a) = action {
+                    self.on_settings_action(a);
+                }
+                false
+            }
+            NSEventType::LeftMouseUp => {
+                let view = self.core.panel_view(&self.shell);
+                let action = self
+                    .shell
+                    .settings
+                    .panel
+                    .as_mut()
+                    .and_then(|p| p.pointer_up(x, y, &view));
+                self.shell.settings.redraw = true;
+                if let Some(a) = action {
+                    self.on_settings_action(a);
+                }
+                false
+            }
+            NSEventType::ScrollWheel if inside => {
+                panel.scroll_by(scroll as f32 / 3.0, 0);
+                sw.redraw = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// While dragging, follow the mouse (events may arrive outside our window).
     fn drag_update(&mut self) {
         let mtm = self.shell.mtm;
@@ -1181,6 +1332,44 @@ fn install_mouse_monitor() {
             let code = ev.keyCode();
             let text = ev.characters().map(|s| s.to_string()).unwrap_or_default();
             let handled = with_app(|a| {
+                let to_settings = window.as_deref().is_some_and(|w| {
+                    a.shell
+                        .settings
+                        .window
+                        .as_deref()
+                        .is_some_and(|s| std::ptr::eq(w, s))
+                });
+                if to_settings {
+                    let cmd = ev
+                        .modifierFlags()
+                        .contains(objc2_app_kit::NSEventModifierFlags::Command);
+                    let editing = a
+                        .shell
+                        .settings
+                        .panel
+                        .as_ref()
+                        .is_some_and(Panel::is_editing);
+                    let key = match code {
+                        // ⌘W closes the window.
+                        13 if cmd => {
+                            a.shell.settings.close();
+                            return true;
+                        }
+                        _ if !editing => return false,
+                        53 => panel::Key::Escape,
+                        36 | 76 => panel::Key::Enter,
+                        51 => panel::Key::Backspace,
+                        9 if cmd => {
+                            let pb = NSPasteboard::generalPasteboard();
+                            let s = pb.stringForType(unsafe { NSPasteboardTypeString });
+                            panel::Key::Text(s.map(|s| s.to_string()).unwrap_or_default())
+                        }
+                        _ if cmd => return false,
+                        _ => panel::Key::Text(text.clone()),
+                    };
+                    a.settings_key(key);
+                    return true;
+                }
                 if !a.shell.panel.panel.as_ref().is_some_and(Panel::is_editing) {
                     if code == 53 {
                         a.close_panel();
@@ -1346,6 +1535,153 @@ impl PanelWindow {
         w.setAlphaValue(1.0 - (1.0 - p).powi(3));
         if p >= 1.0 {
             self.opened = None;
+        }
+    }
+}
+
+/// The big settings window: titled, closable, resizable, showing [`Panel::new_window`].
+/// While it is open the app shows in the Dock and the app switcher, like a preferences
+/// window; it goes back to a menu bar app when it closes.
+#[derive(Default)]
+struct SettingsWindow {
+    window: Option<Retained<NSWindow>>,
+    view: Option<Retained<NSImageView>>,
+    panel: Option<Panel>,
+    pixmap: Option<Pixmap>,
+    redraw: bool,
+}
+
+impl SettingsWindow {
+    fn is_open(&self) -> bool {
+        self.window.is_some()
+    }
+
+    fn open(&mut self, mtm: MainThreadMarker) {
+        let app = NSApplication::sharedApplication(mtm);
+        if let Some(w) = &self.window {
+            if w.isMiniaturized() {
+                w.deminiaturize(None);
+            }
+            app.activate();
+            w.makeKeyAndOrderFront(None);
+            return;
+        }
+        let (pw, ph) = panel::WINDOW_SIZE;
+        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(pw as f64, ph as f64));
+        let style = NSWindowStyleMask::Titled
+            | NSWindowStyleMask::Closable
+            | NSWindowStyleMask::Miniaturizable
+            | NSWindowStyleMask::Resizable;
+        let window = unsafe {
+            NSWindow::initWithContentRect_styleMask_backing_defer(
+                NSWindow::alloc(mtm),
+                frame,
+                style,
+                NSBackingStoreType::Buffered,
+                false,
+            )
+        };
+        unsafe { window.setReleasedWhenClosed(false) };
+        let title = if dost::i18n::is_turkish() {
+            "Dost Ayarları"
+        } else {
+            "Dost Settings"
+        };
+        window.setTitle(&NSString::from_str(title));
+        window.setContentMinSize(NSSize::new(640.0, 460.0));
+        window.setAcceptsMouseMovedEvents(true);
+        // Centred the first time; after that where the user left it.
+        window.center();
+        window.setFrameAutosaveName(&NSString::from_str("DostSettings"));
+        let view = NSImageView::initWithFrame(NSImageView::alloc(mtm), frame);
+        view.setImageScaling(NSImageScaling::ScaleAxesIndependently);
+        window.setContentView(Some(&view));
+        app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+        app.activate();
+        window.makeKeyAndOrderFront(None);
+        let k = window.backingScaleFactor() as f32;
+        self.panel = Some(Panel::new_window(k));
+        self.window = Some(window);
+        self.view = Some(view);
+        self.pixmap = None;
+        self.redraw = true;
+    }
+
+    fn close(&mut self) {
+        if let Some(w) = self.window.take() {
+            w.orderOut(None);
+            w.close();
+            if let Some(mtm) = MainThreadMarker::new() {
+                NSApplication::sharedApplication(mtm)
+                    .setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+            }
+        }
+        self.view = None;
+        self.panel = None;
+        self.pixmap = None;
+    }
+
+    /// The content's size in physical pixels and the backing scale.
+    fn content_px(&self) -> Option<(u32, u32, f64)> {
+        let w = self.window.as_ref()?;
+        let k = w.backingScaleFactor();
+        let r = w.contentRectForFrameRect(w.frame());
+        Some((
+            (r.size.width * k).round().max(1.0) as u32,
+            (r.size.height * k).round().max(1.0) as u32,
+            k,
+        ))
+    }
+
+    /// The window was resized (or moved to a screen with another scale) since the last draw.
+    fn resized(&self) -> bool {
+        match (self.content_px(), &self.pixmap) {
+            (Some((w, h, _)), Some(pm)) => pm.width() != w || pm.height() != h,
+            (Some(_), None) => true,
+            _ => false,
+        }
+    }
+
+    /// The mouse relative to the content's top-left, physical pixels.
+    fn mouse(&self) -> Option<(f32, f32)> {
+        let w = self.window.as_ref()?;
+        let k = w.backingScaleFactor();
+        let r = w.contentRectForFrameRect(w.frame());
+        let m = NSEvent::mouseLocation();
+        Some((
+            ((m.x - r.origin.x) * k) as f32,
+            ((r.origin.y + r.size.height - m.y) * k) as f32,
+        ))
+    }
+
+    fn contains(&self, x: f32, y: f32) -> bool {
+        self.pixmap.as_ref().is_some_and(|pm| {
+            x >= 0.0 && y >= 0.0 && x < pm.width() as f32 && y < pm.height() as f32
+        })
+    }
+
+    fn paint(&mut self, r: &mut Renderer, view: &panel::View) {
+        let Some((w, h, k)) = self.content_px() else {
+            return;
+        };
+        if self
+            .pixmap
+            .as_ref()
+            .is_none_or(|pm| pm.width() != w || pm.height() != h)
+        {
+            self.pixmap = Pixmap::new(w, h);
+        }
+        let (Some(v), Some(panel), Some(pm)) = (
+            self.view.as_ref(),
+            self.panel.as_mut(),
+            self.pixmap.as_mut(),
+        ) else {
+            return;
+        };
+        panel.set_ui_scale(k as f32);
+        panel.draw(pm, r, view);
+        if let Some(image) = to_image(pm, NSSize::new(w as f64 / k, h as f64 / k)) {
+            v.setImage(Some(&image));
         }
     }
 }

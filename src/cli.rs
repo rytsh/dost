@@ -37,10 +37,14 @@ Claude Code (~/.claude/settings.json):
     "hooks": {
       "PermissionRequest": [{ "hooks": [{ "type": "command", "command": "dost hook claude", "timeout": 600 }] }],
       "Notification":      [{ "matcher": "idle_prompt|elicitation_dialog", "hooks": [{ "type": "command", "command": "dost hook claude" }] }],
-      "Stop":              [{ "hooks": [{ "type": "command", "command": "dost hook claude" }] }]
+      "Stop":              [{ "hooks": [{ "type": "command", "command": "dost hook claude" }] }],
+      "UserPromptSubmit":  [{ "hooks": [{ "type": "command", "command": "dost hook claude" }] }],
+      "SessionEnd":        [{ "hooks": [{ "type": "command", "command": "dost hook claude" }] }]
     }
   }
   PermissionRequest shows Allow / Always / Deny buttons and answers Claude with the click.
+  The session shows in the dog's Agents list (UserPromptSubmit: working, Stop: your turn,
+  SessionEnd: removed).
 
 Codex (~/.codex/config.toml):
   notify = ["dost", "hook", "codex"]
@@ -407,6 +411,26 @@ fn hook(url: &str, source: &str, ev: &Value) -> Result<Option<String>, String> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
+    // Codex calls it thread-id; without one there is no session to show.
+    let sid = [s("session_id"), s("thread-id"), s("thread_id")]
+        .into_iter()
+        .find(|v| !v.is_empty())
+        .map(|v| format!("{source}:{v}"));
+    // Reports the session's state to the Agents list; a failure here never stops the hook.
+    let session = |state: &str, detail: &str| {
+        if let Some(id) = &sid {
+            let mut a = json!({ "id": id, "source": source, "project": project });
+            if state == "end" {
+                a["end"] = json!(true);
+            } else {
+                a["state"] = json!(state);
+            }
+            if !detail.is_empty() {
+                a["detail"] = json!(short(detail));
+            }
+            let _ = call(url, "session", a, SHORT);
+        }
+    };
     let in_project = |t: &str| {
         if project.is_empty() {
             t.to_string()
@@ -436,7 +460,7 @@ fn hook(url: &str, source: &str, ev: &Value) -> Result<Option<String>, String> {
             } else {
                 &["Allow", "Always", "Deny"]
             };
-            let a = json!({
+            let mut a = json!({
                 "title": in_project(&format!("Permission: {tool}")),
                 "question": what,
                 "choices": choices,
@@ -444,6 +468,10 @@ fn hook(url: &str, source: &str, ev: &Value) -> Result<Option<String>, String> {
                 "source": source,
                 "key": key,
             });
+            if let Some(id) = &sid {
+                session("waiting", &format!("Permission: {tool} · {what}"));
+                a["session"] = json!(id);
+            }
             let answer = match call(url, "ask", a, Duration::from_secs(HOOK_ASK_SECS + 10)) {
                 Ok(t) => t.strip_prefix("The user answered: ").map(String::from),
                 // No answer: leave it to the agent's own prompt.
@@ -462,6 +490,7 @@ fn hook(url: &str, source: &str, ev: &Value) -> Result<Option<String>, String> {
                 _ if !s("title").is_empty() => s("title").to_string(),
                 _ => "Needs your attention".to_string(),
             };
+            session("waiting", s("message"));
             let a = json!({
                 "title": in_project(&title),
                 "message": short(s("message")),
@@ -469,6 +498,10 @@ fn hook(url: &str, source: &str, ev: &Value) -> Result<Option<String>, String> {
                 "source": source,
             });
             call(url, "notify", a, SHORT).map(|_| None)
+        }
+        "UserPromptSubmit" => {
+            session("working", s("prompt"));
+            Ok(None)
         }
         "Stop" | "agent-turn-complete" => {
             if ev
@@ -483,6 +516,7 @@ fn hook(url: &str, source: &str, ev: &Value) -> Result<Option<String>, String> {
                 .or_else(|| ev.get("last-assistant-message"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
+            session("waiting", last);
             let a = json!({
                 "title": in_project("Your turn"),
                 "message": short(last),
@@ -494,7 +528,11 @@ fn hook(url: &str, source: &str, ev: &Value) -> Result<Option<String>, String> {
             Ok((source == "Codex" && event == "Stop").then(|| "{}".to_string()))
         }
         "SubagentStop" => Ok(None),
-        "SessionEnd" | "SessionStart" => Ok(None),
+        "SessionEnd" => {
+            session("end", "");
+            Ok(None)
+        }
+        "SessionStart" => Ok(None),
         _ => Ok(None),
     }
 }

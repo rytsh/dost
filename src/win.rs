@@ -55,6 +55,8 @@ struct Shell {
     menu: Menu,
     items: MenuItems,
     panel: PanelWindow,
+    /// The big settings window (a normal, resizable top-level window).
+    settings: PanelWindow,
     hotkeys: crate::hotkeys::Hotkeys,
     /// While hidden: the bubble on its own above the tray icon.
     alone: AloneBubble,
@@ -130,6 +132,7 @@ pub fn run() {
         menu,
         items,
         panel: PanelWindow::default(),
+        settings: PanelWindow::default(),
         hotkeys: crate::hotkeys::Hotkeys::new(),
         alone: AloneBubble {
             hwnd: unsafe { create_window() },
@@ -302,6 +305,65 @@ impl Platform for Shell {
     fn autostart_label(&self) -> &'static str {
         "Start with Windows"
     }
+
+    fn open_settings_window(&mut self) {
+        if let Some(hwnd) = self.settings.hwnd {
+            unsafe {
+                if IsIconic(hwnd) != 0 {
+                    ShowWindow(hwnd, SW_RESTORE);
+                }
+                SetForegroundWindow(hwnd);
+            }
+            return;
+        }
+        self.settings.open_window();
+    }
+
+    fn open_reply(&mut self, id: u64, title: &str, question: &str) {
+        if !self.panel.is_open() {
+            let anchor = self
+                .tray_anchor()
+                .or(self.alone.anchor)
+                .unwrap_or_else(cursor_pos);
+            self.panel.open(anchor);
+        }
+        let Some(hwnd) = self.panel.hwnd else {
+            return;
+        };
+        if let Some(p) = self.panel.panel.as_mut() {
+            p.start_reply(id, title, question);
+        }
+        self.panel.redraw = true;
+        unsafe { SetForegroundWindow(hwnd) };
+    }
+
+    fn screen_count(&self) -> usize {
+        monitors().len().max(1)
+    }
+}
+
+/// Which panel window: the popover above the tray icon or the big settings window.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Which {
+    Popover,
+    Settings,
+}
+
+impl Shell {
+    fn surface(&mut self, which: Which) -> &mut PanelWindow {
+        match which {
+            Which::Popover => &mut self.panel,
+            Which::Settings => &mut self.settings,
+        }
+    }
+
+    /// The tray icon's top-centre.
+    fn tray_anchor(&self) -> Option<POINT> {
+        self.tray.rect().map(|r| POINT {
+            x: (r.position.x + r.size.width as f64 / 2.0) as i32,
+            y: r.position.y as i32,
+        })
+    }
 }
 
 impl App {
@@ -346,7 +408,8 @@ impl App {
             self.core.panel_dirty = false;
             self.sync_menu();
         }
-        self.paint_panel();
+        self.paint_panel(Which::Popover);
+        self.paint_panel(Which::Settings);
         let state = (self.core.dog.is_sleeping(), self.core.missed > 0);
         if state != self.shell.tray_icon {
             self.shell.tray_icon = state;
@@ -376,10 +439,7 @@ impl App {
     }
 
     fn bounds(&self) -> Bounds {
-        let pt = self.dog_point();
-        let work = work_area(pt);
-        let mon = monitor_rect(pt);
-        let ui = monitor_scale(pt);
+        let (work, mon, ui) = self.dog_screen();
         let px = Scale::new(ui, self.core.settings.size).px as f32;
         Bounds {
             ground: app::ground_line(
@@ -394,6 +454,21 @@ impl App {
             right: work.right as f32 - EDGE * px,
             scale: px,
         }
+    }
+
+    /// Work area, monitor rect and UI scale of the screen the dog lives on (settings →
+    /// Screen: 1 is the primary one), or else of the one it is on.
+    fn dog_screen(&self) -> (RECT, RECT, f32) {
+        let n = self.core.settings.screen as usize;
+        if n > 0
+            && let Some(&mon) = monitors().get(n - 1)
+        {
+            let mi = hmonitor_info(mon);
+            return (mi.rcWork, mi.rcMonitor, hmonitor_scale(mon));
+        }
+        let pt = self.dog_point();
+        let mi = monitor_info(pt);
+        (mi.rcWork, mi.rcMonitor, monitor_scale(pt))
     }
 
     fn dog_point(&self) -> POINT {
@@ -512,12 +587,7 @@ impl App {
         }
         let anchor = self
             .shell
-            .tray
-            .rect()
-            .map(|r| POINT {
-                x: (r.position.x + r.size.width as f64 / 2.0) as i32,
-                y: r.position.y as i32,
-            })
+            .tray_anchor()
             .or(self.shell.alone.anchor)
             .unwrap_or_else(|| {
                 let w = work_area(POINT { x: 0, y: 0 });
@@ -584,6 +654,7 @@ impl App {
             "Unmute"
         });
         self.shell.panel.redraw = true;
+        self.shell.settings.redraw = true;
     }
 
     fn on_menu(&mut self, id: &str) {
@@ -629,48 +700,56 @@ impl App {
         }
     }
 
-    fn paint_panel(&mut self) {
-        // The caret blinks while the name is edited.
-        if self
-            .shell
-            .panel
-            .panel
-            .as_ref()
-            .is_some_and(Panel::is_editing)
-        {
-            self.shell.panel.redraw = true;
+    fn paint_panel(&mut self, which: Which) {
+        let w = self.shell.surface(which);
+        // The caret blinks while a field is edited.
+        if w.panel.as_ref().is_some_and(Panel::is_editing) {
+            w.redraw = true;
         }
-        if !self.shell.panel.is_open() || !self.shell.panel.redraw {
+        if !w.is_open() || !w.redraw {
             return;
         }
-        self.shell.panel.redraw = false;
+        w.redraw = false;
         let view = self.core.panel_view(&self.shell);
-        self.shell.panel.paint(&mut self.core.renderer, &view);
+        self.shell
+            .surface(which)
+            .paint(&mut self.core.renderer, &view);
     }
 
-    /// A key for the panel's name field.
-    fn panel_key(&mut self, key: panel::Key) {
+    /// A key for the panel's text field.
+    fn panel_key(&mut self, which: Which, key: panel::Key) {
         let view = self.core.panel_view(&self.shell);
-        let Some(p) = self.shell.panel.panel.as_mut() else {
+        let w = self.shell.surface(which);
+        let Some(p) = w.panel.as_mut() else {
             return;
         };
         let (redraw, action) = p.key(key, &view);
-        self.shell.panel.redraw |= redraw;
+        w.redraw |= redraw;
         if let Some(a) = action {
-            self.on_action(a);
+            self.panel_action(which, a);
         }
     }
 
-    /// Closes the panel; a name being edited is saved.
+    /// An action from one of the panel windows: Close closes the window it came from.
+    fn panel_action(&mut self, which: Which, action: panel::Action) {
+        if which == Which::Settings && action == panel::Action::Close {
+            self.close_window(Which::Settings);
+            return;
+        }
+        self.on_action(action);
+    }
+
+    /// Closes the popover; a name being edited is saved.
     fn close_panel(&mut self) {
+        self.close_window(Which::Popover);
+    }
+
+    /// Closes a panel window; a field being edited is saved.
+    fn close_window(&mut self, which: Which) {
         let view = self.core.panel_view(&self.shell);
-        let action = self
-            .shell
-            .panel
-            .panel
-            .as_mut()
-            .and_then(|p| p.finish_editing(&view));
-        self.shell.panel.close();
+        let w = self.shell.surface(which);
+        let action = w.panel.as_mut().and_then(|p| p.finish_editing(&view));
+        w.close();
         if let Some(a) = action {
             self.on_action(a);
         }
@@ -860,15 +939,7 @@ fn cursor_pos() -> POINT {
 }
 
 fn monitor_info(pt: POINT) -> MONITORINFO {
-    unsafe {
-        let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-        let mut mi = MONITORINFO {
-            cbSize: size_of::<MONITORINFO>() as u32,
-            ..std::mem::zeroed()
-        };
-        GetMonitorInfoW(mon, &mut mi);
-        mi
-    }
+    hmonitor_info(unsafe { MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST) })
 }
 
 /// Work area excluding the taskbar; `bottom` is the taskbar's top edge.
@@ -881,14 +952,54 @@ fn monitor_rect(pt: POINT) -> RECT {
 }
 
 fn monitor_scale(pt: POINT) -> f32 {
-    unsafe {
-        let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-        let (mut dx, mut dy) = (96u32, 96u32);
-        if GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy) != 0 {
-            return 1.0;
-        }
-        dx as f32 / 96.0
+    hmonitor_scale(unsafe { MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST) })
+}
+
+fn hmonitor_scale(mon: HMONITOR) -> f32 {
+    let (mut dx, mut dy) = (96u32, 96u32);
+    if unsafe { GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy) } != 0 {
+        return 1.0;
     }
+    dx as f32 / 96.0
+}
+
+fn hmonitor_info(mon: HMONITOR) -> MONITORINFO {
+    let mut mi = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..unsafe { std::mem::zeroed() }
+    };
+    unsafe { GetMonitorInfoW(mon, &mut mi) };
+    mi
+}
+
+/// The monitors, primary first, then the others in `EnumDisplayMonitors` order.
+fn monitors() -> Vec<HMONITOR> {
+    unsafe extern "system" fn add(
+        mon: HMONITOR,
+        _: HDC,
+        _: *mut RECT,
+        data: LPARAM,
+    ) -> windows_sys::core::BOOL {
+        unsafe { (*(data as *mut Vec<HMONITOR>)).push(mon) };
+        1
+    }
+    let mut all: Vec<HMONITOR> = Vec::new();
+    unsafe {
+        EnumDisplayMonitors(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            Some(add),
+            &mut all as *mut Vec<HMONITOR> as LPARAM,
+        );
+    }
+    if let Some(i) = all
+        .iter()
+        .position(|&m| hmonitor_info(m).dwFlags & MONITORINFOF_PRIMARY != 0)
+    {
+        let primary = all.remove(i);
+        all.insert(0, primary);
+    }
+    all
 }
 
 /// Off-screen DIB for `UpdateLayeredWindow`.
@@ -1161,14 +1272,17 @@ mod sound {
     }
 }
 
-/// Settings panel window: a borderless, per-pixel-alpha popup that shows [`Panel`].
-/// It closes when it loses focus, like a flyout.
+/// A window that shows a [`Panel`]: either the popover (a borderless, per-pixel-alpha popup
+/// above the tray icon that closes when it loses focus, like a flyout) or the big settings
+/// window (a normal, resizable top-level window painted in `WM_PAINT`).
 #[derive(Default)]
 struct PanelWindow {
     hwnd: Option<HWND>,
     panel: Option<Panel>,
     pixmap: Option<Pixmap>,
     dib: Dib,
+    /// The settings window's last frame as BGRA, for `WM_PAINT`.
+    bgra: Vec<u8>,
     pos: POINT,
     redraw: bool,
     tracking: bool,
@@ -1177,8 +1291,14 @@ struct PanelWindow {
 /// `WM_MOUSELEAVE` (winuser.h); windows-sys keeps it in a module we do not otherwise need.
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const PANEL_CLASS: &str = "DostPanelWindow";
+const SETTINGS_CLASS: &str = "DostSettingsWindow";
 /// Gap between the panel and the taskbar / screen edge.
 const PANEL_MARGIN: i32 = 12;
+/// The settings window's smallest client size (logical).
+const SETTINGS_MIN: (f32, f32) = (640.0, 460.0);
+const VK_BACK: WPARAM = 0x08;
+const VK_RETURN: WPARAM = 0x0D;
+const VK_ESCAPE: WPARAM = 0x1B;
 
 impl PanelWindow {
     fn is_open(&self) -> bool {
@@ -1212,12 +1332,80 @@ impl PanelWindow {
         self.tracking = false;
     }
 
+    /// Opens the big settings window, centred on the screen under the cursor.
+    fn open_window(&mut self) {
+        let at = cursor_pos();
+        let ui = monitor_scale(at);
+        let work = work_area(at);
+        let mut panel = Panel::new_window(ui);
+        let (w, h) = panel.size((work.bottom - work.top).max(200) as u32);
+        let dpi = (ui * 96.0).round() as u32;
+        let mut r = RECT {
+            left: 0,
+            top: 0,
+            right: w as i32,
+            bottom: h as i32,
+        };
+        unsafe { AdjustWindowRectExForDpi(&mut r, WS_OVERLAPPEDWINDOW, 0, WS_EX_APPWINDOW, dpi) };
+        let (ww, wh) = (
+            (r.right - r.left).min(work.right - work.left),
+            (r.bottom - r.top).min(work.bottom - work.top),
+        );
+        let x = work.left + (work.right - work.left - ww) / 2;
+        let y = work.top + (work.bottom - work.top - wh) / 2;
+        let hwnd = unsafe { create_settings_window(x, y, ww, wh) };
+        if hwnd.is_null() {
+            return;
+        }
+        let dpi = unsafe { GetDpiForWindow(hwnd) };
+        if dpi > 0 {
+            panel.set_ui_scale(dpi as f32 / 96.0);
+        }
+        self.hwnd = Some(hwnd);
+        self.panel = Some(panel);
+        self.pixmap = None;
+        self.bgra.clear();
+        self.pos = POINT { x: 0, y: 0 };
+        self.tracking = false;
+        unsafe {
+            ShowWindow(hwnd, SW_SHOW);
+            SetForegroundWindow(hwnd);
+        }
+        // `WM_SIZE` came while the app was busy (we are called from inside it): size here.
+        self.fit_client();
+    }
+
+    /// The settings window: makes the pixmap the size of the client area.
+    fn fit_client(&mut self) {
+        let Some(hwnd) = self.hwnd else { return };
+        let mut r = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        unsafe { GetClientRect(hwnd, &mut r) };
+        self.resize(r.right - r.left, r.bottom - r.top);
+    }
+
+    fn resize(&mut self, w: i32, h: i32) {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let (w, h) = (w as u32, h as u32);
+        if self.pixmap.as_ref().map(|p| (p.width(), p.height())) != Some((w, h)) {
+            self.pixmap = Pixmap::new(w, h);
+        }
+        self.redraw = true;
+    }
+
     fn close(&mut self) {
         if let Some(hwnd) = self.hwnd.take() {
             unsafe { DestroyWindow(hwnd) };
         }
         self.panel = None;
         self.pixmap = None;
+        self.bgra = Vec::new();
     }
 
     fn paint(&mut self, r: &mut Renderer, view: &panel::View) {
@@ -1227,9 +1415,58 @@ impl PanelWindow {
             return;
         };
         panel.draw(pm, r, view);
+        if panel.is_window() {
+            // Opaque: premultiplied RGBA is plain RGBA; GDI wants BGRA.
+            self.bgra.clear();
+            self.bgra.reserve(pm.data().len());
+            for s in pm.data().as_chunks::<4>().0 {
+                self.bgra.extend_from_slice(&[s[2], s[1], s[0], 255]);
+            }
+            unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
+            return;
+        }
         unsafe {
             self.dib.present(hwnd, pm, self.pos);
             ShowWindow(hwnd, SW_SHOW);
+        }
+    }
+
+    /// The settings window's `WM_PAINT`: copies the last frame to the window.
+    unsafe fn blit(&self, dc: HDC) {
+        let Some(pm) = self.pixmap.as_ref() else {
+            return;
+        };
+        let (w, h) = (pm.width(), pm.height());
+        if self.bgra.len() != (w * h * 4) as usize {
+            return;
+        }
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w as i32,
+                biHeight: -(h as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB,
+                ..unsafe { std::mem::zeroed() }
+            },
+            ..unsafe { std::mem::zeroed() }
+        };
+        unsafe {
+            SetDIBitsToDevice(
+                dc,
+                0,
+                0,
+                w,
+                h,
+                0,
+                0,
+                0,
+                h,
+                self.bgra.as_ptr().cast(),
+                &bmi,
+                DIB_RGB_COLORS,
+            );
         }
     }
 
@@ -1238,21 +1475,28 @@ impl PanelWindow {
     }
 }
 
-unsafe fn create_panel_window() -> HWND {
-    let class: Vec<u16> = PANEL_CLASS.encode_utf16().chain(Some(0)).collect();
+unsafe fn register_class(name: &[u16], proc: WNDPROC) -> HINSTANCE {
     unsafe {
         let hinstance = GetModuleHandleW(std::ptr::null());
         let wc = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
-            lpfnWndProc: Some(panel_proc),
+            lpfnWndProc: proc,
             hInstance: hinstance,
             hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
             // The paw from dost.exe's resources (build.rs), id 1.
             hIcon: LoadIconW(hinstance, 1 as _),
-            lpszClassName: class.as_ptr(),
+            lpszClassName: name.as_ptr(),
             ..std::mem::zeroed()
         };
         RegisterClassExW(&wc);
+        hinstance
+    }
+}
+
+unsafe fn create_panel_window() -> HWND {
+    let class: Vec<u16> = PANEL_CLASS.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        let hinstance = register_class(&class, Some(panel_proc));
         let hwnd = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
             class.as_ptr(),
@@ -1274,20 +1518,66 @@ unsafe fn create_panel_window() -> HWND {
     }
 }
 
-unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    let pt = || {
-        (
-            (lp & 0xffff) as i16 as f32,
-            ((lp >> 16) & 0xffff) as i16 as f32,
+unsafe fn create_settings_window(x: i32, y: i32, w: i32, h: i32) -> HWND {
+    let class: Vec<u16> = SETTINGS_CLASS.encode_utf16().chain(Some(0)).collect();
+    let title = if dost::i18n::is_turkish() {
+        "Dost Ayarları"
+    } else {
+        "Dost Settings"
+    };
+    let title: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        let hinstance = register_class(&class, Some(settings_proc));
+        CreateWindowExW(
+            WS_EX_APPWINDOW,
+            class.as_ptr(),
+            title.as_ptr(),
+            WS_OVERLAPPEDWINDOW,
+            x,
+            y,
+            w,
+            h,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            hinstance,
+            std::ptr::null(),
         )
+    }
+}
+
+/// The key a `WM_KEYDOWN` / `WM_CHAR` message means for a panel's text field (Esc is left to
+/// the caller); Ctrl+V arrives as `WM_CHAR` 0x16: paste.
+fn panel_key_of(msg: u32, wp: WPARAM) -> Option<panel::Key> {
+    match (msg, wp) {
+        (WM_KEYDOWN, VK_BACK) => Some(panel::Key::Backspace),
+        (WM_KEYDOWN, VK_RETURN) => Some(panel::Key::Enter),
+        (WM_CHAR, 0x16) => clipboard::get_text().map(panel::Key::Text),
+        (WM_CHAR, _) => char::from_u32(wp as u32)
+            .filter(|c| !c.is_control())
+            .map(|c| panel::Key::Text(c.to_string())),
+        _ => None,
+    }
+}
+
+/// Mouse and keyboard for either panel window; `None` for messages it does not handle.
+fn panel_input(which: Which, hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
+    let (x, y) = (
+        (lp & 0xffff) as i16 as f32,
+        ((lp >> 16) & 0xffff) as i16 as f32,
+    );
+    // Actions may close the panel (and this window), so they run after the panel's borrow.
+    let act = |action: Option<panel::Action>| {
+        if let Some(action) = action {
+            with_app(|a| a.panel_action(which, action));
+        }
     };
     match msg {
         WM_MOUSEMOVE => {
-            let (x, y) = pt();
-            // Actions may close the panel (and this window), so run them after the borrow.
             let action = with_app(|a| {
-                if !a.shell.panel.tracking {
-                    a.shell.panel.tracking = true;
+                let settings = a.core.settings.clone();
+                let w = a.shell.surface(which);
+                if !w.tracking {
+                    w.tracking = true;
                     let mut tme = TRACKMOUSEEVENT {
                         cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
                         dwFlags: TME_LEAVE,
@@ -1296,117 +1586,84 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                     };
                     unsafe { TrackMouseEvent(&mut tme) };
                 }
-                let settings = a.core.settings.clone();
-                let (redraw, action) = a
-                    .shell
-                    .panel
+                let (redraw, action) = w
                     .panel
                     .as_mut()
                     .map_or((false, None), |p| p.pointer_move(x, y, &settings));
-                a.shell.panel.redraw |= redraw;
+                w.redraw |= redraw;
                 action
             })
             .flatten();
-            if let Some(action) = action {
-                with_app(|a| a.on_action(action));
-            }
-            0
+            act(action);
         }
         WM_MOUSELEAVE => {
             with_app(|a| {
-                a.shell.panel.tracking = false;
-                if a.shell
-                    .panel
-                    .panel
-                    .as_mut()
-                    .is_some_and(Panel::pointer_leave)
-                {
-                    a.shell.panel.redraw = true;
+                let w = a.shell.surface(which);
+                w.tracking = false;
+                if w.panel.as_mut().is_some_and(Panel::pointer_leave) {
+                    w.redraw = true;
                 }
             });
-            0
         }
         WM_LBUTTONDOWN => {
-            let (x, y) = pt();
             unsafe { SetCapture(hwnd) };
-            with_app(|a| {
-                if let Some(action) = a
-                    .shell
-                    .panel
-                    .panel
-                    .as_mut()
-                    .and_then(|p| p.pointer_down(x, y))
-                {
-                    a.on_action(action);
-                }
-                a.shell.panel.redraw = true;
-            });
-            0
+            let action = with_app(|a| {
+                let w = a.shell.surface(which);
+                w.redraw = true;
+                w.panel.as_mut().and_then(|p| p.pointer_down(x, y))
+            })
+            .flatten();
+            act(action);
         }
         WM_LBUTTONUP => {
-            let (x, y) = pt();
             unsafe { ReleaseCapture() };
-            // Actions may close the panel (and this window), so run them after the borrow.
             let action = with_app(|a| {
                 let view = a.core.panel_view(&a.shell);
                 a.shell
-                    .panel
+                    .surface(which)
                     .panel
                     .as_mut()
                     .and_then(|p| p.pointer_up(x, y, &view))
             })
             .flatten();
-            if let Some(action) = action {
-                with_app(|a| a.on_action(action));
-            }
-            0
+            act(action);
         }
         WM_MOUSEWHEEL => {
             let delta = ((wp >> 16) & 0xffff) as i16 as f32 / 120.0;
             with_app(|a| {
-                let h = a.shell.panel.height();
-                if let Some(p) = a.shell.panel.panel.as_mut() {
+                let w = a.shell.surface(which);
+                let h = w.height();
+                if let Some(p) = w.panel.as_mut() {
                     p.scroll_by(delta, h);
-                    a.shell.panel.redraw = true;
+                    w.redraw = true;
                 }
             });
-            0
         }
-        WM_KEYDOWN if wp == 0x1B => {
-            // Esc: cancels editing the name, or closes the panel.
+        WM_KEYDOWN if wp == VK_ESCAPE => {
+            // Esc: cancels editing a field, or closes the popover.
             with_app(|a| {
-                if a.shell.panel.panel.as_ref().is_some_and(Panel::is_editing) {
-                    a.panel_key(panel::Key::Escape);
-                } else {
+                let w = a.shell.surface(which);
+                if w.panel.as_ref().is_some_and(Panel::is_editing) {
+                    a.panel_key(which, panel::Key::Escape);
+                } else if which == Which::Popover {
                     a.shell.panel.close();
                 }
             });
-            0
         }
-        WM_KEYDOWN if wp == 0x08 || wp == 0x0D => {
-            let key = if wp == 0x08 {
-                panel::Key::Backspace
-            } else {
-                panel::Key::Enter
-            };
-            with_app(|a| a.panel_key(key));
-            0
+        WM_KEYDOWN | WM_CHAR => {
+            let key = panel_key_of(msg, wp)?;
+            with_app(|a| a.panel_key(which, key));
         }
-        WM_CHAR => {
-            // Typed text for the fields (Backspace and Enter come as WM_KEYDOWN); Ctrl+V
-            // arrives as character 0x16: paste.
-            if wp == 0x16 {
-                if let Some(t) = clipboard::get_text() {
-                    with_app(|a| a.panel_key(panel::Key::Text(t)));
-                }
-                return 0;
-            }
-            let c = char::from_u32(wp as u32).filter(|c| !c.is_control());
-            if let Some(c) = c {
-                with_app(|a| a.panel_key(panel::Key::Text(c.to_string())));
-            }
-            0
-        }
+        _ => return None,
+    }
+    Some(0)
+}
+
+unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if let Some(r) = panel_input(Which::Popover, hwnd, msg, wp, lp) {
+        return r;
+    }
+    match msg {
         WM_ACTIVATE if (wp & 0xffff) as u32 == WA_INACTIVE => {
             // Clicked elsewhere: close like a flyout. Deferred so we are not inside DestroyWindow.
             unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
@@ -1416,6 +1673,91 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             with_app(|a| {
                 if a.shell.panel.hwnd == Some(hwnd) {
                     a.close_panel();
+                }
+            });
+            0
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+    }
+}
+
+unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if let Some(r) = panel_input(Which::Settings, hwnd, msg, wp, lp) {
+        return r;
+    }
+    match msg {
+        WM_GETMINMAXINFO => {
+            let dpi = match unsafe { GetDpiForWindow(hwnd) } {
+                0 => 96,
+                d => d,
+            };
+            let k = dpi as f32 / 96.0;
+            let mut r = RECT {
+                left: 0,
+                top: 0,
+                right: (SETTINGS_MIN.0 * k) as i32,
+                bottom: (SETTINGS_MIN.1 * k) as i32,
+            };
+            unsafe {
+                AdjustWindowRectExForDpi(&mut r, WS_OVERLAPPEDWINDOW, 0, WS_EX_APPWINDOW, dpi);
+                let mmi = &mut *(lp as *mut MINMAXINFO);
+                mmi.ptMinTrackSize = POINT {
+                    x: r.right - r.left,
+                    y: r.bottom - r.top,
+                };
+            }
+            0
+        }
+        WM_SIZE => {
+            if wp as u32 != SIZE_MINIMIZED {
+                let (w, h) = ((lp & 0xffff) as i32, ((lp >> 16) & 0xffff) as i32);
+                with_app(|a| {
+                    if a.shell.settings.hwnd == Some(hwnd) {
+                        a.shell.settings.resize(w, h);
+                        // Right away, so live resizing does not show stale frames.
+                        a.paint_panel(Which::Settings);
+                    }
+                });
+            }
+            0
+        }
+        WM_DPICHANGED => {
+            let ui = (wp & 0xffff) as f32 / 96.0;
+            with_app(|a| {
+                if let Some(p) = a.shell.settings.panel.as_mut() {
+                    p.set_ui_scale(ui);
+                    a.shell.settings.redraw = true;
+                }
+            });
+            // The suggested rect; its WM_SIZE needs the app, so not inside `with_app`.
+            let r = unsafe { &*(lp as *const RECT) };
+            unsafe {
+                SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    r.left,
+                    r.top,
+                    r.right - r.left,
+                    r.bottom - r.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            0
+        }
+        WM_ERASEBKGND => 1,
+        WM_PAINT => {
+            unsafe {
+                let mut ps: PAINTSTRUCT = std::mem::zeroed();
+                let dc = BeginPaint(hwnd, &mut ps);
+                with_app(|a| a.shell.settings.blit(dc));
+                EndPaint(hwnd, &ps);
+            }
+            0
+        }
+        WM_CLOSE => {
+            with_app(|a| {
+                if a.shell.settings.hwnd == Some(hwnd) {
+                    a.close_window(Which::Settings);
                 }
             });
             0

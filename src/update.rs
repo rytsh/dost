@@ -1,8 +1,8 @@
 //! Updates from GitHub Releases: checks for a newer version and, if allowed, downloads it,
 //! verifies its SHA-256 and swaps it in. Runs on a background thread; the app shows the result.
 //!
-//! Release assets (made by CI): `dost-windows.exe`, `Dost-macos.zip` (Dost.app), each with a
-//! `.sha256` file next to it.
+//! Release assets (made by CI): `dost-windows.exe`, `Dost-macos.zip` (Dost.app),
+//! `dost-linux-x86_64`, each with a `.sha256` file next to it.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
@@ -19,7 +19,9 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 const ASSET: &str = "dost-windows.exe";
 #[cfg(target_os = "macos")]
 const ASSET: &str = "Dost-macos.zip";
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(target_os = "linux")]
+const ASSET: &str = "dost-linux-x86_64";
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 const ASSET: &str = "";
 
 /// What a check found.
@@ -203,9 +205,53 @@ fn install_update(data: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+/// Linux: the new binary is written next to the running one and renamed over it (the running
+/// process keeps the old file open).
+#[cfg(target_os = "linux")]
+fn install_update(data: &[u8]) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let exe = linux_exe().ok_or("cannot find the dost executable")?;
+    let new = exe.with_extension("new");
+    std::fs::write(&new, data).map_err(|e| format!("cannot write the update: {e}"))?;
+    let done = std::fs::set_permissions(&new, std::fs::Permissions::from_mode(0o755))
+        .and_then(|()| std::fs::rename(&new, &exe));
+    if let Err(e) = done {
+        let _ = std::fs::remove_file(&new);
+        return Err(format!("cannot replace {}: {e}", exe.display()));
+    }
+    Ok(())
+}
+
+/// The running executable's path; after it was replaced, Linux reports it as "(deleted)".
+#[cfg(target_os = "linux")]
+fn linux_exe() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let s = exe.to_string_lossy();
+    Some(match s.strip_suffix(" (deleted)") {
+        Some(p) => p.into(),
+        None => exe,
+    })
+}
+
+/// Linux: the binary and its folder can be written (not a package manager's /usr/bin).
+#[cfg(target_os = "linux")]
+fn linux_writable() -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    unsafe extern "C" {
+        fn access(path: *const std::ffi::c_char, mode: i32) -> i32;
+    }
+    const W_OK: i32 = 2;
+    let ok = |p: &Path| {
+        CString::new(p.as_os_str().as_bytes())
+            .is_ok_and(|c| unsafe { access(c.as_ptr(), W_OK) } == 0)
+    };
+    linux_exe().is_some_and(|exe| ok(&exe) && exe.parent().is_some_and(ok))
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 fn install_update(_: &[u8]) -> Result<(), String> {
-    Err("updates are for Windows and macOS".into())
+    Err("updates are for Windows, macOS and Linux".into())
 }
 
 /// The `.app` folder this binary runs from, if any.
@@ -224,6 +270,9 @@ pub fn can_install() -> bool {
     if cfg!(target_os = "macos") {
         return app_bundle().is_some();
     }
+    #[cfg(target_os = "linux")]
+    return linux_writable();
+    #[cfg(not(target_os = "linux"))]
     cfg!(windows)
 }
 
@@ -238,7 +287,11 @@ pub fn restart() {
             .spawn();
         return;
     }
-    if let Ok(exe) = std::env::current_exe() {
+    #[cfg(target_os = "linux")]
+    let exe = linux_exe();
+    #[cfg(not(target_os = "linux"))]
+    let exe = std::env::current_exe().ok();
+    if let Some(exe) = exe {
         let _ = std::process::Command::new(exe).spawn();
     }
 }

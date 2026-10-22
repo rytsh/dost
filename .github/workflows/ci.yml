@@ -53,6 +53,26 @@ jobs:
             dost-windows.exe
             dost-windows.exe.sha256
 
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo build --release
+      - run: |
+          cp target/release/dost dost-linux-x86_64
+          sha256sum dost-linux-x86_64 > dost-linux-x86_64.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dost-linux
+          path: |
+            dost-linux-x86_64
+            dost-linux-x86_64.sha256
+
   macos:
     runs-on: macos-latest
     env:
@@ -89,6 +109,7 @@ jobs:
           xcrun notarytool submit target/Dost-*.dmg --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
           xcrun stapler staple target/Dost-*.dmg
           xcrun stapler staple target/Dost.app
+          spctl --assess --type execute -v target/Dost.app
       # The app on its own, for updates (the dmg is for people).
       - run: |
           ditto -c -k --keepParent target/Dost.app Dost-macos.zip
@@ -104,7 +125,7 @@ jobs:
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [test, windows, macos]
+    needs: [test, windows, linux, macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -116,3 +137,5 @@ jobs:
             dost-macos/Dost.dmg
             dost-macos/Dost-macos.zip
             dost-macos/Dost-macos.zip.sha256
+            dost-linux/dost-linux-x86_64
+            dost-linux/dost-linux-x86_64.sha256

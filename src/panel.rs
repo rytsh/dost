@@ -7,10 +7,13 @@ use tiny_skia::{
     Transform,
 };
 
+use crate::i18n::{self, t};
 use crate::look::{Collar, Fur, Item, Outfit, SOURCE_PALETTE, Theme, Wear, parse_hex};
+use crate::remote::PhoneWhen;
 use crate::render::{Renderer, TextStyle};
+use crate::sessions::{Session, State as SessionState};
 use crate::settings::{
-    Ground, NAME_MAX, NOTIFY_STEPS, SPEEDS, Settings, TEXT_SIZES, clean_name, parse_hhmm,
+    Ground, Lang, NAME_MAX, NOTIFY_STEPS, SPEEDS, Settings, TEXT_SIZES, clean_name, parse_hhmm,
 };
 
 /// Logical width of the panel; height is fixed so switching tabs does not resize it.
@@ -51,21 +54,100 @@ const HOVER: ColorU8 = rgb(0xf6, 0xef, 0xe5);
 const DANGER: ColorU8 = rgb(0xc8, 0x4b, 0x3c);
 const AWAKE: ColorU8 = rgb(0x4f, 0xa8, 0x6a);
 
-/// The panel's tabs, left to right.
 /// Shown on the Dog tab.
 #[cfg(target_os = "macos")]
-const SHORTCUTS: &str = "Bubble keys: ⌥⌘↩ yes · ⌥⌘1-4 · ⌥⌘⌫ no · ⌥⌘L later";
+const SHORTCUTS: &str = "⌥⌘↩ yes · ⌥⌘1-4 · ⌥⌘⌫ no · ⌥⌘L later";
 #[cfg(not(target_os = "macos"))]
 const SHORTCUTS: &str = "Ctrl+Alt + Enter yes · 1-4 · Backspace no · L later";
 
-const TAB_NAMES: [&str; 7] = ["Dog", "Look", "Play", "Sound", "Todo", "History", "Connect"];
-const TAB_LOOK: usize = 1;
-const TAB_PLAY: usize = 2;
-const TAB_SOUND: usize = 3;
-const TAB_TODO: usize = 4;
-const TAB_HISTORY: usize = 5;
+/// A page of settings: a tab of the panel, or an entry in the settings window's sidebar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Page {
+    General,
+    Dog,
+    Look,
+    Play,
+    Sound,
+    Phone,
+    Agents,
+    Todo,
+    History,
+    Connect,
+    /// Answering a question in words (opened from the bubble's "Reply…").
+    Reply,
+}
+
+impl Page {
+    fn title(self) -> &'static str {
+        match self {
+            Page::General => "General",
+            Page::Dog => "Dog",
+            Page::Look => "Look",
+            Page::Play => "Play",
+            Page::Sound => "Sound",
+            Page::Phone => "Phone",
+            Page::Agents => "Agents",
+            Page::Todo => "Todo",
+            Page::History => "History",
+            Page::Connect => "Connect",
+            Page::Reply => "Reply",
+        }
+    }
+
+    fn glyph(self) -> Glyph {
+        match self {
+            Page::General => Glyph::Gear,
+            Page::Dog => Glyph::Paw,
+            Page::Look => Glyph::Bow,
+            Page::Play => Glyph::Bone,
+            Page::Sound => Glyph::Speaker,
+            Page::Phone => Glyph::Phone,
+            Page::Agents => Glyph::Agents,
+            Page::Todo => Glyph::Check,
+            Page::History => Glyph::Clock,
+            Page::Connect => Glyph::Plug,
+            Page::Reply => Glyph::Agents,
+        }
+    }
+}
+
+/// The panel's tabs, left to right.
+const TABS_POPOVER: [Page; 7] = [
+    Page::Dog,
+    Page::Look,
+    Page::Play,
+    Page::Sound,
+    Page::Agents,
+    Page::Todo,
+    Page::History,
+];
+/// The settings window's sidebar: groups of pages.
+const SIDEBAR: [(&str, &[Page]); 4] = [
+    (
+        "Basics",
+        &[Page::General, Page::Dog, Page::Look, Page::Play],
+    ),
+    ("Notifications", &[Page::Sound, Page::Phone]),
+    ("Work", &[Page::Agents, Page::Todo, Page::History]),
+    ("Connect", &[Page::Connect]),
+];
 #[cfg(test)]
-const TAB_CONNECT: usize = 6;
+const TAB_LOOK: usize = 1;
+#[cfg(test)]
+const TAB_PLAY: usize = 2;
+#[cfg(test)]
+const TAB_SOUND: usize = 3;
+#[cfg(test)]
+const TAB_TODO: usize = 5;
+const TAB_HISTORY: usize = 6;
+/// The settings window: logical size it opens at, and the sidebar's width.
+pub const WINDOW_SIZE: (f32, f32) = (780.0, 580.0);
+const SIDEBAR_W: f32 = 210.0;
+/// Width of the label column in rows (panel, window).
+const LABEL_W: f32 = 88.0;
+const LABEL_W_WINDOW: f32 = 190.0;
+/// Height of a session's row on the Agents page.
+const SESSION_ROW: f32 = 46.0;
 
 const fn rgb(r: u8, g: u8, b: u8) -> ColorU8 {
     ColorU8::from_rgba(r, g, b, 255)
@@ -93,6 +175,22 @@ pub enum Action {
     OpenConfigDir,
     /// A change to the todo lists.
     Todo(crate::todo::Edit),
+    /// Opens the big settings window.
+    OpenSettings,
+    /// An answer in words to question `id`.
+    Reply {
+        id: u64,
+        text: String,
+    },
+    /// Sends a test message to the phone.
+    PhoneTest,
+    /// A new random ntfy topic.
+    NewTopic,
+    CopyText(String),
+    OpenUrl(String),
+    /// Forgets finished agent sessions.
+    ClearSessions,
+    RemoveSession(String),
     /// The version in the footer: checks for updates (or restarts into an installed one).
     CheckUpdate,
     Quit,
@@ -125,6 +223,16 @@ pub struct View {
     /// Notifications missed while the dog was hidden (badge on the History tab).
     pub missed: usize,
     pub todos: Vec<crate::todo::List>,
+    /// What agents are doing.
+    pub sessions: Vec<Session>,
+    /// A phone channel's last problem.
+    pub phone_status: Option<String>,
+    /// How many screens there are.
+    pub screens: usize,
+    /// Today is a special day (when they are on).
+    pub special: Option<crate::special::Day>,
+    /// The minute of silence is on.
+    pub silence: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -138,7 +246,10 @@ pub struct HistoryItem {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Hit {
-    Tab(usize),
+    Tab(Page),
+    /// A session on the Agents page (index): opens it; and its ✕.
+    Session(usize),
+    RemoveSession(usize),
     Choice(Field, usize),
     Toggle(Toggle),
     Slider,
@@ -178,6 +289,19 @@ enum TextField {
     /// A new item for a todo list (list id).
     AddTodo(u64),
     NewList,
+    NtfyServer,
+    NtfyTopic,
+    NtfyToken,
+    TelegramToken,
+    /// The answer to a question, in words.
+    Reply,
+}
+
+impl TextField {
+    /// Shown as dots unless edited.
+    fn secret(self) -> bool {
+        matches!(self, TextField::NtfyToken | TextField::TelegramToken)
+    }
 }
 
 /// Lists edited in the panel.
@@ -199,6 +323,9 @@ enum Field {
     Theme,
     /// Which web pages may use the MCP server.
     Browsers,
+    Language,
+    PhoneWhen,
+    Screen,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -216,6 +343,10 @@ enum Toggle {
     Seasonal,
     EventSounds,
     Toy,
+    SpecialDays,
+    Siren,
+    Ntfy,
+    Telegram,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -228,6 +359,13 @@ enum Button {
     Version,
     Quit,
     Close,
+    AllSettings,
+    PhoneTest,
+    NewTopic,
+    CopyTopic,
+    ReplySend,
+    ReplyCancel,
+    ClearSessions,
 }
 
 /// A key typed while a text field is being edited.
@@ -262,7 +400,16 @@ pub struct Panel {
     scroll: f32,
     /// Height of the tab's body content (physical), for the scroll limit.
     body_content: f32,
-    tab: usize,
+    /// Height of the visible part of the body at the last draw (physical).
+    view_h: f32,
+    page: Page,
+    /// The big settings window (sidebar, wide rows) rather than the small panel.
+    window: bool,
+    /// Where the page's cards go (physical x and width), set while drawing.
+    cx: f32,
+    cw: f32,
+    /// The question being answered in words: (id, title, question), and the page to go back to.
+    reply: Option<(u64, String, String, Page)>,
     /// Draws an arrow at the top pointing at this x (physical, panel-relative).
     arrow: Option<f32>,
     /// Missed while hidden; shown as a badge on History.
@@ -284,12 +431,59 @@ impl Panel {
             dragging: false,
             scroll: 0.0,
             body_content: 0.0,
-            tab: 0,
+            view_h: 0.0,
+            page: Page::Dog,
+            window: false,
+            cx: 0.0,
+            cw: 0.0,
+            reply: None,
             arrow: None,
             missed: 0,
             editing: None,
             toy_press: None,
             custom_origins: false,
+        }
+    }
+
+    /// The big settings window: a sidebar of pages and wide rows; sized by the window.
+    pub fn new_window(ui: f32) -> Self {
+        let mut p = Panel::new(ui);
+        p.window = true;
+        p.page = Page::General;
+        p
+    }
+
+    pub fn is_window(&self) -> bool {
+        self.window
+    }
+
+    /// Opens the page that answers question `id` in words, with the field ready for typing.
+    pub fn start_reply(&mut self, id: u64, title: &str, question: &str) {
+        let back = if self.page == Page::Reply {
+            Page::Dog
+        } else {
+            self.page
+        };
+        self.reply = Some((id, title.to_string(), question.to_string(), back));
+        self.page = Page::Reply;
+        self.scroll = 0.0;
+        self.editing = Some(Editing {
+            field: TextField::Reply,
+            text: String::new(),
+            since: std::time::Instant::now(),
+        });
+    }
+
+    fn end_reply(&mut self) {
+        if let Some((.., back)) = self.reply.take() {
+            self.page = back;
+        }
+        if self
+            .editing
+            .as_ref()
+            .is_some_and(|e| e.field == TextField::Reply)
+        {
+            self.editing = None;
         }
     }
 
@@ -304,10 +498,10 @@ impl Panel {
         let Some(e) = self.editing.as_mut() else {
             return (false, None);
         };
-        let max = if e.field == TextField::Name {
-            NAME_MAX
-        } else {
-            TEXT_MAX
+        let max = match e.field {
+            TextField::Name => NAME_MAX,
+            TextField::Reply => 2000,
+            _ => TEXT_MAX,
         };
         match key {
             Key::Text(t) => {
@@ -320,6 +514,7 @@ impl Panel {
             Key::Backspace => {
                 e.text.pop();
             }
+            Key::Escape if e.field == TextField::Reply => self.end_reply(),
             Key::Escape => self.editing = None,
             Key::Enter => return (true, self.finish_editing(v)),
         }
@@ -387,6 +582,45 @@ impl Panel {
                 return (!t.is_empty())
                     .then(|| Action::Todo(crate::todo::Edit::NewList(t.to_string())));
             }
+            TextField::NtfyServer => {
+                let u = t.trim_end_matches('/');
+                if u.starts_with("https://") || u.starts_with("http://") {
+                    s.phone.ntfy.server = u.to_string();
+                }
+            }
+            TextField::NtfyTopic => {
+                let ok = t
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+                if ok && t.len() <= 64 {
+                    s.phone.ntfy.topic = t.to_string();
+                    if !t.is_empty() {
+                        s.phone.ntfy.enabled = true;
+                    }
+                }
+            }
+            TextField::NtfyToken => s.phone.ntfy.token = t.to_string(),
+            TextField::TelegramToken => {
+                if t != s.phone.telegram.token {
+                    s.phone.telegram.token = t.to_string();
+                    // Another bot: pair again.
+                    s.phone.telegram.chat_id.clear();
+                    if !t.is_empty() {
+                        s.phone.telegram.enabled = true;
+                    }
+                }
+            }
+            TextField::Reply => {
+                let id = self.reply.as_ref().map(|r| r.0);
+                if t.is_empty() {
+                    // Nothing typed yet: keep the field open.
+                    self.editing = Some(e);
+                    return None;
+                }
+                let text = t.to_string();
+                self.end_reply();
+                return id.map(|id| Action::Reply { id, text });
+            }
             TextField::AddBark => {
                 // Paths copied from a file manager may come quoted.
                 let p = t.trim_matches(|c| c == '"' || c == '\'');
@@ -419,6 +653,11 @@ impl Panel {
             TextField::QuietTo => s.quiet_to.clone(),
             TextField::Lift => s.lift.to_string(),
             TextField::McpAddr => s.mcp_addr.clone(),
+            TextField::NtfyServer => s.phone.ntfy.server.clone(),
+            TextField::NtfyTopic => s.phone.ntfy.topic.clone(),
+            TextField::NtfyToken => s.phone.ntfy.token.clone(),
+            TextField::TelegramToken => s.phone.telegram.token.clone(),
+            TextField::Reply => String::new(),
             TextField::AddOrigin
             | TextField::AddBark
             | TextField::AddSource
@@ -431,10 +670,21 @@ impl Panel {
         self.ui = ui;
     }
 
-    /// Selects a tab (0-based); out-of-range values pick the last one.
+    /// Selects a tab of the panel (0-based); out-of-range values pick the last one.
     pub fn set_tab(&mut self, tab: usize) {
-        self.tab = tab.min(TAB_NAMES.len() - 1);
+        self.set_page(TABS_POPOVER[tab.min(TABS_POPOVER.len() - 1)]);
+    }
+
+    pub fn set_page(&mut self, page: Page) {
+        if self.page == Page::Reply && page != Page::Reply {
+            self.end_reply();
+        }
+        self.page = page;
         self.scroll = 0.0;
+    }
+
+    pub fn page(&self) -> Page {
+        self.page
     }
 
     /// Opened after notifications were missed while hidden: start on History, with a badge
@@ -447,7 +697,7 @@ impl Panel {
     /// Height of the area under the tabs (logical): the Dog tab spends part of it on the
     /// quick actions, so every tab is the same height and switching does not resize.
     fn body_height(&self) -> f32 {
-        if self.tab == 0 {
+        if self.page == Page::Dog {
             BODY - QUICK - GAP
         } else {
             BODY
@@ -471,6 +721,13 @@ impl Panel {
 
     /// Physical size for a panel that may be at most `max_height` physical pixels tall.
     pub fn size(&self, max_height: u32) -> (u32, u32) {
+        if self.window {
+            let (w, h) = WINDOW_SIZE;
+            return (
+                (w * self.ui).ceil() as u32,
+                ((h * self.ui).ceil() as u32).min(max_height),
+            );
+        }
         let w = (WIDTH * self.ui).ceil() as u32;
         let h = (content_height() * self.ui + self.top()).ceil() as u32;
         (w, h.min(max_height))
@@ -478,11 +735,19 @@ impl Panel {
 
     /// Mouse wheel over the panel; `delta` in lines (positive = up). Scrolls the tab's body.
     pub fn scroll_by(&mut self, delta: f32, _view_height: u32) {
-        let max = (self.body_content - self.body_height() * self.ui).max(0.0);
+        let view = if self.view_h > 0.0 {
+            self.view_h
+        } else {
+            self.body_height() * self.ui
+        };
+        let max = (self.body_content - view).max(0.0);
         self.scroll = (self.scroll - delta * ROW * self.ui).clamp(0.0, max);
     }
 
     pub fn draw(&mut self, pm: &mut Pixmap, r: &mut Renderer, v: &View) {
+        if self.window {
+            return self.draw_window(pm, r, v);
+        }
         let u = self.ui;
         self.hits.clear();
         self.slider = None;
@@ -508,74 +773,249 @@ impl Panel {
         let mut y = top + PAD * u;
         let x = PAD * u;
         let inner = w - 2.0 * x;
+        self.cx = x;
+        self.cw = inner;
 
         y = self.header(pm, r, y, x, inner, v);
         y = self.tabs(pm, r, y, x, inner, self.missed.max(v.missed));
         // The dog's quick actions belong on its own tab.
-        if self.tab == 0 {
+        if self.page == Page::Dog {
             y = self.quick_actions(pm, r, y, x, inner, v);
         }
-        // The tab's body: drawn on its own canvas, scrolled, then copied into its place.
         let body_h = (self.body_height() * u).round();
         let view_h = body_h.min((h - y - (GAP + FOOTER + PAD) * u).max(0.0));
-        if let Some(mut canvas) = Pixmap::new(pm.width(), (view_h.max(1.0)) as u32) {
-            let first = self.hits.len();
-            let end = {
-                let cy = -self.scroll;
-                match self.tab {
-                    0 => self.tab_dog(&mut canvas, r, cy, x, inner, &v.settings),
-                    TAB_LOOK => self.tab_look(&mut canvas, r, cy, x, inner, v),
-                    TAB_PLAY => self.tab_play(&mut canvas, r, cy, x, inner, v),
-                    TAB_SOUND => self.tab_sound(&mut canvas, r, cy, x, inner, &v.settings),
-                    TAB_TODO => self.tab_todo(&mut canvas, r, cy, x, inner, v),
-                    TAB_HISTORY => self.tab_history(&mut canvas, r, cy, x, inner, v),
-                    _ => self.tab_connect(&mut canvas, r, cy, x, inner, v),
-                }
-            };
-            self.body_content = end + self.scroll;
-            let max = (self.body_content - view_h).max(0.0);
-            if self.scroll > max {
-                // The content got shorter (a list entry removed): draw again in range.
-                self.scroll = max;
-                self.hits.truncate(first);
-                return self.draw(pm, r, v);
-            }
-            // Hits are in the canvas: move them into the panel, and drop what is scrolled out.
-            let moved: Vec<(Rect, Hit)> = self.hits.drain(first..).collect();
-            for (rect, hit) in moved {
-                let Some(clipped) = Rect::from_ltrb(
-                    rect.left(),
-                    rect.top().max(0.0),
-                    rect.right(),
-                    rect.bottom().min(view_h),
-                ) else {
-                    continue;
-                };
-                if let Some(r) = Rect::from_xywh(
-                    clipped.left(),
-                    clipped.top() + y,
-                    clipped.width(),
-                    clipped.height(),
-                ) {
-                    self.hits.push((r, hit));
-                }
-            }
-            if let Some(s) = self.slider {
-                self.slider = Rect::from_xywh(s.left(), s.top() + y, s.width(), s.height());
-            }
-            pm.draw_pixmap(
-                0,
-                y.round() as i32,
-                canvas.as_ref(),
-                &PixmapPaint::default(),
-                Transform::identity(),
-                None,
-            );
-            self.scrollbar(pm, x + inner + 4.0 * u, y, view_h);
-        }
+        self.body(pm, r, v, x, y, inner, view_h);
         // On a short screen the body is cut to what fits; the footer stays right under it.
         y += view_h + GAP * u;
         self.footer(pm, r, y, x, inner, v);
+    }
+
+    /// The settings window: a sidebar of pages on the left, the page on the right.
+    fn draw_window(&mut self, pm: &mut Pixmap, r: &mut Renderer, v: &View) {
+        let u = self.ui;
+        self.hits.clear();
+        self.slider = None;
+        let (w, h) = (pm.width() as f32, pm.height() as f32);
+        pm.fill(color8(BG));
+        // Sidebar.
+        let sw = (SIDEBAR_W * u).round();
+        fill_round(pm, Rect::from_xywh(0.0, 0.0, sw, h), 0.0, SIDEBAR_BG);
+        fill_round(pm, Rect::from_xywh(sw, 0.0, 1.0, h), 0.0, BORDER);
+        let mut y = 18.0 * u;
+        let x = 12.0 * u;
+        // The dog and its name.
+        let name = sys(15.0 * u, true, INK);
+        r.draw_dog_icon(
+            pm,
+            if v.sleeping {
+                crate::dog::Anim::Sleep
+            } else {
+                crate::dog::Anim::Sit
+            },
+            (x + 4.0 * u) as i32,
+            y as i32,
+            (30.0 * u) as u32,
+        );
+        let shown = fit(r, &v.settings.name, name, sw - 70.0 * u);
+        r.draw_text(pm, x + 44.0 * u, y + 2.0 * u, &shown, name);
+        let (label, dot) = status_label(v);
+        let st = sys(11.0 * u, false, MUTED);
+        fill_round(
+            pm,
+            Rect::from_xywh(x + 44.0 * u, y + 24.0 * u, 6.0 * u, 6.0 * u),
+            3.0 * u,
+            dot,
+        );
+        r.draw_text(pm, x + 54.0 * u, y + 20.0 * u, t(label), st);
+        y += 52.0 * u;
+        let missed = self.missed.max(v.missed);
+        let waiting = v
+            .sessions
+            .iter()
+            .filter(|s| s.state == SessionState::Waiting)
+            .count();
+        for (group, pages) in SIDEBAR {
+            r.draw_text(
+                pm,
+                x + 8.0 * u,
+                y + 4.0 * u,
+                t(group),
+                sys(11.0 * u, true, MUTED),
+            );
+            y += 24.0 * u;
+            for &page in pages {
+                let Some(row) = Rect::from_xywh(x, y, sw - 2.0 * x, 30.0 * u) else {
+                    continue;
+                };
+                let on = self.page == page
+                    || (self.page == Page::Reply
+                        && self.reply.as_ref().is_some_and(|r| r.3 == page));
+                let hit = Hit::Tab(page);
+                if on {
+                    fill_round(pm, Some(row), 8.0 * u, ACCENT_SOFT);
+                } else if self.hover == Some(hit) {
+                    fill_round(pm, Some(row), 8.0 * u, HOVER);
+                }
+                let c = if on { ACCENT_INK } else { INK };
+                draw_glyph(
+                    pm,
+                    page.glyph(),
+                    row.left() + 18.0 * u,
+                    row.top() + row.height() / 2.0,
+                    u,
+                    if on { ACCENT_INK } else { MUTED },
+                );
+                r.draw_text(
+                    pm,
+                    row.left() + 36.0 * u,
+                    row.top() + 6.0 * u,
+                    t(page.title()),
+                    sys(13.0 * u, on, c),
+                );
+                let badge = match page {
+                    Page::History => missed,
+                    Page::Agents => waiting,
+                    _ => 0,
+                };
+                if badge > 0 {
+                    draw_badge(
+                        pm,
+                        r,
+                        row.right() - 14.0 * u,
+                        row.top() + 15.0 * u,
+                        badge,
+                        u,
+                    );
+                }
+                self.hits.push((row, hit));
+                y += 32.0 * u;
+            }
+            y += 8.0 * u;
+        }
+        // Footer of the sidebar: settings file, quit and the version.
+        let fy = h - 64.0 * u;
+        let mut ly = fy;
+        for (label, b) in [
+            ("Open settings file", Button::OpenDir),
+            ("Quit", Button::Quit),
+        ] {
+            let hover = self.hover == Some(Hit::Button(b));
+            let color = match (b, hover) {
+                (Button::Quit, true) => DANGER,
+                (_, true) => INK,
+                _ => MUTED,
+            };
+            let st = sys(12.0 * u, false, color);
+            let (tw, th) = r.measure(t(label), st);
+            if let Some(rect) = Rect::from_xywh(x, ly, tw + 16.0 * u, 22.0 * u) {
+                if hover {
+                    fill_round(pm, Some(rect), 6.0 * u, HOVER);
+                }
+                r.draw_text(
+                    pm,
+                    rect.left() + 8.0 * u,
+                    (rect.top() + (rect.height() - th) / 2.0).round(),
+                    t(label),
+                    st,
+                );
+                self.hits.push((rect, Hit::Button(b)));
+            }
+            ly += 24.0 * u;
+        }
+        self.version_link(pm, r, sw - 12.0 * u, fy + 24.0 * u, v);
+
+        // The page.
+        let px = sw + 28.0 * u;
+        let pw = (w - px - 28.0 * u).min(560.0 * u);
+        let title_y = 22.0 * u;
+        let title = match (self.page, &self.reply) {
+            (Page::Reply, Some((_, title, ..))) if !title.is_empty() => title.clone(),
+            (p, _) => t(p.title()).to_string(),
+        };
+        r.draw_text(pm, px, title_y, &title, sys(22.0 * u, true, INK));
+        let close = Rect::from_xywh(w - 40.0 * u, 16.0 * u, 26.0 * u, 26.0 * u);
+        self.button_icon(pm, close, Glyph::Close, Button::Close);
+        let by = title_y + 46.0 * u;
+        self.cx = px;
+        self.cw = pw;
+        let view_h = (h - by - 12.0 * u).max(1.0);
+        self.body(pm, r, v, px, by, pw, view_h);
+    }
+
+    /// The page's body: drawn on its own canvas, scrolled, then copied into its place.
+    #[allow(clippy::too_many_arguments)]
+    fn body(
+        &mut self,
+        pm: &mut Pixmap,
+        r: &mut Renderer,
+        v: &View,
+        x: f32,
+        y: f32,
+        inner: f32,
+        view_h: f32,
+    ) {
+        self.view_h = view_h;
+        let Some(mut canvas) = Pixmap::new(pm.width(), (view_h.max(1.0)) as u32) else {
+            return;
+        };
+        let first = self.hits.len();
+        let end = {
+            let cy = -self.scroll;
+            let c = &mut canvas;
+            match self.page {
+                Page::General => self.page_general(c, r, cy, x, inner, v),
+                Page::Dog => self.tab_dog(c, r, cy, x, inner, v),
+                Page::Look => self.tab_look(c, r, cy, x, inner, v),
+                Page::Play => self.tab_play(c, r, cy, x, inner, v),
+                Page::Sound => self.tab_sound(c, r, cy, x, inner, &v.settings),
+                Page::Phone => self.page_phone(c, r, cy, x, inner, v),
+                Page::Agents => self.page_agents(c, r, cy, x, inner, v),
+                Page::Todo => self.tab_todo(c, r, cy, x, inner, v),
+                Page::History => self.tab_history(c, r, cy, x, inner, v),
+                Page::Connect => self.tab_connect(c, r, cy, x, inner, v),
+                Page::Reply => self.page_reply(c, r, cy, x, inner, v),
+            }
+        };
+        self.body_content = end + self.scroll;
+        let max = (self.body_content - view_h).max(0.0);
+        if self.scroll > max {
+            // The content got shorter (a list entry removed): draw again in range.
+            self.scroll = max;
+            self.hits.truncate(first);
+            return self.draw(pm, r, v);
+        }
+        // Hits are in the canvas: move them into the panel, and drop what is scrolled out.
+        let moved: Vec<(Rect, Hit)> = self.hits.drain(first..).collect();
+        for (rect, hit) in moved {
+            let Some(clipped) = Rect::from_ltrb(
+                rect.left(),
+                rect.top().max(0.0),
+                rect.right(),
+                rect.bottom().min(view_h),
+            ) else {
+                continue;
+            };
+            if let Some(r) = Rect::from_xywh(
+                clipped.left(),
+                clipped.top() + y,
+                clipped.width(),
+                clipped.height(),
+            ) {
+                self.hits.push((r, hit));
+            }
+        }
+        if let Some(s) = self.slider {
+            self.slider = Rect::from_xywh(s.left(), s.top() + y, s.width(), s.height());
+        }
+        pm.draw_pixmap(
+            0,
+            y.round() as i32,
+            canvas.as_ref(),
+            &PixmapPaint::default(),
+            Transform::identity(),
+            None,
+        );
+        self.scrollbar(pm, x + inner + 4.0 * self.ui, y, view_h);
     }
 
     /// A thin bar on the right while the tab's body is longer than its room.
@@ -591,7 +1031,7 @@ impl Panel {
         fill_round(pm, Rect::from_xywh(x, by, 3.0 * u, bar_h), 1.5 * u, TRACK);
     }
 
-    /// Name, the dog's state as a colored pill, close button.
+    /// Name, the dog's state as a colored pill, a gear (the settings window), close button.
     fn header(
         &mut self,
         pm: &mut Pixmap,
@@ -604,18 +1044,13 @@ impl Panel {
         let u = self.ui;
         let name_x = x + 4.0 * u;
         let name = sys(15.0 * u, true, INK);
-        // Room for the pill and the close button.
-        let shown = fit(r, &v.settings.name, name, inner - 150.0 * u);
+        // Room for the pill and the buttons.
+        let shown = fit(r, &v.settings.name, name, inner - 180.0 * u);
         let (tw, th) = r.measure(&shown, name);
         r.draw_text(pm, name_x, y + (HEADER * u - th) / 2.0, &shown, name);
 
-        let (label, dot) = match (v.visible, v.sleeping) {
-            (false, true) => ("Hidden · asleep", MUTED),
-            (true, true) => ("Sleeping", MUTED),
-            (false, false) => ("Hidden", MUTED),
-            (true, false) if v.quiet => ("Quiet", ACCENT),
-            (true, false) => ("Awake", AWAKE),
-        };
+        let (label, dot) = status_label(v);
+        let label = t(label);
         let st = sys(11.5 * u, false, MUTED);
         let (lw, lh) = r.measure(label, st);
         let pill = Rect::from_xywh(
@@ -642,6 +1077,13 @@ impl Panel {
             );
         }
 
+        let gear = Rect::from_xywh(
+            x + inner - 56.0 * u,
+            y + (HEADER * u - 26.0 * u) / 2.0,
+            26.0 * u,
+            26.0 * u,
+        );
+        self.button_icon(pm, gear, Glyph::Gear, Button::AllSettings);
         let close = Rect::from_xywh(
             x + inner - 26.0 * u,
             y + (HEADER * u - 26.0 * u) / 2.0,
@@ -668,8 +1110,9 @@ impl Panel {
         fill_round(pm, tray, 12.0 * u, CARD);
         stroke_round(pm, tray, 12.0 * u, BORDER, 1.0);
         let gap = 2.0 * u;
-        let tw = (inner - 8.0 * u - gap * (TAB_NAMES.len() - 1) as f32) / TAB_NAMES.len() as f32;
-        for (i, name) in TAB_NAMES.iter().enumerate() {
+        let n = TABS_POPOVER.len();
+        let tw = (inner - 8.0 * u - gap * (n - 1) as f32) / n as f32;
+        for (i, page) in TABS_POPOVER.iter().enumerate() {
             let Some(cell) = Rect::from_xywh(
                 x + 4.0 * u + i as f32 * (tw + gap),
                 y + 4.0 * u,
@@ -678,66 +1121,44 @@ impl Panel {
             ) else {
                 continue;
             };
-            let on = self.tab == i;
-            let hover = self.hover == Some(Hit::Tab(i));
+            let on = self.page == *page
+                || (self.page == Page::Reply && self.reply.as_ref().is_some_and(|r| r.3 == *page));
+            let hover = self.hover == Some(Hit::Tab(*page));
             if on {
                 fill_round(pm, Some(cell), 8.0 * u, ACCENT_SOFT);
             } else if hover {
                 fill_round(pm, Some(cell), 8.0 * u, HOVER);
             }
             let color = if on { ACCENT_INK } else { MUTED };
-            let glyph = [
-                Glyph::Paw,
-                Glyph::Bow,
-                Glyph::Bone,
-                Glyph::Speaker,
-                Glyph::Check,
-                Glyph::Clock,
-                Glyph::Plug,
-            ][i];
             draw_glyph(
                 pm,
-                glyph,
+                page.glyph(),
                 cell.left() + cell.width() / 2.0,
                 cell.top() + 13.0 * u,
                 u,
                 color,
             );
-            let st = sys(10.5 * u, on, color);
-            let (lw, _) = r.measure(name, st);
+            let name = t(page.title());
+            let st = sys(if i18n::is_turkish() { 9.0 } else { 10.0 } * u, on, color);
+            let shown = fit(r, name, st, cell.width() - 2.0 * u);
+            let (lw, _) = r.measure(&shown, st);
             r.draw_text(
                 pm,
                 (cell.left() + (cell.width() - lw) / 2.0).round(),
                 (cell.top() + 22.0 * u).round(),
-                name,
+                &shown,
                 st,
             );
-            self.hits.push((cell, Hit::Tab(i)));
-            if i == TAB_HISTORY && missed > 0 {
-                let label = if missed > 9 {
-                    "9+".to_string()
-                } else {
-                    missed.to_string()
-                };
-                let st = sys(9.5 * u, true, rgb(0xff, 0xff, 0xff));
-                let (lw, lh) = r.measure(&label, st);
-                let bw = (lw + 8.0 * u).max(16.0 * u);
-                let badge = Rect::from_xywh(
-                    cell.left() + cell.width() / 2.0 + 4.0 * u,
-                    cell.top() + 2.0 * u,
-                    bw,
-                    16.0 * u,
+            self.hits.push((cell, Hit::Tab(*page)));
+            if *page == Page::History && missed > 0 {
+                draw_badge(
+                    pm,
+                    r,
+                    cell.left() + cell.width() / 2.0 + 12.0 * u,
+                    cell.top() + 10.0 * u,
+                    missed,
+                    u,
                 );
-                if let Some(b) = badge {
-                    fill_round(pm, Some(b), 8.0 * u, DANGER);
-                    r.draw_text(
-                        pm,
-                        (b.left() + (b.width() - lw) / 2.0).round(),
-                        (b.top() + (b.height() - lh) / 2.0).round(),
-                        &label,
-                        st,
-                    );
-                }
             }
         }
         y + TABS * u + GAP * u
@@ -769,11 +1190,12 @@ impl Panel {
     /// A small grey title above a card.
     fn section(&mut self, pm: &mut Pixmap, r: &mut Renderer, y: f32, x: f32, title: &str) -> f32 {
         let u = self.ui;
+        let title = t(title).to_uppercase();
         r.draw_text(
             pm,
             x + 4.0 * u,
             y + 5.0 * u,
-            title,
+            &title,
             sys(11.0 * u, true, MUTED),
         );
         y + SECTION * u
@@ -788,13 +1210,9 @@ impl Panel {
     /// One line of grey help text.
     fn note(&mut self, pm: &mut Pixmap, r: &mut Renderer, y: f32, x: f32, text: &str) -> f32 {
         let u = self.ui;
-        r.draw_text(
-            pm,
-            x + 4.0 * u,
-            y + 4.0 * u,
-            text,
-            sys(11.0 * u, false, MUTED),
-        );
+        let st = sys(11.0 * u, false, MUTED);
+        let shown = fit(r, t(text), st, self.cw - 8.0 * u);
+        r.draw_text(pm, x + 4.0 * u, y + 4.0 * u, &shown, st);
         y + 22.0 * u
     }
 
@@ -806,8 +1224,13 @@ impl Panel {
         y: f32,
         x: f32,
         inner: f32,
-        s: &Settings,
+        v: &View,
     ) -> f32 {
+        let s = &v.settings;
+        let mut y = y;
+        if self.window {
+            y = self.quick_actions(pm, r, y, x, inner, v);
+        }
         let mut cy = self.card(pm, y, 3);
         let size = format!("{}%", s.size);
         cy = self.stepper_row(pm, r, cy, x, inner, "Size", &size, Field::Size);
@@ -823,7 +1246,7 @@ impl Panel {
             TEXT_SIZES.iter().position(|(v, _)| *v == s.text_size),
         );
         let bubble = match s.notify_secs {
-            0 => "Until clicked".to_string(),
+            0 => t("Until clicked").to_string(),
             n if n % 60 == 0 => format!("{} min", n / 60),
             n => format!("{n} s"),
         };
@@ -831,16 +1254,18 @@ impl Panel {
         // The bubble's keyboard shortcuts, so they can be found.
         let u = self.ui;
         let st = sys(11.0 * u, false, MUTED);
-        let (_, th) = r.measure(SHORTCUTS, st);
+        let keys = format!("{}: {SHORTCUTS}", t("Bubble keys"));
+        let keys = fit(r, &keys, st, inner - 8.0 * u);
+        let (_, th) = r.measure(&keys, st);
         r.draw_text(
             pm,
             x + 4.0 * u,
             cy + GAP * u + (ROW * u - GAP * u - th) / 2.0,
-            SHORTCUTS,
+            &keys,
             st,
         );
         cy += ROW * u;
-        cy = self.section(pm, r, cy, x, "WALKING");
+        cy = self.section(pm, r, cy, x, "Walking");
         self.walking(pm, r, cy, x, inner, s)
     }
 
@@ -858,8 +1283,8 @@ impl Panel {
         let u = self.ui;
         let s = &v.settings;
         let mut cy = self.card(pm, y, 7);
-        let age = if v.age == "new here" {
-            "new here".to_string()
+        let age = if v.age == "new here" || i18n::is_turkish() {
+            t(&v.age).to_string()
         } else {
             format!("{} old", v.age)
         };
@@ -939,7 +1364,7 @@ impl Panel {
             Theme::ALL.iter().position(|(t, _)| *t == s.theme),
         );
         cy += GAP * u;
-        cy = self.section(pm, r, cy, x, "SOURCE COLOURS");
+        cy = self.section(pm, r, cy, x, "Source colours");
         let entries: Vec<(String, String)> = s
             .source_colors
             .iter()
@@ -988,7 +1413,7 @@ impl Panel {
     ) -> f32 {
         let u = self.ui;
         let s = &v.settings;
-        let mut cy = self.section(pm, r, y, x, "TOYS");
+        let mut cy = self.section(pm, r, y, x, "Toys");
         let card_h = TILE + 16.0;
         if let Some(card) = Rect::from_xywh(x, cy, inner, card_h * u) {
             fill_card(pm, Some(card), u);
@@ -1035,18 +1460,18 @@ impl Panel {
         } else {
             "Bone"
         };
-        r.draw_text(pm, tx, cy + 12.0 * u, name, sys(13.0 * u, true, INK));
+        r.draw_text(pm, tx, cy + 12.0 * u, t(name), sys(13.0 * u, true, INK));
         let help = if s.toy {
             "Drag it out, or click to throw."
         } else {
             "Put away. Drag it out to play."
         };
-        r.draw_text(pm, tx, cy + 32.0 * u, help, sys(11.0 * u, false, MUTED));
+        r.draw_text(pm, tx, cy + 32.0 * u, t(help), sys(11.0 * u, false, MUTED));
         r.draw_text(
             pm,
             tx,
             cy + 48.0 * u,
-            "Right-click it to put it away.",
+            t("Right-click it to put it away."),
             sys(11.0 * u, false, MUTED),
         );
         cy += card_h * u + GAP * u;
@@ -1161,7 +1586,7 @@ impl Panel {
             Toggle::EventSounds,
         );
         cy += GAP * u;
-        cy = self.section(pm, r, cy, x, "QUIET");
+        cy = self.section(pm, r, cy, x, "Quiet");
         let start = self.card(pm, cy, 4);
         cy = self.toggle_row(
             pm,
@@ -1209,7 +1634,7 @@ impl Panel {
         );
         cy = self.note(pm, r, cy, x, "Same From and To: no quiet hours.");
         cy += GAP * u;
-        cy = self.section(pm, r, cy, x, "BARK SOUNDS");
+        cy = self.section(pm, r, cy, x, "Bark sounds");
         let start = self.card(pm, cy, s.bark_files.len() + 1);
         cy = start;
         for (i, f) in s.bark_files.iter().enumerate() {
@@ -1260,7 +1685,8 @@ impl Panel {
         }
         for l in &v.todos {
             // Title: name and open count on the left, Clear done and ✕ on the right.
-            let title = format!("{} · {} open", l.name.to_uppercase(), l.open_count());
+            let open = if i18n::is_turkish() { "açık" } else { "open" };
+            let title = format!("{} · {} {open}", l.name.to_uppercase(), l.open_count());
             let st = sys(11.0 * u, true, MUTED);
             let shown = fit(r, &title, st, inner - 120.0 * u);
             r.draw_text(pm, x + 4.0 * u, cy + 5.0 * u, &shown, st);
@@ -1289,7 +1715,7 @@ impl Panel {
             }
             if l.items.iter().any(|i| i.done) {
                 let st = sys(11.0 * u, false, MUTED);
-                let label = "Clear done";
+                let label = t("Clear done");
                 let (tw, _) = r.measure(label, st);
                 if let Some(rect) = Rect::from_xywh(bx - tw - 12.0 * u, cy, tw + 12.0 * u, 20.0 * u)
                 {
@@ -1427,6 +1853,586 @@ impl Panel {
         y + ROW * u
     }
 
+    /// Language, the special days, which screen the dog lives on, and the app.
+    fn page_general(
+        &mut self,
+        pm: &mut Pixmap,
+        r: &mut Renderer,
+        y: f32,
+        x: f32,
+        inner: f32,
+        v: &View,
+    ) -> f32 {
+        let u = self.ui;
+        let s = &v.settings;
+        let mut cy = self.card(pm, y, 3);
+        cy = self.choice_row(
+            pm,
+            r,
+            cy,
+            x,
+            inner,
+            "Language",
+            Field::Language,
+            &Lang::ALL.map(|(_, l)| l),
+            Lang::ALL.iter().position(|(l, _)| *l == s.language),
+        );
+        let screens: Vec<String> = std::iter::once(t("Any").to_string())
+            .chain((1..=v.screens.clamp(1, 4)).map(|i| {
+                if i == 1 {
+                    t("Main").to_string()
+                } else {
+                    i.to_string()
+                }
+            }))
+            .collect();
+        let screens: Vec<&str> = screens.iter().map(String::as_str).collect();
+        cy = self.choice_row(
+            pm,
+            r,
+            cy,
+            x,
+            inner,
+            "Screen",
+            Field::Screen,
+            &screens,
+            Some((s.screen as usize).min(screens.len() - 1)),
+        );
+        cy = self.toggle_row(
+            pm,
+            r,
+            cy,
+            x,
+            inner,
+            v.autostart_label,
+            v.autostart,
+            Toggle::Autostart,
+        );
+        cy = self.note(
+            pm,
+            r,
+            cy,
+            x,
+            if i18n::is_turkish() {
+                "Ekran: köpeğin yaşadığı ekran; Herhangi: nereye bırakırsan."
+            } else {
+                "Screen: where the dog lives; Any: wherever you put it."
+            },
+        );
+        cy += GAP * u;
+        cy = self.section(pm, r, cy, x, "Special days");
+        let start = self.card(pm, cy, 2);
+        let label = match (v.silence, v.special) {
+            (true, _) => {
+                if i18n::is_turkish() {
+                    "Özel günler · saygı duruşu"
+                } else {
+                    "Special days · minute of silence"
+                }
+            }
+            (_, Some(crate::special::Day::Remembrance)) => {
+                if i18n::is_turkish() {
+                    "Özel günler · bugün 10 Kasım"
+                } else {
+                    "Special days · 10 November today"
+                }
+            }
+            (_, Some(crate::special::Day::National)) => {
+                if i18n::is_turkish() {
+                    "Özel günler · bayram"
+                } else {
+                    "Special days · a holiday today"
+                }
+            }
+            _ => "Special days",
+        };
+        cy = self.toggle_row(
+            pm,
+            r,
+            start,
+            x,
+            inner,
+            label,
+            s.special_days,
+            Toggle::SpecialDays,
+        );
+        let siren = if i18n::is_turkish() {
+            "09:05'te siren"
+        } else {
+            "Siren at 09:05"
+        };
+        cy = self.toggle_row(pm, r, cy, x, inner, siren, s.siren, Toggle::Siren);
+        let lines: &[&str] = if i18n::is_turkish() {
+            &[
+                "10 Kasım: gün boyu siyah kurdele; 09:05'te köpek durur,",
+                "bir dakika sessiz kalır, sonra Atatürk'ü anan bir balon.",
+                "Bayramlarda (23 Nisan, 19 Mayıs, 30 Ağustos, 29 Ekim)",
+                "tasmada küçük bir bayrak.",
+            ]
+        } else {
+            &[
+                "10 November: a black ribbon all day; at 09:05 the dog",
+                "stands still for a minute of silence, then remembers Atatürk.",
+                "National holidays (23 April, 19 May, 30 August,",
+                "29 October): a little flag on the collar.",
+            ]
+        };
+        for l in lines {
+            cy = self.note(pm, r, cy, x, l) - 6.0 * u;
+        }
+        cy += 6.0 * u + GAP * u;
+        if self.window {
+            cy = self.section(pm, r, cy, x, "App");
+            let start = self.card(pm, cy, 2);
+            cy = self.toggle_row(
+                pm,
+                r,
+                start,
+                x,
+                inner,
+                "Check for updates",
+                s.check_updates,
+                Toggle::CheckUpdates,
+            );
+            cy = self.toggle_row(
+                pm,
+                r,
+                cy,
+                x,
+                inner,
+                "Install updates automatically",
+                s.auto_update,
+                Toggle::AutoUpdate,
+            );
+        }
+        cy
+    }
+
+    /// Notifications on the phone: when, ntfy and Telegram.
+    fn page_phone(
+        &mut self,
+        pm: &mut Pixmap,
+        r: &mut Renderer,
+        y: f32,
+        x: f32,
+        inner: f32,
+        v: &View,
+    ) -> f32 {
+        let u = self.ui;
+        let s = &v.settings;
+        let tr = i18n::is_turkish();
+        let mut cy = self.card(pm, y, 1);
+        cy = self.choice_row(
+            pm,
+            r,
+            cy,
+            x,
+            inner,
+            "When",
+            Field::PhoneWhen,
+            &PHONE_WHEN.map(|(_, l)| l),
+            PHONE_WHEN.iter().position(|(w, _)| *w == s.phone.when),
+        );
+        cy = self.note(
+            pm,
+            r,
+            cy,
+            x,
+            if tr {
+                "Uzaktayken: 5 dk boşta ya da ekran kilitliyken."
+            } else {
+                "Away: idle for 5 minutes, or the screen is locked."
+            },
+        );
+        cy += GAP * u / 2.0;
+
+        cy = self.section(pm, r, cy, x, "ntfy");
+        let n = &s.phone.ntfy;
+        let rows = if n.enabled { 5 } else { 1 };
+        let start = self.card(pm, cy, rows);
+        cy = self.toggle_row(
+            pm,
+            r,
+            start,
+            x,
+            inner,
+            if tr {
+                "ntfy ile gönder"
+            } else {
+                "Send with ntfy"
+            },
+            n.enabled,
+            Toggle::Ntfy,
+        );
+        if n.enabled {
+            cy = self.text_row(
+                pm,
+                r,
+                cy,
+                x,
+                inner,
+                "Server",
+                TextField::NtfyServer,
+                s,
+                None,
+                "https://ntfy.sh",
+            );
+            cy = self.text_row(
+                pm,
+                r,
+                cy,
+                x,
+                inner,
+                "Topic",
+                TextField::NtfyTopic,
+                s,
+                None,
+                "dost-…",
+            );
+            cy = self.text_row(
+                pm,
+                r,
+                cy,
+                x,
+                inner,
+                "Token",
+                TextField::NtfyToken,
+                s,
+                None,
+                if tr { "isteğe bağlı" } else { "optional" },
+            );
+            let bw = (inner - 3.0 * 8.0 * u) / 3.0;
+            for (i, (b, label)) in [
+                (
+                    Button::CopyTopic,
+                    if tr {
+                        "Bağlantıyı kopyala"
+                    } else {
+                        "Copy link"
+                    },
+                ),
+                (Button::NewTopic, if tr { "Yeni konu" } else { "New topic" }),
+                (Button::PhoneTest, "Send a test"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let rect = Rect::from_xywh(
+                    x + 8.0 * u + i as f32 * (bw + 4.0 * u),
+                    cy + 4.0 * u,
+                    bw,
+                    24.0 * u,
+                );
+                self.button(pm, r, rect, label, b, true);
+            }
+            cy += ROW * u;
+            cy = self.note(
+                pm,
+                r,
+                cy,
+                x,
+                if tr {
+                    "ntfy uygulamasında bu konuya abone ol; sorular buton olarak gelir."
+                } else {
+                    "Subscribe to the topic in the ntfy app; questions come with buttons."
+                },
+            );
+        }
+        cy += GAP * u / 2.0;
+
+        cy = self.section(pm, r, cy, x, "Telegram");
+        let tg = &s.phone.telegram;
+        let rows = if tg.enabled { 3 } else { 1 };
+        let start = self.card(pm, cy, rows);
+        cy = self.toggle_row(
+            pm,
+            r,
+            start,
+            x,
+            inner,
+            if tr {
+                "Telegram botu ile gönder"
+            } else {
+                "Send with a Telegram bot"
+            },
+            tg.enabled,
+            Toggle::Telegram,
+        );
+        if tg.enabled {
+            cy = self.text_row(
+                pm,
+                r,
+                cy,
+                x,
+                inner,
+                "Token",
+                TextField::TelegramToken,
+                s,
+                None,
+                "123456:ABC…",
+            );
+            let (state, c) = if tg.token.is_empty() {
+                (t("A bot token from @BotFather.").to_string(), MUTED)
+            } else if tg.chat_id.is_empty() {
+                (
+                    if tr {
+                        "Eşleştirmek için bota /start yaz.".to_string()
+                    } else {
+                        "Send /start to the bot to pair.".to_string()
+                    },
+                    ACCENT_INK,
+                )
+            } else if tr {
+                (format!("Eşleşti · sohbet {}", tg.chat_id), AWAKE)
+            } else {
+                (format!("Paired · chat {}", tg.chat_id), AWAKE)
+            };
+            let st = sys(11.5 * u, false, c);
+            let shown = fit(r, &state, st, inner - 140.0 * u);
+            r.draw_text(pm, x + 12.0 * u, cy + 8.0 * u, &shown, st);
+            let test = Rect::from_xywh(x + inner - 118.0 * u, cy + 4.0 * u, 110.0 * u, 24.0 * u);
+            self.button(pm, r, test, "Send a test", Button::PhoneTest, true);
+            cy += ROW * u;
+            cy = self.note(
+                pm,
+                r,
+                cy,
+                x,
+                if tr {
+                    "Sorulara butonla ya da mesaja yanıt yazarak cevap ver."
+                } else {
+                    "Answer questions with the buttons, or reply to the message."
+                },
+            );
+        }
+        if let Some(e) = &v.phone_status {
+            let st = sys(11.5 * u, false, DANGER);
+            let shown = fit(r, e, st, inner - 8.0 * u);
+            r.draw_text(pm, x + 4.0 * u, cy + 6.0 * u, &shown, st);
+            cy += 24.0 * u;
+        }
+        cy
+    }
+
+    /// What the agents are doing: one row per session, waiting ones first.
+    fn page_agents(
+        &mut self,
+        pm: &mut Pixmap,
+        r: &mut Renderer,
+        y: f32,
+        x: f32,
+        inner: f32,
+        v: &View,
+    ) -> f32 {
+        let u = self.ui;
+        let tr = i18n::is_turkish();
+        if v.sessions.is_empty() {
+            let mut cy = self.note(
+                pm,
+                r,
+                y,
+                x,
+                "No agents yet. They show up here while they work.",
+            );
+            cy = self.note(
+                pm,
+                r,
+                cy,
+                x,
+                if tr {
+                    "OpenCode eklentisi, Claude Code ve Codex kancaları"
+                } else {
+                    "The OpenCode plugin, the Claude Code and Codex hooks"
+                },
+            );
+            return self.note(
+                pm,
+                r,
+                cy,
+                x,
+                if tr {
+                    "ve MCP `session` aracı oturumları bildirir."
+                } else {
+                    "and the MCP `session` tool report sessions."
+                },
+            );
+        }
+        let rows = v.sessions.len();
+        let h = rows as f32 * SESSION_ROW * u;
+        if let Some(card) = Rect::from_xywh(self.cx, y, self.cw, h) {
+            fill_card(pm, Some(card), u);
+        }
+        let now = crate::watch::now_unix();
+        for (i, sess) in v.sessions.iter().enumerate() {
+            let ry = y + i as f32 * SESSION_ROW * u;
+            if i > 0
+                && let Some(rule) = Rect::from_xywh(x + 12.0 * u, ry, inner - 24.0 * u, 1.0)
+            {
+                fill_round(pm, Some(rule), 0.0, TRACK);
+            }
+            let hit = Hit::Session(i);
+            if let Some(row) = Rect::from_xywh(x, ry, inner - 36.0 * u, SESSION_ROW * u) {
+                if sess.open.is_some() && self.hover == Some(hit) {
+                    fill_round(pm, row.inset(2.0 * u), 10.0 * u, HOVER);
+                }
+                self.hits.push((row, hit));
+            }
+            let c = match sess.state {
+                SessionState::Working => ACCENT,
+                SessionState::Waiting => DANGER,
+                SessionState::Done => AWAKE,
+                SessionState::Failed => DANGER,
+                SessionState::Idle => MUTED,
+            };
+            let d = 8.0 * u;
+            fill_round(
+                pm,
+                Rect::from_xywh(x + 14.0 * u, ry + 11.0 * u, d, d),
+                d / 2.0,
+                c,
+            );
+            if sess.state == SessionState::Failed {
+                fill_round(
+                    pm,
+                    Rect::from_xywh(x + 16.0 * u, ry + 13.0 * u, d - 4.0 * u, d - 4.0 * u),
+                    d / 2.0,
+                    CARD,
+                );
+            }
+            let tx = x + 30.0 * u;
+            let label = match (&sess.title, &sess.project) {
+                (t, p) if t.is_empty() && p.is_empty() => sess.source.clone(),
+                (t, p) if p.is_empty() => format!("{} · {t}", sess.source),
+                (t, p) if t.is_empty() => format!("{} · {p}", sess.source),
+                (t, p) => format!("{t} · {p}"),
+            };
+            let secs = now.saturating_sub(sess.since);
+            let state = format!(
+                "{} · {}",
+                t(sess.state.label()),
+                crate::watch::human_secs(secs)
+            );
+            let st_state = sys(11.0 * u, sess.state == SessionState::Waiting, c);
+            let (sw, _) = r.measure(&state, st_state);
+            let right = x + inner - 40.0 * u;
+            r.draw_text(pm, right - sw, ry + 6.0 * u, &state, st_state);
+            let st = sys(12.5 * u, true, INK);
+            let shown = fit(r, &label, st, right - sw - tx - 10.0 * u);
+            r.draw_text(pm, tx, ry + 5.0 * u, &shown, st);
+            let detail = if sess.detail.is_empty() {
+                sess.source.clone()
+            } else {
+                sess.detail.clone()
+            };
+            let st = sys(11.0 * u, false, MUTED);
+            let shown = fit(r, &detail, st, right - tx);
+            r.draw_text(pm, tx, ry + 25.0 * u, &shown, st);
+            let remove = Hit::RemoveSession(i);
+            if let Some(rect) =
+                Rect::from_xywh(x + inner - 32.0 * u, ry + 11.0 * u, 24.0 * u, 24.0 * u)
+            {
+                if self.hover == Some(remove) {
+                    fill_round(pm, Some(rect), 7.0 * u, HOVER);
+                }
+                draw_glyph(
+                    pm,
+                    Glyph::Close,
+                    rect.left() + rect.width() / 2.0,
+                    rect.top() + rect.height() / 2.0,
+                    u * 0.8,
+                    if self.hover == Some(remove) {
+                        DANGER
+                    } else {
+                        MUTED
+                    },
+                );
+                self.hits.push((rect, remove));
+            }
+        }
+        let mut cy = y + h + GAP * u;
+        if v.sessions
+            .iter()
+            .any(|s| !matches!(s.state, SessionState::Working | SessionState::Waiting))
+        {
+            let rect = Rect::from_xywh(x, cy, 120.0 * u, 26.0 * u);
+            self.button(pm, r, rect, "Clear done", Button::ClearSessions, true);
+            cy += 34.0 * u;
+        }
+        cy
+    }
+
+    /// Answering a question in words: the question, a field and Send / Cancel.
+    fn page_reply(
+        &mut self,
+        pm: &mut Pixmap,
+        r: &mut Renderer,
+        y: f32,
+        x: f32,
+        inner: f32,
+        v: &View,
+    ) -> f32 {
+        let u = self.ui;
+        let Some((_, title, question, _)) = self.reply.clone() else {
+            return y;
+        };
+        let mut cy = y;
+        if !self.window && !title.is_empty() {
+            let st = sys(13.0 * u, true, INK);
+            let shown = fit(r, &title, st, inner - 8.0 * u);
+            r.draw_text(pm, x + 4.0 * u, cy + 2.0 * u, &shown, st);
+            cy += 22.0 * u;
+        }
+        // The question, wrapped by words into lines that fit.
+        let st = sys(12.5 * u, false, INK);
+        let mut lines: Vec<String> = Vec::new();
+        for para in question.lines() {
+            let mut line = String::new();
+            for word in para.split_whitespace() {
+                let next = if line.is_empty() {
+                    word.to_string()
+                } else {
+                    format!("{line} {word}")
+                };
+                if r.measure(&next, st).0 > inner - 8.0 * u && !line.is_empty() {
+                    lines.push(std::mem::take(&mut line));
+                    line = word.to_string();
+                } else {
+                    line = next;
+                }
+            }
+            lines.push(line);
+        }
+        for l in lines.iter().take(8) {
+            r.draw_text(pm, x + 4.0 * u, cy, l, st);
+            cy += 18.0 * u;
+        }
+        cy += GAP * u;
+        let start = self.card(pm, cy, 1);
+        cy = self.text_row(
+            pm,
+            r,
+            start,
+            x,
+            inner,
+            "Answer",
+            TextField::Reply,
+            &v.settings,
+            None,
+            if i18n::is_turkish() {
+                "kendi sözlerinle…"
+            } else {
+                "in your own words…"
+            },
+        );
+        cy += GAP * u;
+        let bw = 96.0 * u;
+        let send = Rect::from_xywh(x + inner - bw, cy, bw, 28.0 * u);
+        self.button(pm, r, send, "Send", Button::ReplySend, false);
+        let cancel = Rect::from_xywh(x + inner - 2.0 * bw - 8.0 * u, cy, bw, 28.0 * u);
+        self.button(pm, r, cancel, "Cancel", Button::ReplyCancel, true);
+        cy + 36.0 * u
+    }
+
     /// The latest notifications: time, source, title and what happened.
     fn tab_history(
         &mut self,
@@ -1438,12 +2444,16 @@ impl Panel {
         v: &View,
     ) -> f32 {
         let u = self.ui;
-        let rows = 5;
+        let rows = if self.window {
+            v.history.len().clamp(5, 50)
+        } else {
+            5
+        };
         let card = self.card_start(y, rows);
         fill_card(pm, card, u);
         if v.history.is_empty() {
             let st = sys(12.5 * u, false, MUTED);
-            let msg = "Nothing yet. Notifications show up here.";
+            let msg = t("Nothing yet. Notifications show up here.");
             let (tw, th) = r.measure(msg, st);
             r.draw_text(
                 pm,
@@ -1525,7 +2535,7 @@ impl Panel {
         cy += GAP * u;
 
         // Web pages that may call the server from a browser (CORS).
-        cy = self.section(pm, r, cy, x, "BROWSERS");
+        cy = self.section(pm, r, cy, x, "Browsers");
         let cors = &s.mcp_cors;
         let any = cors.allow_origins.iter().any(|o| o == "*");
         let custom = !any && (self.custom_origins || !cors.allow_origins.is_empty());
@@ -1584,7 +2594,7 @@ impl Panel {
         cy = self.note(pm, r, cy, x, "Pages on localhost can always connect.");
         cy += GAP * u;
 
-        cy = self.section(pm, r, cy, x, "APP");
+        cy = self.section(pm, r, cy, x, "App");
         let start = self.card(pm, cy, 3);
         cy = self.toggle_row(
             pm,
@@ -1639,7 +2649,7 @@ impl Panel {
             pm,
             x + 12.0 * u,
             y + 8.0 * u,
-            label,
+            t(label),
             sys(13.0 * u, false, INK),
         );
         let st_suffix = sys(11.0 * u, false, MUTED);
@@ -1653,8 +2663,8 @@ impl Panel {
                 st_suffix,
             );
         }
-        let fx = x + 88.0 * u;
-        let fw = inner - 88.0 * u - 6.0 * u - sw;
+        let fx = x + self.label_w();
+        let fw = inner - self.label_w() - 6.0 * u - sw;
         let Some(field) = Rect::from_xywh(fx, y + 4.0 * u, fw, 24.0 * u) else {
             return y + ROW * u;
         };
@@ -1673,7 +2683,11 @@ impl Panel {
             border,
             if editing.is_some() { 1.5 * u } else { 1.0 },
         );
-        let value = Self::field_value(f, s);
+        let mut value = Self::field_value(f, s);
+        if f.secret() && editing.is_none() && !value.is_empty() {
+            value = "•".repeat(value.chars().count().min(16));
+        }
+        let hint = t(hint);
         let text = editing.map_or(value.as_str(), |e| e.text.as_str());
         let max = fw - 16.0 * u;
         let (shown, st) = if text.is_empty() && editing.is_none() {
@@ -1783,11 +2797,11 @@ impl Panel {
             pm,
             x + 12.0 * u,
             y + 8.0 * u,
-            label,
+            t(label),
             sys(13.0 * u, false, INK),
         );
-        let seg_x = x + 88.0 * u;
-        let seg_w = inner - 88.0 * u - 6.0 * u;
+        let seg_x = x + self.label_w();
+        let seg_w = inner - self.label_w() - 6.0 * u;
         let seg = Rect::from_xywh(seg_x, y + 5.0 * u, seg_w, 22.0 * u);
         fill_round(pm, seg, 8.0 * u, TRACK);
         let bw = 30.0 * u;
@@ -1845,13 +2859,13 @@ impl Panel {
             pm,
             x + 12.0 * u,
             y + 8.0 * u,
-            label,
+            t(label),
             sys(13.0 * u, false, INK),
         );
         let d = 18.0 * u;
         let gap = if colors.len() > 6 { 7.0 * u } else { 10.0 * u };
         for (i, c) in colors.iter().enumerate() {
-            let cx = x + 88.0 * u + i as f32 * (d + gap);
+            let cx = x + self.label_w() + i as f32 * (d + gap);
             let Some(cell) = Rect::from_xywh(cx - 3.0 * u, y + 4.0 * u, d + 6.0 * u, d + 6.0 * u)
             else {
                 continue;
@@ -1907,6 +2921,7 @@ impl Panel {
         fill_round(pm, Some(rule), 0.0, BORDER);
         let mut lx = x;
         for (label, b) in [("Settings file", Button::OpenDir), ("Quit", Button::Quit)] {
+            let label = t(label);
             let hover = self.hover == Some(Hit::Button(b));
             let color = match (b, hover) {
                 (Button::Quit, true) => DANGER,
@@ -1931,12 +2946,23 @@ impl Panel {
             self.hits.push((rect, Hit::Button(b)));
             lx = rect.right() + 4.0 * u;
         }
-        // The version; a newer one shows up here, and clicking checks / restarts.
+        self.version_link(pm, r, x + inner, y, v);
+        y + FOOTER * u + PAD * u
+    }
+
+    /// The version, right-aligned at `right`; a newer one shows up here, and clicking checks
+    /// for updates (or restarts into one).
+    fn version_link(&mut self, pm: &mut Pixmap, r: &mut Renderer, right: f32, y: f32, v: &View) {
+        let u = self.ui;
+        let (x, inner) = (right, 0.0);
         let hover = self.hover == Some(Hit::Button(Button::Version));
+        let tr = i18n::is_turkish();
         let (version, color) = match &v.update {
+            Some((nv, true)) if tr => (format!("v{nv} hazır · Yeniden başlat"), ACCENT_INK),
+            Some((nv, false)) if tr => (format!("v{nv} çıktı"), ACCENT_INK),
             Some((nv, true)) => (format!("v{nv} ready · Restart"), ACCENT_INK),
             Some((nv, false)) => (format!("v{nv} is out"), ACCENT_INK),
-            None if hover => ("Check for updates".to_string(), INK),
+            None if hover => (t("Check for updates").to_string(), INK),
             None => (format!("v{}", v.version), MUTED),
         };
         let st = sys(11.0 * u, v.update.is_some(), color);
@@ -1955,7 +2981,6 @@ impl Panel {
             &version,
             st,
         );
-        y + FOOTER * u + PAD * u
     }
 
     /// Mouse moved to (`x`, `y`), physical pixels relative to the panel. Returns true if the
@@ -2027,18 +3052,45 @@ impl Panel {
             });
             return saved;
         }
-        // Clicking anywhere else saves the field being edited.
-        if let Some(a) = self.finish_editing(v) {
+        // Cancel on the reply page drops what was typed.
+        if hit == Some(Hit::Button(Button::ReplyCancel)) {
+            self.end_reply();
+            return None;
+        }
+        // Clicking anywhere else saves the field being edited; a reply is only sent by Send
+        // (or Enter).
+        let replying = self
+            .editing
+            .as_ref()
+            .is_some_and(|e| e.field == TextField::Reply);
+        if (!replying || hit == Some(Hit::Button(Button::ReplySend)))
+            && let Some(a) = self.finish_editing(v)
+        {
             return Some(a);
         }
         let mut s = v.settings.clone();
         match hit? {
-            Hit::Tab(i) => {
-                if self.tab != i {
-                    self.set_tab(i);
-                    self.missed = 0;
+            Hit::Tab(page) => {
+                if self.page != page {
+                    self.set_page(page);
+                    if page != Page::History {
+                        self.missed = 0;
+                    }
                 }
                 return None;
+            }
+            Hit::Session(i) => {
+                return v
+                    .sessions
+                    .get(i)
+                    .and_then(|s| s.open.clone())
+                    .map(Action::OpenUrl);
+            }
+            Hit::RemoveSession(i) => {
+                return v
+                    .sessions
+                    .get(i)
+                    .map(|s| Action::RemoveSession(s.id.clone()));
             }
             Hit::Text(_) => return None,
             Hit::ToyTile => return toy_click.then_some(Action::Fetch),
@@ -2104,6 +3156,9 @@ impl Panel {
                     }
                 }
                 Field::Wear => s.wear = Wear::ALL[i].0,
+                Field::Language => s.language = Lang::ALL[i].0,
+                Field::PhoneWhen => s.phone.when = PHONE_WHEN[i].0,
+                Field::Screen => s.screen = i as u32,
                 Field::Theme => s.theme = Theme::ALL[i].0,
                 Field::Browsers => {
                     self.custom_origins = i == 2;
@@ -2139,6 +3194,15 @@ impl Panel {
                 Toggle::Seasonal => s.seasonal = !s.seasonal,
                 Toggle::EventSounds => s.event_sounds = !s.event_sounds,
                 Toggle::Toy => s.toy = !s.toy,
+                Toggle::SpecialDays => s.special_days = !s.special_days,
+                Toggle::Siren => s.siren = !s.siren,
+                Toggle::Ntfy => {
+                    s.phone.ntfy.enabled = !s.phone.ntfy.enabled;
+                    if s.phone.ntfy.enabled && s.phone.ntfy.topic.is_empty() {
+                        s.phone.ntfy.topic = crate::remote::random_topic();
+                    }
+                }
+                Toggle::Telegram => s.phone.telegram.enabled = !s.phone.telegram.enabled,
                 Toggle::Autostart => return Some(Action::ToggleAutostart),
             },
             Hit::Slider => return None,
@@ -2152,6 +3216,16 @@ impl Panel {
                     Button::Version => Action::CheckUpdate,
                     Button::Quit => Action::Quit,
                     Button::Close => Action::Close,
+                    Button::AllSettings => Action::OpenSettings,
+                    Button::PhoneTest => Action::PhoneTest,
+                    Button::NewTopic => Action::NewTopic,
+                    Button::CopyTopic => Action::CopyText(ntfy_link(&s)),
+                    Button::ClearSessions => Action::ClearSessions,
+                    Button::ReplyCancel => {
+                        self.end_reply();
+                        return None;
+                    }
+                    Button::ReplySend => return None,
                 });
             }
         }
@@ -2172,9 +3246,12 @@ impl Panel {
     }
 
     fn card_start(&self, y: f32, rows: usize) -> Option<Rect> {
-        let u = self.ui;
-        let w = WIDTH * u - 2.0 * PAD * u;
-        Rect::from_xywh(PAD * u, y, w, rows as f32 * ROW * u)
+        Rect::from_xywh(self.cx, y, self.cw, rows as f32 * ROW * self.ui)
+    }
+
+    /// Width of the label column of a row (physical).
+    fn label_w(&self) -> f32 {
+        (if self.window { LABEL_W_WINDOW } else { LABEL_W }) * self.ui
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2195,17 +3272,17 @@ impl Panel {
             pm,
             x + 12.0 * u,
             y + 8.0 * u,
-            label,
+            t(label),
             sys(13.0 * u, false, INK),
         );
         // Segmented control on the right; options share the space by text width.
-        let seg_x = x + 88.0 * u;
-        let seg_w = inner - 88.0 * u - 6.0 * u;
+        let seg_x = x + self.label_w();
+        let seg_w = inner - self.label_w() - 6.0 * u;
         let seg = Rect::from_xywh(seg_x, y + 5.0 * u, seg_w, 22.0 * u);
         fill_round(pm, seg, 8.0 * u, TRACK);
         let widths: Vec<f32> = options
             .iter()
-            .map(|o| r.measure(o, sys(11.5 * u, false, INK)).0 + 10.0 * u)
+            .map(|o| r.measure(t(o), sys(11.5 * u, false, INK)).0 + 10.0 * u)
             .collect();
         let total: f32 = widths.iter().sum();
         let mut ox = seg_x;
@@ -2223,6 +3300,7 @@ impl Panel {
                 fill_round(pm, cell.inset(2.0 * u), 6.0 * u, HOVER);
             }
             let st = sys(11.5 * u, on, if on { INK } else { MUTED });
+            let o = t(o);
             let (tw, th) = r.measure(o, st);
             r.draw_text(
                 pm,
@@ -2247,20 +3325,20 @@ impl Panel {
         inner: f32,
         label: &str,
         on: bool,
-        t: Toggle,
+        tg: Toggle,
     ) -> f32 {
         let u = self.ui;
         let Some(row) = Rect::from_xywh(x, y, inner, ROW * u) else {
             return y + ROW * u;
         };
-        if self.hover == Some(Hit::Toggle(t)) {
+        if self.hover == Some(Hit::Toggle(tg)) {
             fill_round(pm, row.inset(2.0 * u), 10.0 * u, HOVER);
         }
         r.draw_text(
             pm,
             x + 12.0 * u,
             y + 8.0 * u,
-            label,
+            t(label),
             sys(13.0 * u, false, INK),
         );
         let sw = Rect::from_xywh(x + inner - 44.0 * u, y + 7.0 * u, 34.0 * u, 18.0 * u);
@@ -2276,7 +3354,7 @@ impl Panel {
             7.0 * u,
             CARD,
         );
-        self.hits.push((row, Hit::Toggle(t)));
+        self.hits.push((row, Hit::Toggle(tg)));
         y + ROW * u
     }
 
@@ -2304,8 +3382,8 @@ impl Panel {
         let (lw, _) = r.measure("100%", st);
         let (tw, _) = r.measure(&label, st);
         r.draw_text(pm, x + inner - 10.0 * u - tw, y + 9.0 * u, &label, st);
-        let track_x = x + 88.0 * u;
-        let track_w = inner - 88.0 * u - 20.0 * u - lw;
+        let track_x = x + self.label_w();
+        let track_w = inner - self.label_w() - 20.0 * u - lw;
         let track = Rect::from_xywh(track_x, y + 14.0 * u, track_w, 4.0 * u);
         fill_round(pm, track, 2.0 * u, TRACK);
         let t = volume as f32 / 100.0;
@@ -2372,6 +3450,7 @@ impl Panel {
                 fg
             },
         );
+        let label = t(label);
         let (tw, th) = r.measure(label, st);
         r.draw_text(
             pm,
@@ -2416,6 +3495,11 @@ enum Glyph {
     Check,
     Clock,
     Plug,
+    /// A cog: General, and the settings window.
+    Gear,
+    Phone,
+    /// Two heads: the Agents page.
+    Agents,
 }
 
 fn draw_glyph(pm: &mut Pixmap, g: Glyph, cx: f32, cy: f32, u: f32, c: ColorU8) {
@@ -2566,6 +3650,57 @@ fn draw_glyph(pm: &mut Pixmap, g: Glyph, cx: f32, cy: f32, u: f32, c: ColorU8) {
             stroke(pm, pb, 1.6);
             let (bx, by) = p(-5.0, -3.5);
             fill_round(pm, Rect::from_xywh(bx, by, 10.0 * u, 7.5 * u), 2.5 * u, c);
+        }
+        Glyph::Gear => {
+            let mut pb = PathBuilder::new();
+            for i in 0..8 {
+                let a = i as f32 * std::f32::consts::FRAC_PI_4;
+                let (x0, y0) = p(4.6 * a.cos(), 4.6 * a.sin());
+                let (x1, y1) = p(7.0 * a.cos(), 7.0 * a.sin());
+                pb.move_to(x0, y0);
+                pb.line_to(x1, y1);
+            }
+            stroke(pm, pb, 2.4);
+            let mut pb = PathBuilder::new();
+            let (x, y) = p(0.0, 0.0);
+            pb.push_circle(x, y, 4.6 * u);
+            stroke(pm, pb, 1.8);
+        }
+        Glyph::Phone => {
+            let (bx, by) = p(-4.0, -7.0);
+            if let Some(r) = Rect::from_xywh(bx, by, 8.0 * u, 14.0 * u)
+                && let Some(path) = round_rect(r, 2.0 * u)
+            {
+                let s = Stroke {
+                    width: 1.6 * u,
+                    ..Stroke::default()
+                };
+                pm.stroke_path(&path, &paint(c), &s, Transform::identity(), None);
+            }
+            let mut pb = PathBuilder::new();
+            let (x0, y0) = p(-1.2, 4.5);
+            let (x1, y1) = p(1.2, 4.5);
+            pb.move_to(x0, y0);
+            pb.line_to(x1, y1);
+            stroke(pm, pb, 1.4);
+        }
+        Glyph::Agents => {
+            let mut pb = PathBuilder::new();
+            oval(&mut pb, -3.0, -2.5, 2.6, 2.6);
+            oval(&mut pb, 4.0, -1.0, 2.1, 2.1);
+            fill(pm, pb);
+            let mut pb = PathBuilder::new();
+            let (x0, y0) = p(-7.5, 6.5);
+            let (xm, ym) = p(-3.0, -0.5);
+            let (x1, y1) = p(1.5, 6.5);
+            pb.move_to(x0, y0);
+            pb.quad_to(xm, ym, x1, y1);
+            let (x0, y0) = p(1.0, 5.5);
+            let (xm, ym) = p(4.0, 0.5);
+            let (x1, y1) = p(7.5, 5.5);
+            pb.move_to(x0, y0);
+            pb.quad_to(xm, ym, x1, y1);
+            stroke(pm, pb, 1.8);
         }
     }
 }
@@ -2772,6 +3907,59 @@ impl Inset for Rect {
     }
 }
 
+/// Background of the settings window's sidebar.
+const SIDEBAR_BG: ColorU8 = rgb(0xf3, 0xed, 0xe4);
+
+/// The choices of "When" on the Phone page.
+const PHONE_WHEN: [(PhoneWhen, &str); 3] = [
+    (PhoneWhen::Away, "Away"),
+    (PhoneWhen::Always, "Always"),
+    (PhoneWhen::Never, "Never"),
+];
+
+/// The ntfy topic's web address (to open or subscribe to on the phone).
+fn ntfy_link(s: &Settings) -> String {
+    format!("{}/{}", s.phone.ntfy.server, s.phone.ntfy.topic)
+}
+
+/// The dog's state in words, and the colour of its dot.
+fn status_label(v: &View) -> (&'static str, ColorU8) {
+    match (v.visible, v.sleeping) {
+        _ if v.silence => ("Quiet", MUTED),
+        (false, true) => ("Hidden · asleep", MUTED),
+        (true, true) => ("Sleeping", MUTED),
+        (false, false) => ("Hidden", MUTED),
+        (true, false) if v.quiet => ("Quiet", ACCENT),
+        (true, false) => ("Awake", AWAKE),
+    }
+}
+
+fn color8(c: ColorU8) -> Color {
+    Color::from_rgba8(c.red(), c.green(), c.blue(), c.alpha())
+}
+
+/// A small red count centred at (`cx`, `cy`).
+fn draw_badge(pm: &mut Pixmap, r: &mut Renderer, cx: f32, cy: f32, n: usize, u: f32) {
+    let label = if n > 9 {
+        "9+".to_string()
+    } else {
+        n.to_string()
+    };
+    let st = sys(9.5 * u, true, rgb(0xff, 0xff, 0xff));
+    let (lw, lh) = r.measure(&label, st);
+    let bw = (lw + 8.0 * u).max(16.0 * u);
+    if let Some(b) = Rect::from_xywh(cx - bw / 2.0, cy - 8.0 * u, bw, 16.0 * u) {
+        fill_round(pm, Some(b), 8.0 * u, DANGER);
+        r.draw_text(
+            pm,
+            (b.left() + (b.width() - lw) / 2.0).round(),
+            (b.top() + (b.height() - lh) / 2.0).round(),
+            &label,
+            st,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2843,7 +4031,7 @@ mod tests {
         assert_eq!(p.pointer_up(x, y, &v), Some(Action::Quit));
 
         // Sound lives on its own tab: switching tabs is not an action.
-        let (x, y) = find(&p, Hit::Tab(TAB_SOUND));
+        let (x, y) = find(&p, Hit::Tab(Page::Sound));
         assert_eq!(p.pointer_up(x, y, &v), None);
         p.draw(&mut pm, &mut r, &v);
         assert!(
@@ -2891,7 +4079,7 @@ mod tests {
         let mut v = view();
         let (w, h) = p.size(10_000);
         let mut pm = Pixmap::new(w, h).unwrap();
-        p.set_tab(TAB_CONNECT);
+        p.set_page(Page::Connect);
         p.draw(&mut pm, &mut r, &v);
 
         // Address: a bad one is dropped, a good one saved.
@@ -3151,7 +4339,7 @@ mod tests {
         assert!(!p.is_editing());
         p.pointer_up(x, y, &v);
         p.key(Key::Text("y".into()), &v);
-        let (tx, ty) = find(&p, Hit::Tab(0));
+        let (tx, ty) = find(&p, Hit::Tab(Page::Dog));
         assert!(matches!(p.pointer_up(tx, ty, &v), Some(Action::Settings(s)) if s.name == "Dosty"));
         // Too long names stop at the limit.
         p.pointer_up(x, y, &v);
@@ -3178,25 +4366,25 @@ mod tests {
             p.set_arrow(arrow);
             let (w, h) = p.size(10_000);
             let mut pm = Pixmap::new(w, h).unwrap();
-            for tab in 0..TAB_NAMES.len() {
-                p.set_tab(tab);
+            for tab in TABS_POPOVER {
+                p.set_page(tab);
                 p.draw(&mut pm, &mut r, &view());
                 // Nothing clickable outside the panel, and the footer is always there.
                 assert!(
                     p.hits.iter().all(|(r, _)| r.bottom() <= h as f32 + 1.0),
-                    "tab {tab}"
+                    "tab {tab:?}"
                 );
                 assert!(p.hits.iter().any(|(_, h)| *h == Hit::Button(Button::Quit)));
                 // Scrolled to the end: no hit leaks over the tabs or the footer.
                 p.scroll_by(-100.0, h);
                 p.draw(&mut pm, &mut r, &view());
-                let (_, tab_y) = find(&p, Hit::Tab(0));
+                let (_, tab_y) = find(&p, Hit::Tab(Page::Dog));
                 let (_, quit_y) = find(&p, Hit::Button(Button::Quit));
                 for (rect, hit) in &p.hits {
                     if !matches!(hit, Hit::Tab(_) | Hit::Button(_)) {
                         assert!(
                             rect.top() > tab_y && rect.bottom() < quit_y,
-                            "tab {tab}: {hit:?}"
+                            "tab {tab:?}: {hit:?}"
                         );
                     }
                 }

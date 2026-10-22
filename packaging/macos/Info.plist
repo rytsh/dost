@@ -14,5 +14,6 @@
   <!-- Menu bar app: no Dock icon. -->
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSAppleEventsUsageDescription</key><string>Dost posts a system notification when important news arrives while the screen is locked.</string>
 </dict>
 </plist>

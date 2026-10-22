@@ -8,13 +8,17 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::dog::{Anim, Bounds, Dog};
+use crate::i18n::{self, t};
 use crate::look::{self, Outfit};
 use crate::mcp::{self, DogStatus, HISTORY_LEN, HistoryEntry, Mcp};
 use crate::notify::{self, Event, Mood, Notification, Notifier, ProgressState, Reaction};
 use crate::panel::{self, Action};
+use crate::remote::{PhoneWhen, Remote, RemoteEvent, RemoteMessage};
 use crate::render::{Bubble, Hits, Renderer, Scale};
+use crate::sessions::{self, Sessions};
 use crate::settings::{self, Settings, Store};
 use crate::sound::{Sounds, Voice};
+use crate::special;
 use crate::todo::Todos;
 use crate::toy::{self, Toy};
 use crate::update;
@@ -63,6 +67,14 @@ pub trait Platform {
     fn quit(&mut self);
     /// "Start with Windows" / "Open at login".
     fn autostart_label(&self) -> &'static str;
+    /// Opens the big settings window (or brings it to the front).
+    fn open_settings_window(&mut self) {}
+    /// Opens the panel on a text field to answer question `id` in words.
+    fn open_reply(&mut self, _id: u64, _title: &str, _question: &str) {}
+    /// How many screens there are (for the Screen setting).
+    fn screen_count(&self) -> usize {
+        1
+    }
 }
 
 /// Global keyboard shortcuts for the bubble (⌥⌘ on macOS, Ctrl+Alt on Windows).
@@ -151,6 +163,22 @@ pub struct Core {
     pub toy: Toy,
     /// The day the outfit was last chosen (holidays change at midnight).
     look_day: Option<chrono::NaiveDate>,
+    /// The phone channels (ntfy, Telegram).
+    remote: Remote,
+    /// The last problem a phone channel had, for the settings.
+    pub phone_status: Option<String>,
+    /// The phone settings the channels were last set up with.
+    phone_cfg: Option<crate::remote::PhoneSettings>,
+    /// Notifications sent to the phone that wait for an answer there: id -> sent.
+    remote_open: std::collections::HashSet<u64>,
+    /// What agents are doing.
+    pub sessions: Arc<Sessions>,
+    last_session_check: Instant,
+    /// The minute of silence (10 November, 09:05) lasts until then.
+    silence_until: Option<Instant>,
+    /// The day the special-day bubble was shown (once a day).
+    special_shown: Option<chrono::NaiveDate>,
+    last_special_check: Instant,
 }
 
 impl Core {
@@ -173,29 +201,50 @@ impl Core {
         // Hidden or asleep from last time: no hello bark.
         let quiet_start = !core.visible || core.dog.is_put_to_sleep();
         let name = core.settings.name.clone();
+        let tr = i18n::is_turkish();
         let hello = match &core.mcp_error {
             None if quiet_start => None,
             None => Some(
                 match look::Season::on(look::today(), core.settings.birthday()) {
+                    Some(look::Season::Birthday) if tr => Notification::new(
+                        "Hav! Bugün doğum günüm!",
+                        format!("{name} bugün {} oldu. Bana baktığın için teşekkürler.", core.age_text()),
+                    )
+                    .mood(Some(Mood::Good)),
                     Some(look::Season::Birthday) => Notification::new(
                         "Woof! It's my birthday!",
                         format!("{name} is {} today. Thanks for having me.", core.age_text()),
                     )
                     .mood(Some(Mood::Good)),
+                    _ if first_start && tr => Notification::new(
+                        "Hav!",
+                        format!(
+                            "Merhaba, ben {name}. Beni sürükleyebilir, kemiğimi fırlatabilir ya da bana bir ad vermek için simgeme tıklayabilirsin."
+                        ),
+                    ),
                     _ if first_start => Notification::new(
                         "Woof!",
                         format!(
                             "Hi, I'm {name}. Drag me around, throw my bone, or click my tray icon to give me a name."
                         ),
                     ),
+                    _ if tr => Notification::new(
+                        "Hav!",
+                        format!("{name} burada. Beni sürükleyebilir ya da ayarlar için simgeme tıklayabilirsin."),
+                    ),
                     _ => Notification::new(
                         "Woof!",
                         format!("{name} is here. Drag me around, or click my tray icon for settings."),
                     ),
                 }
+                .local()
                 .timeout(Duration::from_secs(6)),
             ),
-            Some(e) => Some(Notification::new("MCP server could not start", e.clone()).sticky()),
+            Some(e) => Some(
+                Notification::new(t("MCP server could not start"), e.clone())
+                    .local()
+                    .sticky(),
+            ),
         };
         if let Some(hello) = hello {
             core.notifier.send(hello);
@@ -205,7 +254,22 @@ impl Core {
 
     /// "2 years" / "1 year" / "3 days" since the birthday.
     pub fn age_text(&self) -> String {
-        age_text(self.settings.birthday(), look::today())
+        let a = age_text(self.settings.birthday(), look::today());
+        if !i18n::is_turkish() {
+            return a;
+        }
+        match a.split_once(' ') {
+            Some(("0", _)) => "bugün geldi".into(),
+            Some((n, unit)) => {
+                let unit = match unit.trim_end_matches('s') {
+                    "year" => "yaşında",
+                    "month" => "aylık",
+                    _ => "günlük",
+                };
+                format!("{n} {unit}")
+            }
+            None => t(&a).to_string(),
+        }
     }
 
     fn build(
@@ -223,12 +287,15 @@ impl Core {
         let todos = Arc::new(Todos::new(
             watches_path.and_then(|p| Some(p.parent()?.join("todos.json"))),
         ));
+        let sessions = Arc::new(Sessions::default());
         let mcp = Arc::new(Mcp::new(
             notifier.clone(),
             watches,
             Arc::clone(&todos),
             Arc::clone(&status),
+            Arc::clone(&sessions),
         ));
+        let remote = Remote::new(notifier.remote_sender());
         Core {
             dog: Dog::new(x.round(), ground),
             renderer,
@@ -272,6 +339,15 @@ impl Core {
             sound_files: Vec::new(),
             toy: Toy::new(x + 90.0, ground),
             look_day: None,
+            remote,
+            phone_status: None,
+            phone_cfg: None,
+            remote_open: Default::default(),
+            sessions,
+            last_session_check: Instant::now(),
+            silence_until: None,
+            special_shown: None,
+            last_special_check: Instant::now() - Duration::from_secs(10),
         }
     }
 
@@ -367,9 +443,23 @@ impl Core {
                 Event::React(r) => self.reactions.push(r),
                 Event::Dismiss(key) => self.dismiss(&key),
                 Event::PanelChanged => self.panel_dirty = true,
+                Event::Remote(e) => self.on_remote(e),
+            }
+        }
+        if now - self.last_special_check >= Duration::from_secs(1) {
+            self.last_special_check = now;
+            self.special_days(p);
+        }
+        if now - self.last_session_check >= Duration::from_secs(30) {
+            self.last_session_check = now;
+            if self.sessions.expire(watch::now_unix()) {
+                self.panel_dirty = true;
             }
         }
         for r in std::mem::take(&mut self.reactions) {
+            if self.in_silence() {
+                continue;
+            }
             self.react(p, r, bounds);
         }
         if std::mem::take(&mut self.toggle_visible) {
@@ -409,10 +499,10 @@ impl Core {
                 self.queue.push_back(note);
             }
         }
-        if self.shown.is_none() && self.ready_for_next() {
+        if self.shown.is_none() && self.ready_for_next() && !self.in_silence() {
             self.show_next(p, now);
         }
-        self.dog.hold = self.shown.is_some() && !self.dog.is_performing();
+        self.dog.hold = (self.shown.is_some() || self.in_silence()) && !self.dog.is_performing();
         self.welcome_back(p.idle_secs());
         self.restart_if_asked(p);
         self.publish_status(p);
@@ -496,6 +586,7 @@ impl Core {
             && !self.dog.is_performing()
             && !self.dog.is_held()
             && !self.dog.is_sleeping()
+            && !self.in_silence()
             && fastrand::f32() < dt / SELF_PLAY_EVERY
         {
             // Now and then it goes and plays with the bone by itself.
@@ -611,8 +702,10 @@ impl Core {
             .then(|| look::Season::on(today, s.birthday()))
             .flatten();
         let outfit = Outfit::new(s.wear, season);
+        let pin = s.special_days.then(|| special::Pin::on(today)).flatten();
         self.renderer
             .set_look(s.fur, s.collar, outfit, s.theme, s.source_colors());
+        self.renderer.set_pin(pin);
     }
 
     /// Hide: the dog walks off to the right. Show: it walks back in.
@@ -681,7 +774,223 @@ impl Core {
         n.id = self.next_id;
         self.note_locked(&n);
         self.record(&n, "queued");
+        if let Some(sid) = n.session.clone() {
+            self.session_from(&n, &sid);
+        }
+        self.send_to_phone(&n);
         self.queue.push_back(n);
+    }
+
+    /// The user is away from the computer: idle for a while, or the screen is locked.
+    fn user_away(&self) -> bool {
+        self.away_since.is_some() || self.locked
+    }
+
+    /// Sends a notification to the phone when the settings say so.
+    fn send_to_phone(&mut self, n: &Notification) {
+        let ph = &self.settings.phone;
+        if n.local || n.silent || !ph.any_enabled() {
+            return;
+        }
+        if ph.when == PhoneWhen::Away && !self.user_away() {
+            return;
+        }
+        // A running progress bar is not news; its end is.
+        if n.progress
+            .as_ref()
+            .is_some_and(|p| p.state == ProgressState::Running)
+        {
+            return;
+        }
+        if n.is_question() {
+            self.remote_open.insert(n.id);
+        }
+        self.remote.send(RemoteMessage {
+            id: n.id,
+            source: n.source.clone(),
+            title: n.title.clone(),
+            body: n.body.clone(),
+            choices: n.choices.clone(),
+            allow_text: n.allow_text,
+            url: n.url.clone(),
+            mood: match n.mood {
+                Mood::Good => "good",
+                Mood::Bad => "bad",
+                Mood::Neutral => "neutral",
+            },
+        });
+    }
+
+    /// A question sent to the phone ended here (answered, expired, withdrawn).
+    fn phone_closed(&mut self, id: u64, outcome: &str) {
+        if self.remote_open.remove(&id) {
+            self.remote.resolve(id, outcome);
+        }
+    }
+
+    fn on_remote(&mut self, e: RemoteEvent) {
+        match e {
+            RemoteEvent::Answer { id, answer } => {
+                self.remote_open.remove(&id);
+                let shown = self.shown.as_ref().is_some_and(|s| s.note.id == id);
+                let note = if shown {
+                    self.shown.take().map(|s| s.note)
+                } else {
+                    self.queue
+                        .iter()
+                        .position(|n| n.id == id)
+                        .and_then(|i| self.queue.remove(i))
+                };
+                let Some(note) = note else { return };
+                // A button's label, or (when allowed) the user's own words.
+                let ok = note.choices.contains(&answer) || note.allow_text;
+                if !ok {
+                    if shown {
+                        self.shown = Some(Shown {
+                            note,
+                            deadline: None,
+                            since: Instant::now(),
+                        });
+                    } else {
+                        self.queue.push_front(note);
+                    }
+                    return;
+                }
+                self.send_answer(&note, &answer, "answered on phone");
+                if shown {
+                    self.seen = self.waiting() > 0;
+                }
+            }
+            RemoteEvent::Paired { chat_id } => {
+                let mut s = self.settings.clone();
+                s.phone.telegram.chat_id = chat_id;
+                self.apply_settings(s, true);
+                self.push(
+                    Notification::new("Telegram", t("Dost can reach your phone."))
+                        .local()
+                        .mood(Some(Mood::Good)),
+                );
+            }
+            RemoteEvent::Error { channel, error } => {
+                self.phone_status = Some(format!("{channel}: {error}"));
+                self.panel_dirty = true;
+            }
+        }
+    }
+
+    /// Hands an answer to whoever asked, and records it.
+    fn send_answer(&mut self, note: &Notification, answer: &str, how: &str) {
+        if let Some(tx) = &note.reply {
+            let _ = tx.send(answer.to_string());
+        }
+        if let Some(sid) = &note.session {
+            self.sessions.report(
+                sessions::Report {
+                    id: sid.clone(),
+                    state: Some(sessions::State::Working),
+                    ..Default::default()
+                },
+                watch::now_unix(),
+            );
+        }
+        let id = note.id;
+        let text: String = answer.chars().take(60).collect();
+        self.update_history(id, |h| h.outcome = format!("{how}: {text}"));
+        self.dog.pet();
+    }
+
+    /// A notification from an agent session updates that session.
+    fn session_from(&mut self, n: &Notification, sid: &str) {
+        let state = if n.is_question() {
+            Some(sessions::State::Waiting)
+        } else if let Some(p) = &n.progress {
+            Some(match p.state {
+                ProgressState::Running => sessions::State::Working,
+                ProgressState::Done => sessions::State::Done,
+                ProgressState::Failed => sessions::State::Failed,
+            })
+        } else {
+            match n.mood {
+                Mood::Good => Some(sessions::State::Done),
+                Mood::Bad => Some(sessions::State::Failed),
+                Mood::Neutral => None,
+            }
+        };
+        let detail = if n.body.is_empty() { &n.title } else { &n.body };
+        self.sessions.report(
+            sessions::Report {
+                id: sid.to_string(),
+                source: n.source.clone(),
+                state,
+                detail: Some(detail.chars().take(120).collect()),
+                ..Default::default()
+            },
+            watch::now_unix(),
+        );
+        self.panel_dirty = true;
+    }
+
+    /// The minute of silence is on.
+    pub fn in_silence(&self) -> bool {
+        self.silence_until.is_some_and(|t| Instant::now() < t)
+    }
+
+    /// 10 November: the minute of silence at 09:05 and the remembrance bubble after it;
+    /// national holidays: a bubble in the morning.
+    fn special_days(&mut self, p: &mut dyn Platform) {
+        if !self.settings.special_days {
+            self.silence_until = None;
+            return;
+        }
+        let now = chrono::Local::now().naive_local();
+        let today = now.date();
+        if let Some(left) = special::silence_left(now) {
+            if self.silence_until.is_none() {
+                self.silence_until = Some(Instant::now() + Duration::from_secs(left as u64));
+                // The bubble on screen steps aside; it comes back after.
+                if let Some(s) = self.shown.take() {
+                    let mut note = s.note;
+                    note.announced = true;
+                    self.queue.push_front(note);
+                }
+                self.dog.stand_still();
+                if self.settings.siren
+                    && self.settings.sound
+                    && let Some(wav) =
+                        crate::sound::scaled_wav(&special::siren_wav(), self.settings.volume)
+                {
+                    p.play_wav(wav);
+                }
+                self.panel_dirty = true;
+            }
+            return;
+        }
+        if self.silence_until.is_some_and(|t| Instant::now() >= t) {
+            self.silence_until = None;
+            self.panel_dirty = true;
+        }
+        if self.special_shown == Some(today) {
+            return;
+        }
+        let tr = i18n::is_turkish();
+        let text = if special::remembrance_due(now) {
+            Some(special::remembrance_text(tr))
+        } else if now.time() >= chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap() {
+            special::holiday_text(today, tr)
+        } else {
+            None
+        };
+        let Some((title, body)) = text else { return };
+        self.special_shown = Some(today);
+        let mut n = Notification::new(title, body)
+            .local()
+            .timeout(Duration::from_secs(30));
+        if special::Day::on(today) == Some(special::Day::Remembrance) {
+            n.silent = true;
+        } else {
+            n.mood = Mood::Good;
+        }
+        self.push(n);
     }
 
     /// Withdraws notifications with this key (e.g. a question answered in the terminal).
@@ -703,6 +1012,7 @@ impl Core {
             keep
         });
         for id in gone {
+            self.phone_closed(id, "answered elsewhere");
             self.update_history(id, |h| h.outcome = "answered elsewhere".into());
         }
     }
@@ -721,6 +1031,7 @@ impl Core {
             keep
         });
         for id in gone {
+            self.phone_closed(id, "expired");
             self.update_history(id, |h| h.outcome = "expired (no answer)".into());
         }
     }
@@ -777,7 +1088,7 @@ impl Core {
                 self.update_history(note.id, |h| h.outcome = "missed (hidden)".into());
                 continue;
             }
-            if !note.announced {
+            if !note.announced && !note.silent {
                 if !seen {
                     self.react_to(&note);
                 }
@@ -824,10 +1135,13 @@ impl Core {
         self.panel_dirty = true;
     }
 
-    /// No barking and only important bubbles: quiet hours / Quiet on, or the dog was put
-    /// to sleep.
+    /// No barking and only important bubbles: quiet hours / Quiet on, the dog was put
+    /// to sleep, or the minute of silence.
     pub fn hushed(&self) -> bool {
-        self.settings.is_quiet(local_minute()) || self.dog.is_put_to_sleep() || self.fullscreen
+        self.settings.is_quiet(local_minute())
+            || self.dog.is_put_to_sleep()
+            || self.fullscreen
+            || self.in_silence()
     }
 
     fn record(&mut self, n: &Notification, outcome: &str) {
@@ -887,6 +1201,13 @@ impl Core {
             self.snooze();
             return;
         }
+        if self.hits.reply.is_some_and(inside) {
+            if let Some(s) = &self.shown {
+                let (id, title, body) = (s.note.id, s.note.title.clone(), s.note.body.clone());
+                p.open_reply(id, &title, &body);
+            }
+            return;
+        }
         if let Some(i) = choice {
             self.answer(i);
         } else if on_bubble {
@@ -912,6 +1233,9 @@ impl Core {
                 self.seen = self.waiting() > 0;
             }
         } else {
+            if self.in_silence() {
+                return;
+            }
             self.dog.pet();
             if self.settings.sound && self.settings.sound_on_pet {
                 self.voice(p, Voice::Bark);
@@ -1190,12 +1514,33 @@ impl Core {
     fn answer(&mut self, i: usize) {
         let Some(s) = self.shown.take() else { return };
         let answer = s.note.choices.get(i).cloned().unwrap_or_default();
-        if let Some(tx) = &s.note.reply {
-            let _ = tx.send(answer.clone());
-        }
-        self.update_history(s.note.id, |h| h.outcome = format!("answered: {answer}"));
-        self.dog.pet();
+        self.phone_closed(s.note.id, &format!("answered: {answer}"));
+        self.send_answer(&s.note, &answer, "answered");
         self.seen = self.waiting() > 0;
+    }
+
+    /// The user typed an answer to question `id` (the "Reply…" field).
+    pub fn answer_text(&mut self, id: u64, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let shown = self.shown.as_ref().is_some_and(|s| s.note.id == id);
+        let note = if shown {
+            self.shown.take().map(|s| s.note)
+        } else {
+            self.queue
+                .iter()
+                .position(|n| n.id == id)
+                .and_then(|i| self.queue.remove(i))
+        };
+        let Some(note) = note else { return };
+        self.phone_closed(id, &format!("answered: {text}"));
+        self.send_answer(&note, text, "answered");
+        if shown {
+            self.seen = self.waiting() > 0;
+        }
+        self.panel_dirty = true;
     }
 
     /// "Later": the bubble goes away and comes back after [`SNOOZE`], silently.
@@ -1298,6 +1643,12 @@ impl Core {
         }
         self.mcp.set_name(&s.name);
         self.mcp.set_cors(&s.mcp_cors);
+        if self.phone_cfg.as_ref() != Some(&s.phone) {
+            self.remote.configure(&s.phone);
+            self.phone_cfg = Some(s.phone.clone());
+            self.phone_status = None;
+        }
+        i18n::set(s.language);
         self.settings = s;
         self.apply_look();
         self.panel_dirty = true;
@@ -1379,6 +1730,34 @@ impl Core {
                 p.quit();
             }
             Action::Close => p.close_panel(),
+            Action::OpenSettings => {
+                p.close_panel();
+                p.open_settings_window();
+            }
+            Action::Reply { id, text } => self.answer_text(id, &text),
+            Action::PhoneTest => {
+                self.phone_status = None;
+                self.remote.test();
+            }
+            Action::NewTopic => {
+                let mut s = self.settings.clone();
+                s.phone.ntfy.topic = crate::remote::random_topic();
+                self.apply_settings(s, true);
+            }
+            Action::CopyText(text) => {
+                if p.copy_text(&text) {
+                    self.push(
+                        Notification::new(t("Copy"), text)
+                            .local()
+                            .timeout(Duration::from_secs(4)),
+                    );
+                }
+            }
+            Action::OpenUrl(url) => p.open_url(&url),
+            Action::ClearSessions => self.sessions.clear_finished(),
+            Action::RemoveSession(id) => {
+                self.sessions.remove(&id);
+            }
             Action::Todo(edit) => self.mcp.todo_edit(&edit),
             Action::CheckUpdate => {
                 if self.update_ready {
@@ -1428,6 +1807,15 @@ impl Core {
             quiet: self.settings.is_quiet(local_minute()) || self.fullscreen,
             missed: self.missed,
             todos: self.mcp.todo_lists(),
+            sessions: self.sessions.list(),
+            phone_status: self.phone_status.clone(),
+            screens: p.screen_count(),
+            special: self
+                .settings
+                .special_days
+                .then(|| special::Day::on(look::today()))
+                .flatten(),
+            silence: self.in_silence(),
         }
     }
 
@@ -1459,6 +1847,7 @@ impl Core {
 
     fn publish_status(&self, p: &dyn Platform) {
         let activity = match self.dog.frame().anim {
+            _ if self.in_silence() => "standing in silence (10 November, 09:05)",
             _ if self.dog.is_put_to_sleep() => "sleeping",
             _ if self.dog.is_away() => "away (hidden)",
             _ if self.dog.is_fetching() => "playing fetch",
@@ -1501,6 +1890,7 @@ pub fn bubble_of(shown: Option<&Shown>, pending: usize) -> Option<Bubble<'_>> {
         progress: s.note.progress.as_ref().map(|p| (p.value, p.state)),
         link: s.note.url.is_some(),
         snooze: s.note.can_snooze(),
+        reply: s.note.allow_text,
         time: s.since.elapsed().as_secs_f32(),
     })
 }
@@ -2310,6 +2700,66 @@ mod tests {
         assert!(text.starts_with("Karabaş (the user's dog)"), "{text}");
         assert_eq!(c.renderer.outfit().hat, Some(look::Item::Beanie));
         assert_eq!(c.panel_view(&p).settings.name, "Karabaş");
+    }
+
+    #[test]
+    fn answered_in_words_and_from_the_phone() {
+        let (mut c, mut p) = (core(), Fake::default());
+        let (mut n, rx) = Notification::new("Plan", "Which approach?")
+            .ask(vec!["A".into(), "B".into()], Duration::from_secs(60));
+        n.allow_text = true;
+        n.session = Some("s1".into());
+        c.notifier.send(n);
+        step(&mut c, &mut p);
+        assert!(c.bubble().unwrap().reply);
+        assert_eq!(c.sessions.list()[0].state, sessions::State::Waiting);
+        let id = c.shown.as_ref().unwrap().note.id;
+        c.answer_text(id, "  B, but skip the tests ");
+        assert_eq!(rx.try_recv().unwrap(), "B, but skip the tests");
+        assert_eq!(c.sessions.list()[0].state, sessions::State::Working);
+
+        // From the phone: a choice is taken, anything else only when words are allowed.
+        let (n, rx) = Notification::new("", "Deploy?")
+            .ask(vec!["Yes".into(), "No".into()], Duration::from_secs(60));
+        c.notifier.send(n);
+        step(&mut c, &mut p);
+        let id = c.shown.as_ref().unwrap().note.id;
+        c.on_remote(RemoteEvent::Answer {
+            id,
+            answer: "maybe".into(),
+        });
+        assert!(c.shown.is_some(), "not a choice");
+        c.on_remote(RemoteEvent::Answer {
+            id,
+            answer: "No".into(),
+        });
+        assert_eq!(rx.try_recv().unwrap(), "No");
+        assert!(c.shown.is_none());
+        assert_eq!(history(&c).last().unwrap().1, "answered on phone: No");
+    }
+
+    #[test]
+    fn telegram_pairing_is_saved() {
+        let (mut c, _p) = (core(), Fake::default());
+        c.on_remote(RemoteEvent::Paired {
+            chat_id: "42".into(),
+        });
+        assert_eq!(c.settings.phone.telegram.chat_id, "42");
+    }
+
+    #[test]
+    fn minute_of_silence_holds_everything() {
+        let (mut c, mut p) = (core(), Fake::default());
+        c.silence_until = Some(Instant::now() + Duration::from_secs(60));
+        c.notifier.send(Notification::new("Build done", ""));
+        c.notifier.react(Reaction::Bark);
+        step(&mut c, &mut p);
+        assert!(c.shown.is_none(), "waits");
+        assert_eq!(p.barks, 0);
+        assert!(c.hushed());
+        c.silence_until = Some(Instant::now());
+        step(&mut c, &mut p);
+        assert_eq!(c.shown.as_ref().unwrap().note.title, "Build done");
     }
 
     #[test]

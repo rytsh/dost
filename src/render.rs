@@ -11,8 +11,10 @@ use tiny_skia::{
 };
 
 use crate::dog::{Anim, DogFrame};
+use crate::i18n::t;
 use crate::look::{self, Collar, Fur, Item, Outfit, Theme};
 use crate::notify::ProgressState;
+use crate::special::Pin;
 
 /// Output of `art/pack_atlas.py`: each row is an animation (in `Anim` order), each column a frame.
 const ATLAS_PNG: &[u8] = include_bytes!("../assets/dog.png");
@@ -209,6 +211,8 @@ pub struct Bubble<'a> {
     pub link: bool,
     /// Shows "Later" (snooze) under the text.
     pub snooze: bool,
+    /// Shows "Reply…": the question may be answered in words.
+    pub reply: bool,
     /// Seconds since the bubble appeared (animates the indeterminate bar).
     pub time: f32,
 }
@@ -223,6 +227,8 @@ pub struct Hits {
     pub clear: Option<Rect>,
     /// "Later": shown again in a while.
     pub snooze: Option<Rect>,
+    /// "Reply…": answer in words.
+    pub reply: Option<Rect>,
 }
 
 pub struct Renderer {
@@ -242,6 +248,8 @@ pub struct Renderer {
     /// (sprite pixels).
     heights: [u32; Anim::ALL.len()],
     text: Option<Text>,
+    /// Pinned on the collar for the day (special days).
+    pin: Option<Pin>,
 }
 
 /// Text layout: system fonts, shaping for complex scripts (Arabic, Hindi...),
@@ -315,7 +323,13 @@ impl Renderer {
             source_colors: Vec::new(),
             heights,
             text,
+            pin: None,
         }
+    }
+
+    /// What is pinned on the collar today (a ribbon, a flag), if anything.
+    pub fn set_pin(&mut self, pin: Option<Pin>) {
+        self.pin = pin;
     }
 
     /// Colours, what the dog wears and the bubble theme. Cheap when nothing changed.
@@ -405,6 +419,9 @@ impl Renderer {
                 f.facing < 0.0,
                 (ax, ground, px),
             );
+        }
+        if let Some(pin) = self.pin {
+            draw_pin(pm, pin, f, (ax, ground, px));
         }
     }
 
@@ -644,7 +661,7 @@ impl Renderer {
                 .color(cc(pal.muted))
                 .metrics(Metrics::new(11.5 * scale, 17.0 * scale));
             let body_text: String = b.body.chars().take(400).collect();
-            let more_text = format!("+{} more", b.pending);
+            let more_text = t("+{n} more").replace("{n}", &b.pending.to_string());
             let source_text = b.source.unwrap_or_default().to_string();
             let mut spans: Vec<(&str, Attrs)> = Vec::new();
             for (t, a) in [
@@ -693,8 +710,12 @@ impl Renderer {
         if b.progress.is_some() || b.link {
             tw = tw.max(160.0 * scale);
         }
-        if b.pending > 0 || b.snooze {
-            tw = tw.max(if b.snooze { 190.0 } else { 90.0 } * scale);
+        if b.pending > 0 || b.snooze || b.reply {
+            let mut need: f32 = if b.snooze { 190.0 } else { 90.0 };
+            if b.reply {
+                need += 80.0;
+            }
+            tw = tw.max(need * scale);
         }
         let pad = BUBBLE_PAD * scale;
         (
@@ -824,11 +845,11 @@ impl Renderer {
                 bold: false,
                 color: pal.accent_ink,
             };
-            self.draw_text(pm, x, y, "Click to open ↗", st);
+            self.draw_text(pm, x, y, t("Click to open ↗"), st);
             y += (LINK_H - 4.0) * scale;
         }
-        let (mut clear, mut snooze) = (None, None);
-        if b.pending > 0 || b.snooze {
+        let (mut clear, mut snooze, mut reply) = (None, None, None);
+        if b.pending > 0 || b.snooze || b.reply {
             y += 4.0 * scale;
             let st = TextStyle {
                 size: 12.0 * scale,
@@ -838,9 +859,17 @@ impl Renderer {
             // A little slack around the text so it is easy to hit.
             let slack = 4.0 * scale;
             let mut lx = x;
+            if b.reply {
+                let label = t("Reply…");
+                let (lw, lh) = self.measure(label, st);
+                self.draw_text(pm, lx, y, label, st);
+                reply = Rect::from_xywh(lx - slack, y - slack, lw + 2.0 * slack, lh + 2.0 * slack);
+                lx += lw + 16.0 * scale;
+            }
             if b.pending > 0 {
-                let (lw, lh) = self.measure(CLEAR_ALL, st);
-                self.draw_text(pm, lx, y, CLEAR_ALL, st);
+                let clear_all = t(CLEAR_ALL);
+                let (lw, lh) = self.measure(clear_all, st);
+                self.draw_text(pm, lx, y, clear_all, st);
                 clear = Rect::from_xywh(lx - slack, y - slack, lw + 2.0 * slack, lh + 2.0 * slack);
                 lx += lw + 16.0 * scale;
             }
@@ -849,8 +878,9 @@ impl Renderer {
                     color: pal.muted,
                     ..st
                 };
-                let (lw, lh) = self.measure(SNOOZE, st);
-                self.draw_text(pm, lx, y, SNOOZE, st);
+                let later = t(SNOOZE);
+                let (lw, lh) = self.measure(later, st);
+                self.draw_text(pm, lx, y, later, st);
                 snooze = Rect::from_xywh(lx - slack, y - slack, lw + 2.0 * slack, lh + 2.0 * slack);
             }
             y += (LINK_H - 4.0) * scale;
@@ -905,6 +935,7 @@ impl Renderer {
             choices: buttons,
             clear,
             snooze,
+            reply,
         })
     }
 
@@ -960,7 +991,7 @@ fn extras_height(b: &Bubble, choice_rows: usize) -> f32 {
     if b.link {
         h += LINK_H;
     }
-    if b.pending > 0 || b.snooze {
+    if b.pending > 0 || b.snooze || b.reply {
         h += LINK_H;
     }
     if choice_rows > 0 {
@@ -1343,6 +1374,42 @@ pub fn blit_sprite(pm: &mut Pixmap, atlas: &Pixmap, f: &DogFrame, ax: i32, groun
                 for x in x0.max(0)..(x0 + px).min(pw) {
                     let d = &mut dst[(y * pw + x) as usize];
                     *d = over(p, *d);
+                }
+            }
+        }
+    }
+}
+
+/// A pin on the collar, beside the tag (`NECK`), on the side towards the back.
+fn draw_pin(pm: &mut Pixmap, pin: Pin, f: &DogFrame, (ax, ground, px): (i32, i32, i32)) {
+    let (rows, colors) = pin.pixels();
+    let (nx, ny) = NECK[f.anim.cell(f.frame)];
+    let w = rows[0].len() as i32;
+    // On the collar behind the tag (the tag hangs at the neck's centre), the top at the band.
+    let (left, top) = (nx as i32 - w - 4, ny as i32 - 3);
+    let flip = f.facing < 0.0;
+    let (pw, ph) = (pm.width() as i32, pm.height() as i32);
+    let dst = pm.pixels_mut();
+    for (ry, row) in rows.iter().enumerate() {
+        for (rx, ch) in row.chars().enumerate() {
+            let Some((_, c)) = colors.iter().find(|(k, _)| *k == ch) else {
+                continue;
+            };
+            let Some(p) = PremultipliedColorU8::from_rgba(c[0], c[1], c[2], c[3]) else {
+                continue;
+            };
+            // Mirrored with the dog, but the picture itself is never turned around.
+            let col = if flip { w - 1 - rx as i32 } else { rx as i32 };
+            let dx = left + col;
+            let x0 = if flip {
+                ax - (dx + 1) * px
+            } else {
+                ax + dx * px
+            };
+            let y0 = ground + (top + ry as i32) * px;
+            for y in y0.max(0)..(y0 + px).min(ph) {
+                for x in x0.max(0)..(x0 + px).min(pw) {
+                    dst[(y * pw + x) as usize] = p;
                 }
             }
         }

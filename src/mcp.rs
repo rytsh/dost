@@ -59,6 +59,8 @@ pub struct Mcp {
     /// Todo lists; items with a reminder have a watch that barks it.
     todos: Arc<Todos>,
     status: Arc<Mutex<DogStatus>>,
+    /// What agents are doing (`session`).
+    sessions: Arc<crate::sessions::Sessions>,
     /// The dog's name (settings), used in the tool descriptions.
     name: Mutex<String>,
     /// Which web pages may call the server from a browser (settings).
@@ -135,12 +137,14 @@ impl Mcp {
         watches: Arc<Watches>,
         todos: Arc<Todos>,
         status: Arc<Mutex<DogStatus>>,
+        sessions: Arc<crate::sessions::Sessions>,
     ) -> Self {
         Mcp {
             notifier,
             watches,
             todos,
             status,
+            sessions,
             name: Mutex::new(crate::settings::DEFAULT_NAME.into()),
             cors: Mutex::new(Cors::default()),
         }
@@ -354,6 +358,8 @@ impl Mcp {
             "remove_watch" => self.tool_remove_watch(&args),
             "check_now" => self.tool_check_now(&args),
             "status" => Ok(self.tool_status()),
+            "session" => self.tool_session(&args),
+            "sessions" => Ok(self.tool_sessions()),
             "history" => Ok(self.tool_history(&args)),
             "todo_lists" => Ok(self.tool_todo_lists(&args)),
             "todo_create_list" => self.tool_todo_create_list(&args),
@@ -393,6 +399,7 @@ impl Mcp {
             }
         }
         n.copy = str_arg(a, "copy");
+        n.session = str_arg(a, "session");
         let copied = n.copy.is_some();
         let important = n.is_important();
         if !self.notifier.send(n) {
@@ -443,6 +450,11 @@ impl Mcp {
             .source(str_arg(a, "source"))
             .ask(choices, Duration::from_secs(wait));
         n.key = str_arg(a, "key");
+        n.session = str_arg(a, "session");
+        n.allow_text = a
+            .get("allow_text")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         if !self.notifier.send(n) {
             return Err("the dog is not running".into());
         }
@@ -503,6 +515,7 @@ impl Mcp {
             value,
             state,
         });
+        n.session = str_arg(a, "session");
         if !self.notifier.send(n) {
             return Err("the dog is not running".into());
         }
@@ -816,6 +829,55 @@ impl Mcp {
         serde_json::to_string_pretty(&v).unwrap_or_default()
     }
 
+    fn tool_session(&self, a: &Value) -> Result<String, String> {
+        let id = str_arg(a, "id").ok_or("`id` is required")?;
+        let state = match str_arg(a, "state") {
+            Some(s) => Some(crate::sessions::State::parse(&s).ok_or_else(|| {
+                format!(
+                    "unknown state `{s}`; use one of {}",
+                    crate::sessions::State::NAMES.join(", ")
+                )
+            })?),
+            None => None,
+        };
+        let end = a.get("end").and_then(Value::as_bool).unwrap_or(false);
+        let open = str_arg(a, "open");
+        if let Some(o) = &open
+            && !is_web_url(o)
+        {
+            return Err("`open` must be an http(s) link".into());
+        }
+        let changed = self.sessions.report(
+            crate::sessions::Report {
+                id: id.clone(),
+                source: str_arg(a, "source"),
+                title: str_arg(a, "title"),
+                project: str_arg(a, "project"),
+                state,
+                detail: str_arg(a, "detail").map(|d| d.chars().take(160).collect()),
+                open,
+                end,
+            },
+            crate::watch::now_unix(),
+        );
+        if changed {
+            self.notifier.panel_changed();
+        }
+        Ok(if end {
+            format!("Session `{id}` ended.")
+        } else {
+            format!("Session `{id}` updated; the user sees it in the dog's Agents list.")
+        })
+    }
+
+    fn tool_sessions(&self) -> String {
+        let list = self.sessions.list();
+        if list.is_empty() {
+            return "No agent sessions.".into();
+        }
+        serde_json::to_string_pretty(&list).unwrap_or_default()
+    }
+
     fn tool_history(&self, a: &Value) -> String {
         let limit = a
             .get("limit")
@@ -957,6 +1019,7 @@ fn parse_github(s: &str, a: &Value) -> Result<Check, String> {
 fn tools(name: &str) -> Value {
     let dog = dog_label(name);
     let source = json!({ "type": "string", "description": "Who is sending this (your name, e.g. \"OpenCode\", \"CI\"); shown above the title." });
+    let session = json!({ "type": "string", "description": "Your session id (see `session`): the user's Agents list shows this session waiting, done or failed." });
     let check_props = json!({
         "url": { "type": "string", "description": "HTTP(S) check: sends a GET request to this URL. Met on 2xx (or `status`)." },
         "status": { "type": "integer", "description": "Expected status code for url (default: any 2xx)." },
@@ -1000,6 +1063,7 @@ fn tools(name: &str) -> Value {
                     "mood": { "type": "string", "enum": Mood::NAMES, "description": "good (it worked: the dog is happy), bad (it failed: the dog is sad and howls) or neutral. Default: guessed from the words (failed, error, passed, done...)." },
                     "url": { "type": "string", "description": "http(s) link opened when the user clicks the bubble (a PR, a failed job, a preview)." },
                     "copy": { "type": "string", "description": "Text put on the user's clipboard when the bubble appears (a command to run, a token, a path)." },
+                    "session": session,
                     "sticky": { "type": "boolean", "description": "Keep it until the user clicks it." },
                     "timeout_secs": { "type": "integer", "description": "How long the bubble stays, in seconds (default 10, 30 with a url)." }
                 }
@@ -1017,6 +1081,8 @@ fn tools(name: &str) -> Value {
                     "title": { "type": "string", "description": "Short title above the question." },
                     "source": source,
                     "key": { "type": "string", "description": "Your id for this question, to withdraw it with `dismiss` (e.g. when it was answered somewhere else)." },
+                    "allow_text": { "type": "boolean", "description": "The user may also type an answer in their own words (\"Reply…\"); the result is then that text instead of a choice." },
+                    "session": session,
                     "timeout_secs": { "type": "integer", "minimum": 10, "maximum": ASK_TIMEOUT_MAX, "description": format!("How long to wait for an answer (default {ASK_TIMEOUT}).") }
                 },
                 "required": ["question"]
@@ -1045,7 +1111,8 @@ fn tools(name: &str) -> Value {
                     "value": { "type": "number", "description": "Progress: with `total`, steps done; alone, a fraction 0-1 or a percent 0-100. Omit for an indeterminate bar." },
                     "total": { "type": "number", "description": "Total steps." },
                     "state": { "type": "string", "enum": ["running", "done", "failed"], "description": "Default running." },
-                    "source": source
+                    "source": source,
+                    "session": session
                 },
                 "required": ["id"]
             }
@@ -1122,6 +1189,32 @@ fn tools(name: &str) -> Value {
             "name": "status",
             "title": format!("{name}'s status"),
             "description": format!("Returns the dog's name ({name}) and age, what it is doing, the notification on screen, queued notifications, watches, whether it is quiet (Quiet on, quiet hours, a full-screen app, or the dog put to sleep: no barking, only questions/progress/sticky shown), and how long the user has been idle (no mouse/keyboard)."),
+            "inputSchema": { "type": "object", "properties": {} },
+            "annotations": { "readOnlyHint": true }
+        },
+        {
+            "name": "session",
+            "title": "Report a session",
+            "description": format!("Tells {dog} what your session is doing, so the user can follow several agents at once in the Agents list (settings): working (with the current step in `detail`), waiting (for the user), done, failed or idle. Call it when you start working, when you wait for the user and when you finish; `end` removes it. Questions and progress with the same `session` update it too."),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "A stable id for this session (e.g. your session id)." },
+                    "state": { "type": "string", "enum": crate::sessions::State::NAMES },
+                    "title": { "type": "string", "description": "What the session works on." },
+                    "project": { "type": "string", "description": "The project folder's name." },
+                    "detail": { "type": "string", "description": "The current step, or the last message." },
+                    "open": { "type": "string", "description": "An http(s) link that shows the session (opened when the user clicks it)." },
+                    "end": { "type": "boolean", "description": "The session is over: remove it." },
+                    "source": source
+                },
+                "required": ["id"]
+            }
+        },
+        {
+            "name": "sessions",
+            "title": "Agent sessions",
+            "description": "Lists the agent sessions the user follows and what each is doing.",
             "inputSchema": { "type": "object", "properties": {} },
             "annotations": { "readOnlyHint": true }
         },
@@ -1298,7 +1391,10 @@ mod tests {
         let (tx, rx) = notify::channel();
         let watches = Watches::new(tx.clone(), None);
         let todos = Arc::new(Todos::new(None));
-        (Mcp::new(tx, watches, todos, Arc::default()), rx)
+        (
+            Mcp::new(tx, watches, todos, Arc::default(), Arc::default()),
+            rx,
+        )
     }
 
     #[test]
@@ -1360,6 +1456,8 @@ mod tests {
                 "remove_watch",
                 "check_now",
                 "status",
+                "session",
+                "sessions",
                 "todo_lists",
                 "todo_create_list",
                 "todo_add",

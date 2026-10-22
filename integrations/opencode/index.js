@@ -194,6 +194,18 @@ export default {
     }
     const notify = (title, message, extra = {}) => call("notify", { title, message, ...extra })
 
+    // The session in the dog's Agents list (top-level sessions only).
+    async function report(sessionID, state, detail) {
+      if (await isChild(sessionID)) return
+      const info = await sessionInfo(sessionID)
+      const project = info?.location?.directory?.split(/[\\/]/).filter(Boolean).pop() ?? ""
+      const args = { id: progressID(sessionID), title: short(info?.title ?? "", 60), project }
+      if (state === "end") args.end = true
+      else args.state = state
+      if (detail) args.detail = short(detail)
+      await call("session", args)
+    }
+
     // Cache session titles and whether a session is a sub-agent.
     const sessions = new Map()
     async function sessionInfo(sessionID) {
@@ -241,6 +253,7 @@ export default {
         "ask",
         {
           key: data.id,
+          session: progressID(data.sessionID),
           title: t.permission(await label(data.sessionID)),
           question: short(data.message || t.wants(what), 200),
           choices,
@@ -268,6 +281,7 @@ export default {
       switch (event.type) {
         case "session.execution.started": {
           running.set(data.sessionID, { started: event.created ?? Date.now(), steps: 0, tool: "", shown: false })
+          report(data.sessionID, "working").catch(() => {})
           if (!want.progress || (await isChild(data.sessionID))) return
           const sessionID = data.sessionID
           setTimeout(() => {
@@ -280,11 +294,16 @@ export default {
         case "session.metadata.updated":
           sessions.delete(data.sessionID)
           return
+        case "session.deleted":
+          report(data.sessionID, "end").catch(() => {})
+          return
         case "form.created": {
           if (!want.question) return
           const form = data.form
+          report(form.sessionID, "waiting", formSummary(form)).catch(() => {})
           await notify(t.question(await label(form.sessionID)), formSummary(form) || t.waiting, {
             sticky: true,
+            session: progressID(form.sessionID),
           })
           return
         }
@@ -296,13 +315,15 @@ export default {
         case "permission.replied": {
           // Answered in the terminal (or by us): take the bubble away.
           if (pendingAsks.delete(data.requestID)) await call("dismiss", { key: data.requestID })
+          if (data.sessionID) report(data.sessionID, "working").catch(() => {})
           return
         }
         case "session.execution.succeeded": {
           const task = running.get(data.sessionID)
           running.delete(data.sessionID)
-          if (!want.done || (await isChild(data.sessionID))) return
           const elapsed = (event.created ?? Date.now()) - (task?.started ?? Date.now())
+          report(data.sessionID, "done", t.yourTurn(duration(elapsed))).catch(() => {})
+          if (!want.done || (await isChild(data.sessionID))) return
           if (task && elapsed < minWorkMs) return
           const title = t.done(await label(data.sessionID))
           const message = t.yourTurn(duration(elapsed))
@@ -316,6 +337,7 @@ export default {
         case "session.execution.failed": {
           const task = running.get(data.sessionID)
           running.delete(data.sessionID)
+          report(data.sessionID, "failed", data.error?.message || t.failed).catch(() => {})
           if (!want.error || (await isChild(data.sessionID))) return
           const title = t.error(await label(data.sessionID))
           const message = short(data.error?.message || t.failed)
@@ -329,6 +351,7 @@ export default {
         case "session.execution.interrupted": {
           const task = running.get(data.sessionID)
           running.delete(data.sessionID)
+          report(data.sessionID, "idle").catch(() => {})
           if (task?.shown) {
             await call("progress", { id: progressID(data.sessionID), message: "", state: "failed" })
           }
@@ -343,6 +366,10 @@ export default {
       if (!task) return
       task.steps += 1
       task.tool = event.tool ?? task.tool
+      // Not every step: the list only needs to look alive.
+      if (task.steps === 1 || task.steps % 5 === 0) {
+        report(event.sessionID, "working", t.step(task.tool, task.steps)).catch(() => {})
+      }
       if (task.shown && want.progress) await showProgress(event.sessionID)
     }
 
