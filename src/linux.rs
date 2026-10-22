@@ -810,7 +810,7 @@ struct Shell {
     tray: Option<ksni::blocking::Handle<Tray>>,
     tray_rx: Receiver<TrayMsg>,
     /// What the tray shows: (sleeping dog, unread mark, visible, sound, Turkish).
-    tray_state: (bool, bool, bool, bool, bool),
+    tray_state: (bool, bool, bool, bool, bool, u32),
     /// Where the tray icon was last clicked, if the host told us.
     tray_anchor: Option<(i32, i32)>,
     panel: PanelWindow,
@@ -877,7 +877,7 @@ pub fn run() {
         screens_at: Instant::now(),
         tray,
         tray_rx,
-        tray_state: (false, false, true, true, false),
+        tray_state: (false, false, true, true, false, u32::MAX),
         tray_anchor: None,
         panel: PanelWindow::default(),
         settings: SettingsWindow::default(),
@@ -1362,16 +1362,18 @@ impl App {
 
     fn sync_tray(&mut self) {
         let state = (
-            self.core.dog.is_sleeping(),
+            self.core.dog.is_put_to_sleep(),
             self.core.missed > 0,
             self.core.visible,
             self.core.settings.sound,
             dost::i18n::is_turkish(),
+            self.core.renderer.look_gen(),
         );
         if state == self.shell.tray_state {
             return;
         }
-        let icon = (state.0, state.1) != (self.shell.tray_state.0, self.shell.tray_state.1);
+        let old = self.shell.tray_state;
+        let icon = (state.0, state.1, state.5) != (old.0, old.1, old.5);
         self.shell.tray_state = state;
         let pixels = icon.then(|| tray_icon(&self.core.renderer, state.0, state.1));
         if let Some(t) = &self.shell.tray {

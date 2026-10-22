@@ -13,7 +13,7 @@ VERSION     := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 SIGN_ID     ?= -
 
 .PHONY: help build build-release test check clippy fmt preview atlas icons install-opencode-plugin \
-	build-linux build-windows run-windows stop-windows app dmg notarize clean
+	build-linux build-windows run-windows stop-windows app dmg dmg-background notarize clean
 
 help:
 	@echo "make build                   Debug build for this computer (target/debug/dost)"
@@ -31,6 +31,7 @@ help:
 	@echo "make stop-windows            Stop a running dost.exe"
 	@echo "make app                     (on a Mac) Dost.app in target/ (Apple silicon)"
 	@echo "make dmg                     (on a Mac) Dost-$(VERSION).dmg in target/"
+	@echo "make dmg-background          Redraw the dmg window's background"
 	@echo "make notarize SIGN_ID=...     (on a Mac) Signed, notarized and stapled dmg"
 	@echo "make install-opencode-plugin Install the OpenCode plugin from this checkout"
 	@echo "make clean                   Remove target/"
@@ -72,6 +73,10 @@ atlas:
 
 # examples/icon.rs -> packaging/macos/AppIcon.icns and packaging/windows/dost.ico.
 ICON_TMP := target/icons
+# The dmg window's background (packaging/macos/dmg-background*.png).
+dmg-background:
+	cargo run -q --example dmg_background packaging/macos
+
 icons:
 	@test "$$(uname)" = Darwin || { echo "make icons needs macOS (iconutil)"; exit 1; }
 	rm -rf $(ICON_TMP) && mkdir -p $(ICON_TMP)/AppIcon.iconset packaging/windows
@@ -120,9 +125,19 @@ app:
 	codesign --verify --strict --verbose=2 $(APP)
 	@echo "-> $(APP)"
 
+# create-dmg (brew install create-dmg) lays out the dmg window: the background with the path
+# (make dmg-background), Dost on the left and an Applications link on the right.
+DMG_TMP := target/dmg
 dmg: app
-	rm -f target/Dost-$(VERSION).dmg
-	hdiutil create -volname Dost -srcfolder $(APP) -ov -format UDZO target/Dost-$(VERSION).dmg
+	@command -v create-dmg >/dev/null || { echo "create-dmg is missing: brew install create-dmg"; exit 1; }
+	rm -rf $(DMG_TMP) target/Dost-$(VERSION).dmg
+	mkdir -p $(DMG_TMP)/src
+	cp -R $(APP) $(DMG_TMP)/src/
+	tiffutil -cathidpicheck packaging/macos/dmg-background.png packaging/macos/dmg-background@2x.png -out $(DMG_TMP)/background.tiff
+	create-dmg --volname Dost --volicon packaging/macos/AppIcon.icns \
+		--background $(DMG_TMP)/background.tiff --window-pos 200 160 --window-size 660 400 \
+		--icon-size 112 --text-size 13 --icon Dost.app 170 190 --hide-extension Dost.app \
+		--app-drop-link 490 190 --no-internet-enable target/Dost-$(VERSION).dmg $(DMG_TMP)/src
 	$(if $(filter -,$(SIGN_ID)),,codesign --sign "$(SIGN_ID)" --timestamp target/Dost-$(VERSION).dmg)
 	@echo "-> target/Dost-$(VERSION).dmg"
 

@@ -595,8 +595,9 @@ impl Dog {
         self.forced_sleep
     }
 
+    /// The Sleep / Wake button: a nap is not sleep, so during one it puts the dog to sleep.
     pub fn toggle_sleep(&mut self) {
-        if self.is_sleeping() {
+        if self.forced_sleep {
             self.wake_up();
         } else {
             self.sleep();
@@ -843,6 +844,17 @@ mod tests {
         assert!(dog.is_put_to_sleep());
         assert_eq!(dog.frame().anim, Anim::Sleep);
         dog.pet();
+        assert!(!dog.is_sleeping());
+    }
+
+    #[test]
+    fn sleep_button_during_a_nap_puts_it_to_sleep() {
+        let mut dog = Dog::new(500.0, B.ground);
+        dog.set(Activity::Sleep, 60.0);
+        assert!(dog.is_sleeping() && !dog.is_put_to_sleep());
+        dog.toggle_sleep();
+        assert!(dog.is_put_to_sleep());
+        dog.toggle_sleep();
         assert!(!dog.is_sleeping());
     }
 

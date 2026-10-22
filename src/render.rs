@@ -250,6 +250,8 @@ pub struct Renderer {
     text: Option<Text>,
     /// Pinned on the collar for the day (special days).
     pin: Option<Pin>,
+    /// Goes up whenever the dog's colours change (the tray icon is drawn again).
+    look_gen: u32,
 }
 
 /// Text layout: system fonts, shaping for complex scripts (Arabic, Hindi...),
@@ -324,7 +326,13 @@ impl Renderer {
             heights,
             text,
             pin: None,
+            look_gen: 0,
         }
+    }
+
+    /// Changes whenever the dog's colours do: shells redraw the tray icon when it changes.
+    pub fn look_gen(&self) -> u32 {
+        self.look_gen
     }
 
     /// What is pinned on the collar today (a ribbon, a flag), if anything.
@@ -345,6 +353,7 @@ impl Renderer {
             self.colors = (fur, collar);
             self.atlas = self.original.clone();
             look::recolor(&mut self.atlas, &self.collar, fur, collar);
+            self.look_gen = self.look_gen.wrapping_add(1);
         }
         if self.outfit != outfit {
             self.outfit = outfit;
@@ -551,14 +560,20 @@ impl Renderer {
         let (w, h) = ((x1 - x0) as f32, (y1 - y0) as f32);
         let k = size as f32 / w.max(h);
         let mut pm = Pixmap::new(size, size).expect("icon size");
+        // Only this frame: the whole atlas would show the row above in the room over a
+        // wide, low pose (the sleeping dog).
+        let Some(frame) = self.atlas.clone_rect(
+            tiny_skia::IntRect::from_xywh(x0 as i32, y0 as i32, x1 - x0, y1 - y0).expect("frame"),
+        ) else {
+            return pm;
+        };
         let t = Transform::from_translate((size as f32 - w * k) / 2.0, size as f32 - h * k)
-            .pre_scale(k, k)
-            .pre_translate(-(x0 as f32), -(y0 as f32));
+            .pre_scale(k, k);
         let paint = tiny_skia::PixmapPaint {
             quality: tiny_skia::FilterQuality::Bicubic,
             ..Default::default()
         };
-        pm.draw_pixmap(0, 0, self.atlas.as_ref(), &paint, t, None);
+        pm.draw_pixmap(0, 0, frame.as_ref(), &paint, t, None);
         if unread {
             // A thin red dash in the top-right corner, with a light edge for dark menu bars.
             let s = size as f32;
@@ -1430,4 +1445,22 @@ fn over(s: PremultipliedColorU8, d: PremultipliedColorU8) -> PremultipliedColorU
         a,
     )
     .unwrap_or(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sleeping_icon_has_nothing_above_the_dog() {
+        let r = Renderer::new(false, Vec::new());
+        for size in [32, 44, 64] {
+            let pm = r.icon_pixmap(size, true, false);
+            let top = pm.pixels()[..(size * size / 3) as usize]
+                .iter()
+                .filter(|p| p.alpha() > 0)
+                .count();
+            assert_eq!(top, 0, "{size} px: something drawn above the sleeping dog");
+        }
+    }
 }

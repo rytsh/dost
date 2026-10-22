@@ -1791,7 +1791,7 @@ impl Core {
             settings: self.settings.clone(),
             age: self.age_text(),
             outfit: self.renderer.outfit(),
-            sleeping: self.dog.is_sleeping(),
+            sleeping: self.dog.is_put_to_sleep(),
             visible: self.visible,
             autostart: p.autostart_enabled(),
             autostart_label: p.autostart_label(),
@@ -1857,7 +1857,7 @@ impl Core {
             Anim::Sit => "sitting",
             Anim::Bark => "barking",
             Anim::Happy => "happy",
-            Anim::Sleep => "sleeping",
+            Anim::Sleep => "napping",
             Anim::Held => "being carried",
             Anim::Sad => "sad",
         };
@@ -2700,6 +2700,31 @@ mod tests {
         assert!(text.starts_with("Karabaş (the user's dog)"), "{text}");
         assert_eq!(c.renderer.outfit().hat, Some(look::Item::Beanie));
         assert_eq!(c.panel_view(&p).settings.name, "Karabaş");
+
+        // A new fur colour tells the shells to draw the tray icon again.
+        let before = c.renderer.look_gen();
+        let fur = if c.settings.fur == look::Fur::Black {
+            look::Fur::Cream
+        } else {
+            look::Fur::Black
+        };
+        let s = Settings {
+            fur,
+            ..c.settings.clone()
+        };
+        c.on_action(&mut p, Action::Settings(Box::new(s)));
+        assert_ne!(c.renderer.look_gen(), before);
+        let before = c.renderer.look_gen();
+        let s = Settings {
+            name: "Dost".into(),
+            ..c.settings.clone()
+        };
+        c.on_action(&mut p, Action::Settings(Box::new(s)));
+        assert_eq!(
+            c.renderer.look_gen(),
+            before,
+            "other settings keep the icon"
+        );
     }
 
     #[test]

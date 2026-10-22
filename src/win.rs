@@ -51,7 +51,8 @@ struct Shell {
     last_topmost: std::time::Instant,
     tray: TrayIcon,
     /// What the tray icon shows: (sleeping dog, unread mark).
-    tray_icon: (bool, bool),
+    /// Asleep, something missed, and the colours (`Renderer::look_gen`) the icon shows.
+    tray_icon: (bool, bool, u32),
     menu: Menu,
     items: MenuItems,
     panel: PanelWindow,
@@ -128,7 +129,7 @@ pub fn run() {
         drag: None,
         last_topmost: std::time::Instant::now(),
         tray,
-        tray_icon: (false, false),
+        tray_icon: (false, false, u32::MAX),
         menu,
         items,
         panel: PanelWindow::default(),
@@ -410,7 +411,11 @@ impl App {
         }
         self.paint_panel(Which::Popover);
         self.paint_panel(Which::Settings);
-        let state = (self.core.dog.is_sleeping(), self.core.missed > 0);
+        let state = (
+            self.core.dog.is_put_to_sleep(),
+            self.core.missed > 0,
+            self.core.renderer.look_gen(),
+        );
         if state != self.shell.tray_icon {
             self.shell.tray_icon = state;
             let rgba = self.core.renderer.icon_rgba(32, state.0, state.1);

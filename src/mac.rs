@@ -72,7 +72,8 @@ struct Shell {
     /// Whether the menu bar icon is drawn pressed (while the panel is open).
     status_pressed: bool,
     /// What the menu bar icon shows: (sleeping dog, unread mark).
-    status_icon: (bool, bool),
+    /// Asleep, something missed, and the colours (`Renderer::look_gen`) the icon shows.
+    status_icon: (bool, bool, u32),
     menu: Menu,
     items: MenuItems,
     panel: PanelWindow,
@@ -153,7 +154,7 @@ pub fn run() {
         drag: None,
         status,
         status_pressed: false,
-        status_icon: (false, false),
+        status_icon: (false, false, u32::MAX),
         menu,
         items,
         panel: PanelWindow::default(),
@@ -210,6 +211,8 @@ pub fn run() {
 /// below it, right pops up the short menu.
 fn make_status_item(mtm: MainThreadMarker, renderer: &Renderer) -> Retained<NSStatusItem> {
     let item = NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
+    // Remembers where the user ⌘-dragged it to.
+    item.setAutosaveName(Some(&NSString::from_str("DostStatusItem")));
     if let Some(button) = item.button(mtm) {
         set_status_icon(&button, renderer, (false, false));
         button.setImagePosition(NSCellImagePosition::ImageOnly);
@@ -711,11 +714,15 @@ impl App {
                 b.highlight(open);
             }
         }
-        let icon = (self.core.dog.is_sleeping(), self.core.missed > 0);
+        let icon = (
+            self.core.dog.is_put_to_sleep(),
+            self.core.missed > 0,
+            self.core.renderer.look_gen(),
+        );
         if icon != self.shell.status_icon {
             self.shell.status_icon = icon;
             if let Some(b) = self.shell.status.button(self.shell.mtm) {
-                set_status_icon(&b, &self.core.renderer, icon);
+                set_status_icon(&b, &self.core.renderer, (icon.0, icon.1));
             }
         }
     }
@@ -1101,6 +1108,12 @@ impl App {
                 .and_then(|b| b.window())
                 .is_some_and(|s| std::ptr::eq(w, &*s))
         });
+        // ⌘-drag moves the icon along the menu bar: leave those clicks to the system.
+        let cmd =
+            NSEvent::modifierFlags_class().contains(objc2_app_kit::NSEventModifierFlags::Command);
+        if on_status && cmd {
+            return false;
+        }
         if on_status {
             return match kind {
                 NSEventType::LeftMouseDown => {
@@ -1401,7 +1414,10 @@ fn install_mouse_monitor() {
                 event.as_ptr()
             };
         }
-        if kind == NSEventType::RightMouseDown {
+        let cmd = ev
+            .modifierFlags()
+            .contains(objc2_app_kit::NSEventModifierFlags::Command);
+        if kind == NSEventType::RightMouseDown && !cmd {
             let on_status = with_app(|a| {
                 let status = a.shell.status.button(mtm).and_then(|b| b.window());
                 window

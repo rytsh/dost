@@ -102,6 +102,7 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -s -k ci build.keychain
           rm cert.p12
           echo "SIGN_ID=$(security find-identity -v -p codesigning build.keychain | grep -o '"Developer ID Application[^"]*"' | head -1 | tr -d '"')" >> "$GITHUB_ENV"
+      - run: brew install create-dmg
       - run: make dmg SIGN_ID="${SIGN_ID:--}" MAC_TARGETS="aarch64-apple-darwin x86_64-apple-darwin"
       - name: Notarize
         if: env.SIGN_ID != '' && env.APPLE_ID != ''
