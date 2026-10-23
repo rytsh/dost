@@ -9,11 +9,13 @@ parola veya token değerlerini bu dosyaya yazma.
 - `main` branch'ine push: testler ve Windows, Linux, macOS build'leri çalışır.
 - Pull request: aynı kontroller çalışır; fork PR'larına repository secret'ları verilmez.
 - `v*` etiketi push: bütün işler başarılı olursa GitHub Release oluşturulur ve dosyalar yüklenir.
-- macOS Developer ID imzalama ve notarization yalnızca `v*` tag'lerinde, gerekli secret'lar
-  varsa yapılır. Normal `main` / PR build'leri ad-hoc imzalıdır; Apple'a başvuru gönderilmez.
+- macOS Developer ID imzalama ve notarization yalnızca `v*` tag'lerinde yapılır. Release'te
+  beş Apple secret'ı da zorunludur; eksikse imzasız release yayımlamak yerine CI durur.
+  Normal `main` / PR build'leri ad-hoc imzalıdır; Apple'a başvuru gönderilmez.
 - Normal branch build'lerinin dosyaları Actions çalışmasının **Artifacts** bölümündedir.
 - Secret eklemek tek başına build başlatmaz. Sonraki push'u bekle veya uygun bir önceki
-  çalışmayı yeniden çalıştır. Workflow'da şu an `workflow_dispatch` yok.
+  çalışmayı yeniden çalıştır. Ana CI'da `workflow_dispatch` yok; yalnızca notarization
+  kurtarma akışı manuel başlatılabilir (aşağıya bak).
 
 Release dosyaları:
 
@@ -37,21 +39,71 @@ ve otomatik güncellemeler daha küçük olur. Güncelleyici çalışan binary'n
 seçer; Rosetta altında çalışan Intel sürümü Intel arşivini indirir.
 Windows ve Linux arşivlerinin kökünde `dost.exe` / `dost`, `README.md` ve `LICENSE` bulunur.
 
-Her mimarinin macOS uygulaması ayrı oluşturulur, imzalanır ve notarize edilir; imzalı
-universal uygulamadan sonradan mimari silinmez. Apple `tar.gz` kabul etmediği için
-notarization'a geçici bir ZIP gönderilir. Onaydan sonra uygulamaya ticket staple edilir,
+Her mimarinin macOS uygulaması ayrı oluşturulur ve imzalanır; yalnızca universal uygulamanın
+onayının diğer çıktılara da uyduğunu varsaymak yerine hepsi aynı başvuruya eklenir.
+Apple `tar.gz` kabul etmediği için notarization'a geçici bir ZIP gönderilir.
+Onaydan sonra uygulamaya ticket staple edilir,
 son arşiv macOS `tar` ile oluşturulur. CI arşivi yeniden açıp mimari, imza ve (notarize
 edilmişse) ticket / Gatekeeper doğrulaması yapar. Güncelleyici de yeni uygulamanın imzasını
 kontrol etmeden mevcut uygulamayı değiştirmez. Mevcut Apple secret'ları yeterlidir.
 
-Release'te önce universal DMG ve iki mimarinin uygulaması hazırlanır. Ardından
-`scripts/notarize_macos.py` DMG, ARM64 ve Intel başvurularını **paralel** gönderip bekler;
-üçünün de `Accepted` olması ve ticket işlemlerinin tamamlanması gerekir. Tek başvurunun
-reddi / hatası bile paketleme ve release'i durdurur. Sonuç JSON'ları Actions içindeki
-`notarization-results` artifact'ında saklanır. Workflow'da ek bir süre sınırı tanımlanmaz;
-GitHub-hosted job'ların varsayılan / platform üst sınırı (şu an 360 dakika) yine geçerlidir.
-Paralellik süreleri üst üste eklemeyi önler; Apple'ın kendi kuyruk süresini kısaltacağını
-garanti etmez.
+### Tek başvuru ve kaldığı yerden devam
+
+Release'te önce son imzalı universal DMG ve iki mimarinin uygulaması hazırlanır.
+`scripts/notarize_macos.py prepare` hepsini tek geçici ZIP içine koyar:
+
+```text
+submission.zip
+└── payload/
+    ├── dost.dmg
+    ├── arm64/Dost.app
+    └── x86_64/Dost.app
+```
+
+Apple iç içe DMG'yi ve içindeki universal uygulamayı da tarar; **üç çıktı için tek başvuru**
+yapılır. DMG sonradan yeniden oluşturulmaz, uygulamalar yeniden imzalanmaz.
+İmzalı girdiler önce `macos-notary-inputs-<attempt>` artifact'ına yüklenir. Ardından
+`submit --no-wait` ile başvuru gönderilir; dönen UUID hemen
+`macos-notary-submission-<attempt>` artifact'ına kaydedilir. İki artifact da 30 gün saklanır.
+Sertifika, özel anahtar ve parolalar bu dosyalarda bulunmaz.
+
+Asıl bekleme ve yayın [Complete notarized release](.github/workflows/notarization.yml)
+akışında gerçekleşir. Bu akış tekrar derleme, imzalama veya başvuru yapmaz:
+
+1. Kaynak CI'ın bu repodaki bir `v*` tag push'u olduğunu ve tag'in hâlâ aynı commit'e
+   işaret ettiğini kontrol eder; altı build/test işinin başarılı olmasını şart koşar.
+2. İmzalı ZIP'in SHA-256'sını, tag / commit / run ID / attempt bilgisini ve UUID kaydını eşleştirir.
+3. Aynı UUID'nin durumunu her dakika sorgular; `Accepted` dışında bir son durumda durur.
+4. Apple analiz günlüğünde DMG'nin ve dört uygulama mimarisinin beklenen cdhash / yol /
+   mimari kayıtlarını kontrol eder. Birinin kapsamı eksikse yayın yapılmaz.
+5. DMG'ye ve iki uygulamaya ticket iliştirir, doğrular; son tarball'ları oluşturup tekrar açar
+   ve imza / mimari / ticket / Gatekeeper kontrolü yapar.
+6. Kaynak run'ın Windows/Linux arşivlerini birleştirip checksum'ları en son hesaplar ve
+   yalnızca orijinal tag için release yayımlar.
+
+Sonuçlar `notarization-results-<run>-<attempt>` artifact'ında saklanır. Ek süre sınırı
+tanımlanmaz; GitHub-hosted job'ların 6 saatlik platform sınırı yine geçerlidir. Runner'ın
+süresi dolsa bile Apple başvurusu devam eder.
+
+**Devam ettirmek için:** GitHub → Actions → **Complete notarized release** → **Run workflow**
+(güncel `main` branch'ini seç):
+
+- `source_run_id`: İlk **tag CI çalışmasının** URL'sindeki sayı.
+- `source_attempt`: O kaynak çalışmanın attempt numarası; ilk denemeyse `1`.
+
+Bu değerler kurtarma çalışmasının ID'si değil, imzalı girdilerin ve UUID'nin saklandığı
+orijinal CI'a aittir. Artifact'lar mevcut olduğu sürece aynı UUID ile tekrar devam edilir;
+6 saat daha beklemek için yeniden dosya yüklenmez. Aynı kaynağın eşzamanlı kurtarmaları
+sıraya alınır, birbirini iptal etmez. **Ana macOS build job'unu yeniden çalıştırmak ise
+yeniden derleyip yeni başvuru yapar; kurtarma için onu kullanma.**
+
+Bu özellik eski sıralı `v0.2.3` gibi kurtarma artifact'ı üretmeyen çalışmalara geriye dönük
+uygulanamaz. UUID artifact'ı yüklenmeden hata olursa `notarytool history` ile mevcut
+başvuruyu araştır; körlemesine yeniden gönderme. İmzalı girdiler ve UUID ikisi de gerekli.
+
+Kaynaklar: [Apple'ın çoklu öğe / iç içe kapsayıcı rehberi](https://developer.apple.com/documentation/security/customizing-the-notarization-workflow),
+[imzayı koruyabilen mimari çıkarma işlemleri](https://developer.apple.com/library/archive/technotes/tn2206/_index.html#//apple_ref/doc/uid/DTS40007919-CH1-TNTAG402).
+Tek başvuru Apple'ın kendi kuyruk süresinin kısa olacağını garanti etmez.
 
 **Eski sürümden geçiş:** `dost-windows.exe`, `Dost-macos.zip`, `dost-linux-x86_64` ve
 ayrı `.sha256` dosyalarını arayan eski kurulumların bir kez elle güncellenmesi gerekir.
@@ -67,7 +119,8 @@ ve macOS uygulama / DMG imzalama akışını zaten Actions yönetiyor. Yalnızca
 ve release notları için ek bir araç eklenmedi. Homebrew / Scoop gibi dağıtım kanalları
 genişlerse GoReleaser yeniden değerlendirilebilir.
 
-İmzalama secret'ları yoksa macOS ad-hoc imzalı, Windows imzasız derlenir. Linux için
+Normal macOS branch build'leri ad-hoc imzalıdır; release'lerde Apple secret'ları zorunludur.
+Windows secret'ları yoksa Windows imzasız derlenir. Linux için
 bu workflow'da kod imzalama secret'ı yoktur. Release yayımlamak için ayrıca PAT veya
 `GITHUB_TOKEN` secret'ı eklemek gerekmez; Actions token'ı otomatik sağlar.
 
@@ -174,12 +227,13 @@ sertifikadan otomatik bulur.
 Release tag'i için Actions → **ci → macos** içinde:
 
 - **Import certificate** başarılı olmalı.
-- **Notarize release artifacts in parallel** atlanmadan çalışmalı ve üç Apple sonucu da
-  `Accepted` olmalı. Branch / PR çalışmasında bu adımın atlanması normaldir.
-- `stapler` ve `spctl` kontrolleri başarılı olmalı.
+- İmzalı girdi artifact'ı ve UUID artifact'ı kaydedilmeli.
+- **release / macos** altında aynı UUID `Accepted` olmalı; log kapsam kontrolü,
+  `stapler` ve `spctl` kontrolleri başarılı olmalı.
+- Branch / PR çalışmasında Apple adımlarının atlanması normaldir.
 
-Sadece yeşil build görmek yeterli değildir: secret'lar eksikse imzalama / notarization
-adımları atlanıp ad-hoc build üretilebilir. Sertifikanın son kullanma tarihini takip et;
+Sadece yeşil branch build'i görmek release onayı anlamına gelmez. Release'te eksik
+secret'lar artık hataya yol açar. Sertifikanın son kullanma tarihini takip et;
 yenilediğinde `.p12` secret'larını da güncelle. Apple uygulamaya özel parolası iptal
 olursa `APPLE_APP_PASSWORD` değerini yenile.
 

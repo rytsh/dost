@@ -20,8 +20,8 @@ and CI builds, signs (when set up) and publishes:
 Windows and Linux archives have a flat layout: `dost.exe` / `dost`, `README.md`, `LICENSE`.
 macOS tarballs contain `Dost.app` and are created with macOS `tar` after signing/notarization
 to preserve bundle metadata. Each architecture-specific bundle is built and signed
-independently; a temporary `ditto` ZIP is submitted to Apple (notarytool does not accept
-tar.gz), then the ticket is stapled before creating the tarball. CI extracts each delivered
+independently; one temporary `ditto` ZIP contains the final signed DMG and both thin apps
+(notarytool does not accept tar.gz). Tickets are stapled before creating the tarballs. CI extracts each delivered
 tarball and checks its architecture, signature and, when notarized, stapled ticket and
 Gatekeeper assessment. The updater also verifies the extracted app's signature before
 replacing the installed app. The universal DMG is always named `dost.dmg`, without a
@@ -45,23 +45,39 @@ and Linux requires a writable executable and parent directory.
 `dost-linux-x86_64` and individual `.sha256` files require one manual upgrade. Legacy
 aliases are deliberately not published. The release notes call out this change.
 
-## Signing (optional)
+## Signing
 
-Without these secrets CI still works: the macOS app is ad-hoc signed and the Windows exe is
-unsigned (users see a Gatekeeper / SmartScreen warning the first time).
+Branch/PR macOS builds are ad-hoc signed without Apple submissions. Release tags require
+all five Apple secrets and fail rather than silently publishing an unsigned/unnotarized
+macOS release. Windows signing remains optional; without its secrets the EXE is unsigned.
 
 Add them in GitHub → Settings → Secrets and variables → Actions:
 
 ### macOS: Developer ID + notarization
 
-Developer ID signing and notarization run **only for `v*` release tags**, when the secrets
-are configured. Branch/PR artifacts stay ad-hoc signed and do not submit anything to Apple.
-CI builds all three bundles first, then `scripts/notarize_macos.py` submits the universal
-DMG and the two architecture-specific app ZIPs concurrently. All three must be `Accepted`
-and successfully stapled before packaging. JSON responses are retained in the
-`notarization-results` Actions artifact (not in the GitHub Release). No custom timeout is
-configured; GitHub-hosted jobs still have the default/platform limit (currently 360 minutes).
-Parallel requests avoid adding three wait times together but cannot bypass Apple's queue.
+Developer ID signing and notarization run **only for `v*` release tags**. Branch/PR artifacts
+stay ad-hoc signed and do not submit anything to Apple. `scripts/notarize_macos.py` creates
+one ZIP containing the final signed universal DMG (with its app inside), `arm64/Dost.app`
+and `x86_64/Dost.app`. Apple processes nested containers, so all three outputs are submitted
+once. Signed recovery inputs are uploaded **before submission**, then `submit --no-wait`
+returns a UUID that is immediately uploaded separately. No private keys or credentials
+are included in these artifacts; retention is 30 days.
+
+The reusable/manual `.github/workflows/notarization.yml` waits for that UUID, downloads
+Apple's log and requires matching CDHashes, paths and architectures for the DMG and all
+four app slices. Only then does it staple the original DMG and both thin apps, verify
+them, package and validate the delivered tarballs, and publish checksums/release files.
+It never rebuilds, re-signs or submits. Source tag, SHA, run/attempt, successful platform
+jobs and checkpoint checksums are verified before publishing. Apple status and log JSON
+are saved as `notarization-results-<run>-<attempt>` artifacts, not release downloads.
+
+No custom timeout is configured; GitHub-hosted jobs still have their six-hour platform
+limit, but Apple keeps processing the saved UUID. To resume, run **Complete notarized
+release** on `main` with the original tag CI's `source_run_id` and `source_attempt`
+(usually `1`). Both checkpoint artifacts must still exist. This resumes the same UUID
+and uses the original Windows/Linux artifacts, without another Apple submission. Do not
+rerun the build job as a recovery shortcut; that makes a fresh submission. Old releases
+without checkpoint artifacts cannot use this recovery path. See [CI.md](../CI.md) for details.
 
 With these secrets CI signs `Dost.app` with the hardened runtime and `packaging/macos/Dost.entitlements`,
 notarizes the dmg with `notarytool`, staples the ticket to the dmg and the app and checks the result

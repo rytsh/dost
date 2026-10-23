@@ -1,0 +1,173 @@
+name: Complete notarized release
+
+on:
+  workflow_call:
+    inputs:
+      source_run_id:
+        type: string
+        required: true
+      source_attempt:
+        type: string
+        required: true
+    secrets:
+      APPLE_ID:
+        required: true
+      APPLE_TEAM_ID:
+        required: true
+      APPLE_APP_PASSWORD:
+        required: true
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: Original tag CI run ID containing signed inputs and the submission UUID
+        type: string
+        required: true
+      source_attempt:
+        description: Original CI run attempt (not this recovery attempt)
+        type: string
+        default: "1"
+        required: true
+
+# Recovery never rebuilds, re-signs, or submits. It uses the original signed ZIP and UUID.
+# No custom timeout: GitHub's hosted-job limit still applies; dispatch again to keep waiting.
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: notarization-${{ inputs.source_run_id }}-${{ inputs.source_attempt }}
+  cancel-in-progress: false
+
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      sha: ${{ steps.check.outputs.sha }}
+    steps:
+      - name: Validate original tag, source commit and successful platform builds
+        id: check
+        uses: actions/github-script@v7
+        env:
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_ATTEMPT: ${{ inputs.source_attempt }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const runId = process.env.SOURCE_RUN_ID;
+            const attempt = process.env.SOURCE_ATTEMPT;
+            if (!/^[1-9][0-9]*$/.test(runId) || !/^[1-9][0-9]*$/.test(attempt)) {
+              throw new Error('Run ID and attempt must be positive integers');
+            }
+            const { data: run } = await github.request(
+              'GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}',
+              { owner, repo, run_id: runId, attempt_number: attempt }
+            );
+            if (run.event !== 'push' || run.path !== '.github/workflows/ci.yml' ||
+                run.head_repository?.full_name !== `${owner}/${repo}` ||
+                !/^v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$/.test(run.head_branch)) {
+              throw new Error('Recovery requires a trusted tag push from this repository CI');
+            }
+            const { data: commit } = await github.rest.repos.getCommit({ owner, repo, ref: run.head_branch });
+            if (commit.sha !== run.head_sha) throw new Error('Tag no longer points to original source');
+            const jobs = await github.paginate(
+              'GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}/jobs',
+              { owner, repo, run_id: runId, attempt_number: attempt, per_page: 100 }
+            );
+            for (const name of ['test', 'Windows (x86_64)', 'Windows (arm64)',
+                                'Linux (x86_64)', 'Linux (arm64)', 'macos']) {
+              if (!jobs.some(job => job.name === name && job.conclusion === 'success')) {
+                throw new Error(`Original job was not successful: ${name}`);
+              }
+            }
+            core.setOutput('tag', run.head_branch);
+            core.setOutput('sha', run.head_sha);
+            core.summary.addHeading('Resume original Apple submission')
+              .addRaw(`Source: ${run.html_url}, attempt ${attempt}; tag ${run.head_branch}. No new submission.`);
+            await core.summary.write();
+
+  macos:
+    needs: source
+    runs-on: macos-latest
+    env:
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-notary-inputs-${{ inputs.source_attempt }}
+          path: target/notary-inputs
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-notary-submission-${{ inputs.source_attempt }}
+          path: target/notary-submission
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+      - name: Wait for saved UUID, verify coverage, staple and package original inputs
+        env:
+          SOURCE_TAG: ${{ needs.source.outputs.tag }}
+          SOURCE_SHA: ${{ needs.source.outputs.sha }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_ATTEMPT: ${{ inputs.source_attempt }}
+        run: |
+          python3 scripts/notarize_macos.py finish \
+            --tag "$SOURCE_TAG" --sha "$SOURCE_SHA" \
+            --run-id "$SOURCE_RUN_ID" --attempt "$SOURCE_ATTEMPT"
+      - name: Upload Apple status and analysis log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: notarization-results-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/notarization/*.json
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: notarized-macos-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [source, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.source.outputs.sha }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dost-windows-*
+          path: dist
+          merge-multiple: true
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dost-linux-*
+          path: dist
+          merge-multiple: true
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: notarized-macos-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist
+      - name: Validate all assets and generate checksums and download notes
+        env:
+          RELEASE_TAG: ${{ needs.source.outputs.tag }}
+        run: python3 scripts/release.py finalize --tag "$RELEASE_TAG"
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.source.outputs.tag }}
+          target_commitish: ${{ needs.source.outputs.sha }}
+          name: Dost ${{ needs.source.outputs.tag }}
+          body_path: release-notes.md
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: dist/*
