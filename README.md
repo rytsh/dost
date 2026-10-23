@@ -14,14 +14,24 @@ bubble to dismiss it.
 
 ## Install
 
-- **Windows**: download `dost.exe` from [Releases](https://github.com/rytsh/dost/releases) and run it.
-- **macOS**: download `Dost.dmg` from [Releases](https://github.com/rytsh/dost/releases) and drag it
-  into Applications. It is not notarized yet, so open it the first time with right click → *Open*.
-- **Linux** (X11, or Wayland through XWayland): download `dost-linux-x86_64` from
-  [Releases](https://github.com/rytsh/dost/releases), `chmod +x` it and run it. The tray icon needs a
+- **Windows**: download `dost_Windows_x86_64.zip` (Intel / AMD) or `dost_Windows_arm64.zip`
+  (Windows on ARM) from [Releases](https://github.com/rytsh/dost/releases), extract it and run
+  `dost.exe`. Unsigned builds may show a SmartScreen warning.
+- **macOS**: download `dost.dmg` from [Releases](https://github.com/rytsh/dost/releases) and drag
+  Dost into Applications. The DMG supports Apple Silicon and Intel. For a smaller download,
+  use `dost_Darwin_arm64.tar.gz` (Apple Silicon) or `dost_Darwin_x86_64.tar.gz` (Intel),
+  extract it and move `Dost.app` into Applications. macOS releases are signed with an
+  Apple Developer ID and notarized by Apple.
+- **Linux** (X11, or Wayland through XWayland): download `dost_Linux_x86_64.tar.gz` or
+  `dost_Linux_arm64.tar.gz` from [Releases](https://github.com/rytsh/dost/releases), extract it
+  and run `./dost`. The tray icon needs a
   StatusNotifierItem host (KDE, most panels; on GNOME the AppIndicator extension), otherwise right-click
   the dog for settings. Sound plays through `paplay`, `pw-play` or `aplay`; copy and paste use `wl-copy`
   / `wl-paste` or `xclip` / `xsel`.
+
+Each release includes one `dost-<version>-checksums.txt` covering every download. Release
+and signing details are in [CI.md](CI.md). Older installations using the previous asset
+names need one manual upgrade to this archive layout; subsequent updates use the new names.
 
 ## OpenCode
 

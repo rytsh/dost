@@ -28,6 +28,15 @@ croner = "4"
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
 
+# Read only the executable from update archives; never extract arbitrary paths.
+[target.'cfg(any(windows, target_os = "linux"))'.dependencies]
+flate2 = "1"
+
+[target.'cfg(windows)'.dependencies.zip]
+version = "9"
+default-features = false
+features = ["deflate-flate2"]
+
 [target.'cfg(target_os = "macos")'.dependencies]
 ureq = { version = "3.4.2", default-features = false, features = ["native-tls"] }
 muda = { version = "0.21", default-features = false }
@@ -39,6 +48,7 @@ objc2-foundation = { version = "0.3", features = ["NSString", "NSArray", "NSData
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSWindow", "NSView", "NSControl", "NSButton", "NSMenu", "NSStatusBar", "NSStatusBarButton", "NSStatusItem", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSImageView", "NSImageCell", "NSScreen", "NSEvent", "NSResponder", "NSRunningApplication", "NSGraphics", "NSColor", "NSSound", "NSPasteboard", "NSWorkspace", "block2", "objc2-core-foundation"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+tar = { version = "0.4", default-features = false }
 x11rb = { version = "0.13", features = ["randr", "shape", "screensaver"] }
 # Tray icon over D-Bus (StatusNotifierItem), without GTK.
 ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }

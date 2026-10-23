@@ -7,7 +7,7 @@ on:
   pull_request:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test:
@@ -20,11 +20,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: python3 scripts/i18n-keys.py all
+      - run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
   windows:
-    runs-on: windows-latest
+    name: Windows (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          - arch: arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
     env:
       WINDOWS_CERT_PFX: ${{ secrets.WINDOWS_CERT_PFX }}
       WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
@@ -33,10 +45,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo build --release
-      - run: Copy-Item target/release/dost.exe dost-windows.exe
+      - run: cargo clippy --all-targets --target ${{ matrix.target }} -- -D warnings
+      - run: cargo test --target ${{ matrix.target }} update::tests
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - run: Copy-Item target/${{ matrix.target }}/release/dost.exe dost.exe
       # Signed only when the certificate is set up (repo secrets WINDOWS_CERT_PFX as base64,
       # WINDOWS_CERT_PASSWORD); otherwise the exe stays unsigned.
       - name: Sign
@@ -44,18 +58,30 @@ jobs:
         run: |
           [IO.File]::WriteAllBytes("cert.pfx", [Convert]::FromBase64String($env:WINDOWS_CERT_PFX))
           $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" | Select-Object -Last 1
-          & $signtool.FullName sign /f cert.pfx /p $env:WINDOWS_CERT_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 dost-windows.exe
+          & $signtool.FullName sign /f cert.pfx /p $env:WINDOWS_CERT_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 dost.exe
+          if ($LASTEXITCODE -ne 0) { throw "Windows code signing failed" }
+          & $signtool.FullName verify /pa /v dost.exe
+          if ($LASTEXITCODE -ne 0) { throw "Windows signature verification failed" }
           Remove-Item cert.pfx
-      - run: (Get-FileHash dost-windows.exe -Algorithm SHA256).Hash.ToLower() + "  dost-windows.exe" | Out-File -Encoding ascii dost-windows.exe.sha256
+      - name: Package
+        run: python scripts/release.py package --os Windows --arch ${{ matrix.arch }} --binary dost.exe
       - uses: actions/upload-artifact@v4
         with:
-          name: dost-windows
-          path: |
-            dost-windows.exe
-            dost-windows.exe.sha256
+          name: dost-windows-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
 
   linux:
-    runs-on: ubuntu-latest
+    name: Linux (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -63,16 +89,15 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo build --release
-      - run: |
-          cp target/release/dost dost-linux-x86_64
-          sha256sum dost-linux-x86_64 > dost-linux-x86_64.sha256
+      - run: cargo test update::tests
+      - run: cargo build --locked --release
+      - name: Package
+        run: python3 scripts/release.py package --os Linux --arch ${{ matrix.arch }} --binary target/release/dost
       - uses: actions/upload-artifact@v4
         with:
-          name: dost-linux
-          path: |
-            dost-linux-x86_64
-            dost-linux-x86_64.sha256
+          name: dost-linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
 
   macos:
     runs-on: macos-latest
@@ -91,7 +116,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
       # Signed with a Developer ID and notarized when the secrets are set up (see
-      # packaging/macos/README.md); otherwise ad-hoc signed.
+      # CI.md); otherwise ad-hoc signed.
       - name: Import certificate
         if: env.MACOS_CERT_P12 != ''
         run: |
@@ -112,32 +137,69 @@ jobs:
           xcrun stapler staple target/Dost-*.dmg
           xcrun stapler staple target/Dost.app
           spctl --assess --type execute -v target/Dost.app
-      # The app on its own, for updates (the dmg is for people).
-      - run: |
-          ditto -c -k --keepParent target/Dost.app Dost-macos.zip
-          shasum -a 256 Dost-macos.zip > Dost-macos.zip.sha256
-          cp target/Dost-*.dmg Dost.dmg
+      # Keep the installer universal, but build/sign each update bundle independently.
+      # Never thin a signed bundle: that changes its code signature and notarization identity.
+      - name: Package architecture-specific apps
+        run: |
+          mkdir -p dist
+          cp target/Dost-*.dmg dist/dost.dmg
+          for spec in arm64:aarch64-apple-darwin x86_64:x86_64-apple-darwin; do
+            arch="${spec%%:*}"
+            target="${spec#*:}"
+            app="target/macos/$arch/Dost.app"
+            make app APP="$app" SIGN_ID="${SIGN_ID:--}" MAC_TARGETS="$target"
+            test "$(lipo -archs "$app/Contents/MacOS/dost")" = "$arch"
+
+            # notarytool accepts ZIP/DMG/PKG, not tar.gz. Submit a temporary ZIP,
+            # staple the approved app, then create the final tar.gz with macOS bsdtar.
+            if [[ -n "${SIGN_ID:-}" && -n "$APPLE_ID" ]]; then
+              zip="target/macos/$arch/notarization.zip"
+              ditto -c -k --keepParent "$app" "$zip"
+              xcrun notarytool submit "$zip" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+              xcrun stapler staple "$app"
+              rm "$zip"
+            fi
+
+            archive="dist/dost_Darwin_$arch.tar.gz"
+            tar -czf "$archive" -C "$(dirname "$app")" Dost.app
+            # Verify the delivered archive, not just the bundle before compression.
+            verify="target/macos/$arch/verify"
+            mkdir -p "$verify"
+            tar -xzf "$archive" -C "$verify"
+            codesign --verify --strict --verbose=2 "$verify/Dost.app"
+            test "$(lipo -archs "$verify/Dost.app/Contents/MacOS/dost")" = "$arch"
+            if [[ -n "${SIGN_ID:-}" && -n "$APPLE_ID" ]]; then
+              xcrun stapler validate "$verify/Dost.app"
+              spctl --assess --type execute -v "$verify/Dost.app"
+            fi
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: dost-macos
-          path: |
-            Dost.dmg
-            Dost-macos.zip
-            Dost-macos.zip.sha256
+          path: dist/*
+          if-no-files-found: error
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [test, windows, linux, macos]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
+        with:
+          pattern: dost-*
+          path: dist
+          merge-multiple: true
+      - name: Validate assets and generate checksums and download notes
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python3 scripts/release.py finalize --tag "$RELEASE_TAG"
       - uses: softprops/action-gh-release@v2
         with:
-          files: |
-            dost-windows/dost-windows.exe
-            dost-windows/dost-windows.exe.sha256
-            dost-macos/Dost.dmg
-            dost-macos/Dost-macos.zip
-            dost-macos/Dost-macos.zip.sha256
-            dost-linux/dost-linux-x86_64
-            dost-linux/dost-linux-x86_64.sha256
+          name: Dost ${{ github.ref_name }}
+          body_path: release-notes.md
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: dist/*

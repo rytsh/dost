@@ -288,7 +288,7 @@ impl Days {
 
     pub fn set_builtin(&self, b: Builtin, on: bool) {
         let mut st = self.state.lock().unwrap();
-        if on == !st.builtins_off.contains(&b) {
+        if on != st.builtins_off.contains(&b) {
             return;
         }
         if on {

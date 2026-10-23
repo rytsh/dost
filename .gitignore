@@ -1,4 +1,6 @@
 target/
+dist/
+__pycache__/
 /*.png
 
 # Sprite Forge intermediates: raw generations, HD frames, QC reports.

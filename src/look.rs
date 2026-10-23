@@ -272,8 +272,7 @@ pub fn recolor(pm: &mut Pixmap, collar_mask: &Pixmap, fur: Fur, collar: Collar) 
         let on_collar = m > 100 && collar != Collar::None;
         // Kept as drawn: the tag and the collar's outline, outline, cream and gold.
         let keep = (on_collar && m < 255)
-            || l < 0.08
-            || l >= 0.8
+            || !(0.08..0.8).contains(&l)
             || ((50.0..=62.0).contains(&h) && s > 0.8 && l < 0.75);
         let mapped = if on_collar && m == 255 {
             collar.map(hsl)

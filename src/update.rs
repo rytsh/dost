@@ -1,8 +1,8 @@
 //! Updates from GitHub Releases: checks for a newer version and, if allowed, downloads it,
 //! verifies its SHA-256 and swaps it in. Runs on a background thread; the app shows the result.
 //!
-//! Release assets (made by CI): `dost-windows.exe`, `Dost-macos.zip` (Dost.app),
-//! `dost-linux-x86_64`, each with a `.sha256` file next to it.
+//! Release archives use `dost_<OS>_<arch>` names and one versioned checksum manifest.
+//! Each platform selects the running binary's architecture; macOS archives contain Dost.app.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
@@ -14,15 +14,45 @@ use sha2::{Digest, Sha256};
 const LATEST: &str = "https://api.github.com/repos/rytsh/dost/releases/latest";
 const TIMEOUT: Duration = Duration::from_secs(30);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+#[cfg(any(windows, target_os = "linux"))]
+const MAX_EXECUTABLE: u64 = 200 << 20;
 
-#[cfg(windows)]
-const ASSET: &str = "dost-windows.exe";
-#[cfg(target_os = "macos")]
-const ASSET: &str = "Dost-macos.zip";
-#[cfg(target_os = "linux")]
-const ASSET: &str = "dost-linux-x86_64";
-#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-const ASSET: &str = "";
+fn archive_name(os: &str, arch: &str) -> Option<String> {
+    let arch = match arch {
+        "aarch64" => "arm64",
+        "x86_64" => "x86_64",
+        _ => return None,
+    };
+    match os {
+        "windows" => Some(format!("dost_Windows_{arch}.zip")),
+        "linux" => Some(format!("dost_Linux_{arch}.tar.gz")),
+        "macos" => Some(format!("dost_Darwin_{arch}.tar.gz")),
+        _ => None,
+    }
+}
+
+/// Match the exact filename, not the first hash (which may belong to another platform).
+fn checksum(manifest: &str, name: &str) -> Result<String, String> {
+    let mut found = None;
+    for line in manifest.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(hash), Some(file)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        if file.trim_start_matches('*') != name {
+            continue;
+        }
+        if fields.next().is_some()
+            || hash.len() != 64
+            || !hash.bytes().all(|c| c.is_ascii_hexdigit())
+            || found.is_some()
+        {
+            return Err("invalid or duplicate update checksum".into());
+        }
+        found = Some(hash.to_ascii_lowercase());
+    }
+    found.ok_or_else(|| "the update archive is missing from the checksum manifest".into())
+}
 
 /// What a check found.
 #[derive(Clone, Debug, PartialEq)]
@@ -78,15 +108,19 @@ fn run(install: bool) -> Result<Found, String> {
                 .map(String::from)
         })
     };
+    let archive = archive_name(std::env::consts::OS, std::env::consts::ARCH);
     let ready = install
-        && match (asset(ASSET), asset(&format!("{ASSET}.sha256"))) {
+        && match (
+            archive.as_deref().and_then(asset),
+            asset(&format!("dost-{version}-checksums.txt")),
+        ) {
             (Some(bin), Some(sum)) => {
                 let data = download(&bin)?;
-                let want = String::from_utf8_lossy(&download(&sum)?)
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("")
-                    .to_lowercase();
+                let manifest = download(&sum)?;
+                let want = checksum(
+                    &String::from_utf8_lossy(&manifest),
+                    archive.as_deref().unwrap(),
+                )?;
                 let got = hex(&Sha256::digest(&data));
                 if want != got {
                     return Err("the download's checksum does not match".into());
@@ -124,6 +158,53 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// Limit decompressed size as well as the download; archives never get a general unpack().
+#[cfg(any(windows, target_os = "linux"))]
+fn read_executable(reader: impl std::io::Read) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut data = Vec::new();
+    reader
+        .take(MAX_EXECUTABLE + 1)
+        .read_to_end(&mut data)
+        .map_err(|e| format!("cannot read the update executable: {e}"))?;
+    if data.is_empty() || data.len() as u64 > MAX_EXECUTABLE {
+        return Err("the update executable is empty or too large".into());
+    }
+    Ok(data)
+}
+
+#[cfg(windows)]
+fn unpack_executable(data: &[u8]) -> Result<Vec<u8>, String> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(data))
+        .map_err(|e| format!("invalid update ZIP: {e}"))?;
+    let file = archive
+        .by_name("dost.exe")
+        .map_err(|_| "the update ZIP does not contain dost.exe".to_string())?;
+    if !file.is_file() || file.is_symlink() {
+        return Err("the update executable is not a regular file".into());
+    }
+    read_executable(file)
+}
+
+#[cfg(target_os = "linux")]
+fn unpack_executable(data: &[u8]) -> Result<Vec<u8>, String> {
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(data));
+    let entries = archive
+        .entries()
+        .map_err(|e| format!("invalid update archive: {e}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("invalid update archive entry: {e}"))?;
+        let path = entry.path().map_err(|e| e.to_string())?;
+        if path.as_ref() == Path::new("dost") {
+            if !entry.header().entry_type().is_file() {
+                return Err("the update executable is not a regular file".into());
+            }
+            return read_executable(entry);
+        }
+    }
+    Err("the update archive does not contain dost".into())
+}
+
 /// "v0.2.0" > "0.1.9"? Compares dotted numbers; pre-release suffixes count as older.
 pub fn newer(tag: &str, current: &str) -> bool {
     let parse = |s: &str| -> Option<(Vec<u64>, bool)> {
@@ -155,10 +236,11 @@ pub fn newer(tag: &str, current: &str) -> bool {
 /// Windows: the running exe can be renamed but not overwritten, so it moves aside.
 #[cfg(windows)]
 fn install_update(data: &[u8]) -> Result<(), String> {
+    let data = unpack_executable(data)?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let new = exe.with_extension("new.exe");
     let old = exe.with_extension("old.exe");
-    std::fs::write(&new, data).map_err(|e| format!("cannot write the update: {e}"))?;
+    std::fs::write(&new, &data).map_err(|e| format!("cannot write the update: {e}"))?;
     let _ = std::fs::remove_file(&old);
     std::fs::rename(&exe, &old).map_err(|e| format!("cannot replace dost.exe: {e}"))?;
     if let Err(e) = std::fs::rename(&new, &exe) {
@@ -176,12 +258,13 @@ fn install_update(data: &[u8]) -> Result<(), String> {
     let tmp = parent.join(".dost-update");
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).map_err(|e| format!("cannot write next to Dost.app: {e}"))?;
-    let zip = tmp.join("Dost.zip");
-    std::fs::write(&zip, data).map_err(|e| e.to_string())?;
-    // ditto keeps the bundle's signature and attributes intact.
-    let ok = std::process::Command::new("ditto")
-        .args(["-x", "-k"])
-        .arg(&zip)
+    let archive = tmp.join("Dost.tar.gz");
+    std::fs::write(&archive, data).map_err(|e| e.to_string())?;
+    // macOS bsdtar restores the bundle's permissions and Apple metadata, including its ticket.
+    let ok = std::process::Command::new("/usr/bin/tar")
+        .arg("-xzf")
+        .arg(&archive)
+        .arg("-C")
         .arg(&tmp)
         .status()
         .is_ok_and(|s| s.success());
@@ -189,6 +272,15 @@ fn install_update(data: &[u8]) -> Result<(), String> {
     if !ok || !fresh.join("Contents/MacOS/dost").exists() {
         let _ = std::fs::remove_dir_all(&tmp);
         return Err("the update could not be unpacked".into());
+    }
+    let valid = std::process::Command::new("/usr/bin/codesign")
+        .args(["--verify", "--strict"])
+        .arg(&fresh)
+        .status()
+        .is_ok_and(|s| s.success());
+    if !valid {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err("the update app's signature is invalid".into());
     }
     let old = tmp.join("Dost-old.app");
     std::fs::rename(&app, &old).map_err(|e| format!("cannot replace Dost.app: {e}"))?;
@@ -210,9 +302,10 @@ fn install_update(data: &[u8]) -> Result<(), String> {
 #[cfg(target_os = "linux")]
 fn install_update(data: &[u8]) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
+    let data = unpack_executable(data)?;
     let exe = linux_exe().ok_or("cannot find the dost executable")?;
     let new = exe.with_extension("new");
-    std::fs::write(&new, data).map_err(|e| format!("cannot write the update: {e}"))?;
+    std::fs::write(&new, &data).map_err(|e| format!("cannot write the update: {e}"))?;
     let done = std::fs::set_permissions(&new, std::fs::Permissions::from_mode(0o755))
         .and_then(|()| std::fs::rename(&new, &exe));
     if let Err(e) = done {
@@ -309,6 +402,122 @@ pub fn cleanup() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_archive_names() {
+        assert_eq!(
+            archive_name("windows", "x86_64").as_deref(),
+            Some("dost_Windows_x86_64.zip")
+        );
+        assert_eq!(
+            archive_name("windows", "aarch64").as_deref(),
+            Some("dost_Windows_arm64.zip")
+        );
+        assert_eq!(
+            archive_name("linux", "aarch64").as_deref(),
+            Some("dost_Linux_arm64.tar.gz")
+        );
+        assert_eq!(
+            archive_name("linux", "x86_64").as_deref(),
+            Some("dost_Linux_x86_64.tar.gz")
+        );
+        assert_eq!(
+            archive_name("macos", "aarch64").as_deref(),
+            Some("dost_Darwin_arm64.tar.gz")
+        );
+        assert_eq!(
+            archive_name("macos", "x86_64").as_deref(),
+            Some("dost_Darwin_x86_64.tar.gz")
+        );
+        assert!(archive_name("linux", "arm").is_none());
+        assert!(archive_name("unknown", "x86_64").is_none());
+    }
+
+    #[test]
+    fn manifest_matches_exact_filename() {
+        let hash = hex(&Sha256::digest(b"archive"));
+        let manifest = format!(
+            "{}  dost.dmg\r\n{}  dost_Linux_arm64.tar.gz\r\n",
+            "0".repeat(64),
+            hash.to_uppercase()
+        );
+        assert_eq!(
+            checksum(&manifest, "dost_Linux_arm64.tar.gz"),
+            Ok(hash.clone())
+        );
+        assert_eq!(
+            checksum(&format!("{hash} *file.zip\n"), "file.zip"),
+            Ok(hash)
+        );
+        assert!(checksum(&manifest, "dost_Linux_x86_64.tar.gz").is_err());
+        assert!(checksum(&manifest, "arm64.tar.gz").is_err());
+    }
+
+    #[test]
+    fn reject_invalid_or_ambiguous_checksums() {
+        let hash = "a".repeat(64);
+        for manifest in [
+            "bad  file.zip".to_string(),
+            format!("{}  file.zip", "g".repeat(64)),
+            format!("{hash}  file.zip extra"),
+            format!("{hash}  file.zip\n{hash}  file.zip"),
+            String::new(),
+        ] {
+            assert!(checksum(&manifest, "file.zip").is_err());
+        }
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn reject_empty_executable() {
+        assert!(read_executable(std::io::empty()).is_err());
+        assert_eq!(read_executable(&b"executable"[..]).unwrap(), b"executable");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unpack_only_linux_executable() {
+        fn archive(name: &str, kind: tar::EntryType, contents: &[u8]) -> Vec<u8> {
+            let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            let mut tar = tar::Builder::new(gz);
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o755);
+            header.set_size(contents.len() as u64);
+            header.set_entry_type(kind);
+            if kind.is_symlink() {
+                header.set_link_name("/tmp/not-an-executable").unwrap();
+            }
+            header.set_cksum();
+            tar.append_data(&mut header, name, contents).unwrap();
+            tar.into_inner().unwrap().finish().unwrap()
+        }
+        let data = archive("dost", tar::EntryType::Regular, b"ELF executable");
+        assert_eq!(unpack_executable(&data).unwrap(), b"ELF executable");
+        assert!(unpack_executable(&archive("other/dost", tar::EntryType::Regular, b"x")).is_err());
+        assert!(unpack_executable(&archive("dost", tar::EntryType::Symlink, b"")).is_err());
+        assert!(unpack_executable(&archive("dost", tar::EntryType::Regular, b"")).is_err());
+        assert!(unpack_executable(b"not an archive").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unpack_only_windows_executable() {
+        use std::io::Write;
+        fn archive(name: &str, contents: &[u8]) -> Vec<u8> {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(contents).unwrap();
+            zip.finish().unwrap().into_inner()
+        }
+        assert_eq!(
+            unpack_executable(&archive("dost.exe", b"MZ executable")).unwrap(),
+            b"MZ executable"
+        );
+        assert!(unpack_executable(&archive("other/dost.exe", b"x")).is_err());
+        assert!(unpack_executable(&archive("dost.exe", b"")).is_err());
+        assert!(unpack_executable(b"not an archive").is_err());
+    }
 
     #[test]
     fn versions() {
