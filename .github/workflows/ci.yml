@@ -115,10 +115,10 @@ jobs:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
-      # Signed with a Developer ID and notarized when the secrets are set up (see
-      # CI.md); otherwise ad-hoc signed.
+      # Only release tags use Developer ID signing and Apple's notarization service.
+      # Branch/PR artifacts are ad-hoc signed, even when secrets are available.
       - name: Import certificate
-        if: env.MACOS_CERT_P12 != ''
+        if: startsWith(github.ref, 'refs/tags/v') && env.MACOS_CERT_P12 != ''
         run: |
           echo "$MACOS_CERT_P12" | base64 --decode > cert.p12
           security create-keychain -p ci build.keychain
@@ -130,36 +130,32 @@ jobs:
           echo "SIGN_ID=$(security find-identity -v -p codesigning build.keychain | grep -o '"Developer ID Application[^"]*"' | head -1 | tr -d '"')" >> "$GITHUB_ENV"
       - run: brew install create-dmg
       - run: make dmg SIGN_ID="${SIGN_ID:--}" MAC_TARGETS="aarch64-apple-darwin x86_64-apple-darwin"
-      - name: Notarize
-        if: env.SIGN_ID != '' && env.APPLE_ID != ''
-        run: |
-          xcrun notarytool submit target/Dost-*.dmg --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
-          xcrun stapler staple target/Dost-*.dmg
-          xcrun stapler staple target/Dost.app
-          spctl --assess --type execute -v target/Dost.app
       # Keep the installer universal, but build/sign each update bundle independently.
       # Never thin a signed bundle: that changes its code signature and notarization identity.
-      - name: Package architecture-specific apps
+      - name: Build architecture-specific apps
         run: |
-          mkdir -p dist
-          cp target/Dost-*.dmg dist/dost.dmg
           for spec in arm64:aarch64-apple-darwin x86_64:x86_64-apple-darwin; do
             arch="${spec%%:*}"
             target="${spec#*:}"
             app="target/macos/$arch/Dost.app"
             make app APP="$app" SIGN_ID="${SIGN_ID:--}" MAC_TARGETS="$target"
             test "$(lipo -archs "$app/Contents/MacOS/dost")" = "$arch"
-
-            # notarytool accepts ZIP/DMG/PKG, not tar.gz. Submit a temporary ZIP,
-            # staple the approved app, then create the final tar.gz with macOS bsdtar.
-            if [[ -n "${SIGN_ID:-}" && -n "$APPLE_ID" ]]; then
-              zip="target/macos/$arch/notarization.zip"
-              ditto -c -k --keepParent "$app" "$zip"
-              xcrun notarytool submit "$zip" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
-              xcrun stapler staple "$app"
-              rm "$zip"
-            fi
-
+          done
+      - name: Notarize release artifacts in parallel
+        if: startsWith(github.ref, 'refs/tags/v') && env.SIGN_ID != '' && env.APPLE_ID != ''
+        run: |
+          python3 scripts/notarize_macos.py \
+            --dmg target/Dost-*.dmg \
+            --universal-app target/Dost.app \
+            --app target/macos/arm64/Dost.app \
+            --app target/macos/x86_64/Dost.app
+          spctl --assess --type execute -v target/Dost.app
+      - name: Package architecture-specific apps
+        run: |
+          mkdir -p dist
+          cp target/Dost-*.dmg dist/dost.dmg
+          for arch in arm64 x86_64; do
+            app="target/macos/$arch/Dost.app"
             archive="dist/dost_Darwin_$arch.tar.gz"
             tar -czf "$archive" -C "$(dirname "$app")" Dost.app
             # Verify the delivered archive, not just the bundle before compression.
@@ -168,11 +164,18 @@ jobs:
             tar -xzf "$archive" -C "$verify"
             codesign --verify --strict --verbose=2 "$verify/Dost.app"
             test "$(lipo -archs "$verify/Dost.app/Contents/MacOS/dost")" = "$arch"
-            if [[ -n "${SIGN_ID:-}" && -n "$APPLE_ID" ]]; then
+            if [[ "$GITHUB_REF" == refs/tags/v* && -n "${SIGN_ID:-}" && -n "$APPLE_ID" ]]; then
               xcrun stapler validate "$verify/Dost.app"
               spctl --assess --type execute -v "$verify/Dost.app"
             fi
           done
+      - name: Upload notarization results
+        if: always() && startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: notarization-results
+          path: target/notarization/*.json
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
         with:
           name: dost-macos

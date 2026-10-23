@@ -54,6 +54,15 @@ Add them in GitHub → Settings → Secrets and variables → Actions:
 
 ### macOS: Developer ID + notarization
 
+Developer ID signing and notarization run **only for `v*` release tags**, when the secrets
+are configured. Branch/PR artifacts stay ad-hoc signed and do not submit anything to Apple.
+CI builds all three bundles first, then `scripts/notarize_macos.py` submits the universal
+DMG and the two architecture-specific app ZIPs concurrently. All three must be `Accepted`
+and successfully stapled before packaging. JSON responses are retained in the
+`notarization-results` Actions artifact (not in the GitHub Release). No custom timeout is
+configured; GitHub-hosted jobs still have the default/platform limit (currently 360 minutes).
+Parallel requests avoid adding three wait times together but cannot bypass Apple's queue.
+
 With these secrets CI signs `Dost.app` with the hardened runtime and `packaging/macos/Dost.entitlements`,
 notarizes the dmg with `notarytool`, staples the ticket to the dmg and the app and checks the result
 with `spctl`. Gatekeeper then opens Dost without the "unidentified developer" warning. Locally the

@@ -9,6 +9,8 @@ parola veya token değerlerini bu dosyaya yazma.
 - `main` branch'ine push: testler ve Windows, Linux, macOS build'leri çalışır.
 - Pull request: aynı kontroller çalışır; fork PR'larına repository secret'ları verilmez.
 - `v*` etiketi push: bütün işler başarılı olursa GitHub Release oluşturulur ve dosyalar yüklenir.
+- macOS Developer ID imzalama ve notarization yalnızca `v*` tag'lerinde, gerekli secret'lar
+  varsa yapılır. Normal `main` / PR build'leri ad-hoc imzalıdır; Apple'a başvuru gönderilmez.
 - Normal branch build'lerinin dosyaları Actions çalışmasının **Artifacts** bölümündedir.
 - Secret eklemek tek başına build başlatmaz. Sonraki push'u bekle veya uygun bir önceki
   çalışmayı yeniden çalıştır. Workflow'da şu an `workflow_dispatch` yok.
@@ -41,6 +43,15 @@ notarization'a geçici bir ZIP gönderilir. Onaydan sonra uygulamaya ticket stap
 son arşiv macOS `tar` ile oluşturulur. CI arşivi yeniden açıp mimari, imza ve (notarize
 edilmişse) ticket / Gatekeeper doğrulaması yapar. Güncelleyici de yeni uygulamanın imzasını
 kontrol etmeden mevcut uygulamayı değiştirmez. Mevcut Apple secret'ları yeterlidir.
+
+Release'te önce universal DMG ve iki mimarinin uygulaması hazırlanır. Ardından
+`scripts/notarize_macos.py` DMG, ARM64 ve Intel başvurularını **paralel** gönderip bekler;
+üçünün de `Accepted` olması ve ticket işlemlerinin tamamlanması gerekir. Tek başvurunun
+reddi / hatası bile paketleme ve release'i durdurur. Sonuç JSON'ları Actions içindeki
+`notarization-results` artifact'ında saklanır. Workflow'da ek bir süre sınırı tanımlanmaz;
+GitHub-hosted job'ların varsayılan / platform üst sınırı (şu an 360 dakika) yine geçerlidir.
+Paralellik süreleri üst üste eklemeyi önler; Apple'ın kendi kuyruk süresini kısaltacağını
+garanti etmez.
 
 **Eski sürümden geçiş:** `dost-windows.exe`, `Dost-macos.zip`, `dost-linux-x86_64` ve
 ayrı `.sha256` dosyalarını arayan eski kurulumların bir kez elle güncellenmesi gerekir.
@@ -160,10 +171,11 @@ sertifikadan otomatik bulur.
 
 ### 8. macOS doğrulama
 
-Actions → **ci → macos** içinde:
+Release tag'i için Actions → **ci → macos** içinde:
 
 - **Import certificate** başarılı olmalı.
-- **Notarize** atlanmadan çalışmalı ve Apple sonucu `Accepted` olmalı.
+- **Notarize release artifacts in parallel** atlanmadan çalışmalı ve üç Apple sonucu da
+  `Accepted` olmalı. Branch / PR çalışmasında bu adımın atlanması normaldir.
 - `stapler` ve `spctl` kontrolleri başarılı olmalı.
 
 Sadece yeşil build görmek yeterli değildir: secret'lar eksikse imzalama / notarization
